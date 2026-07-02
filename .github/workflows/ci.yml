@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+
+    steps:
+      - name: Checkout dicom-viewer
+        uses: actions/checkout@v4
+        with:
+          path: dicom-viewer
+
+      - name: Checkout statumen
+        uses: actions/checkout@v4
+        with:
+          repository: frames-sg/statumen
+          path: statumen
+
+      - name: Checkout signinum
+        uses: actions/checkout@v4
+        with:
+          repository: frames-sg/signinum
+          path: signinum
+
+      - name: Install Linux GUI dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libxdo-dev \
+            libxkbcommon-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.96
+        with:
+          components: rustfmt, clippy
+
+      - name: Format
+        working-directory: dicom-viewer
+        run: cargo fmt --check
+
+      - name: Clippy
+        working-directory: dicom-viewer
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        working-directory: dicom-viewer
+        run: cargo test --workspace

@@ -1,0 +1,18 @@
+[package]
+name = "dicom-viewer"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = []
+cuda = ["dicom-viewer-core/cuda"]
+metal = ["dicom-viewer-core/metal"]
+
+[dependencies]
+dicom-viewer-core = { path = "../../crates/dicom-viewer-core" }
+eframe = { workspace = true }
+rayon = { workspace = true }
+rfd = { workspace = true }
