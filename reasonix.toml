@@ -52,7 +52,7 @@ enabled = true   # language server tools; servers launch lazily when used
 # Rules are "Tool" or "Tool(specifier)"; e.g. Bash(go test:*), Edit(src/**).
 mode  = "ask"
 # deny = ["Bash(rm -rf*)", "Bash(git push*)"]   # hard-blocked in every mode
-allow = ["explore", "Bash(ls -la ../wsi-rs/ 2>/dev/null && echo \"--- wsi-rs exists ---\" || echo \"--- wsi-rs NOT found ---\"; ls -la ../j2k/ 2>/dev/null && echo \"--- j2k exists ---\" || echo \"--- j2k NOT found ---\")", "Edit(apps/dicom-viewer/src/app.rs)", "Bash(cd /Users/user/Bench/dicom-viewer && cargo clippy 2>&1)"]
+allow = ["explore", "Bash(ls -la ../wsi-rs/ 2>/dev/null && echo \"--- wsi-rs exists ---\" || echo \"--- wsi-rs NOT found ---\"; ls -la ../j2k/ 2>/dev/null && echo \"--- j2k exists ---\" || echo \"--- j2k NOT found ---\")", "Edit(apps/dicom-viewer/src/app.rs)", "Bash(cd /Users/user/Bench/frames/dicom-viewer && cargo clippy 2>&1)"]
 # ask = ["Edit(src/**)"]   # force a prompt even if otherwise allowed
 
 [sandbox]

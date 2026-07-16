@@ -3,7 +3,9 @@ resolver = "2"
 members = [
     "apps/dicom-viewer",
     "crates/dicom-viewer-core",
+    "crates/metal-wgpu-interop",
 ]
+exclude = ["vendor/wayland-scanner"]
 
 [workspace.package]
 edition = "2021"
@@ -18,18 +20,45 @@ dicom-object = "0.9"
 eframe = { version = "0.34.2", default-features = false, features = [
     "accesskit",
     "default_fonts",
-    "glow",
     "wayland",
+    "wgpu",
     "x11",
 ] }
+egui-wgpu = "0.34.3"
+wgpu = "29.0.3"
+wgpu-hal = "29.0.3"
+metal = "0.33"
+objc2 = "0.6.4"
+objc2-metal = "0.3.2"
+foreign-types = "0.5"
+j2k-core = { version = "=0.7.4", path = "../j2k/crates/j2k-core" }
+j2k-metal-support = { version = "=0.7.4", path = "../j2k/crates/j2k-metal-support" }
+pollster = "0.4"
 rfd = "0.17.2"
-rayon = "1.12"
-wsi-rs = { path = "../wsi-rs" }
-j2k-test-support = { path = "../j2k/crates/j2k-test-support", features = [
+wsi-rs = { version = "=0.5.0", path = "../wsi-rs" }
+j2k-test-support = { version = "=0.7.4", path = "../j2k/crates/j2k-test-support", features = [
     "j2k-native-fixtures",
 ] }
 tempfile = "3"
 thiserror = "2"
+
+# Temporary security patch for RUSTSEC-2026-0194 and RUSTSEC-2026-0195.
+# Remove this override after wayland-scanner publishes a release requiring
+# quick-xml >= 0.41. See vendor/wayland-scanner/SECURITY-PATCH.md.
+[patch.crates-io]
+wayland-scanner = { path = "vendor/wayland-scanner" }
+# `wsi-rs` 0.5 accepts the 0.7.x j2k family. Keep its codec crates aligned
+# with the sibling 0.7.4 test fixtures so Cargo links one native codec build.
+j2k = { path = "../j2k/crates/j2k" }
+j2k-core = { path = "../j2k/crates/j2k-core" }
+j2k-cuda = { path = "../j2k/crates/j2k-cuda" }
+j2k-jpeg = { path = "../j2k/crates/j2k-jpeg" }
+j2k-jpeg-cuda = { path = "../j2k/crates/j2k-jpeg-cuda" }
+j2k-jpeg-metal = { path = "../j2k/crates/j2k-jpeg-metal" }
+j2k-metal = { path = "../j2k/crates/j2k-metal" }
+j2k-metal-support = { path = "../j2k/crates/j2k-metal-support" }
+j2k-native = { path = "../j2k/crates/j2k-native" }
+j2k-tilecodec = { path = "../j2k/crates/j2k-tilecodec" }
 
 [profile.release]
 lto = "fat"

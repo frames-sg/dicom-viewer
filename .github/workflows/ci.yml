@@ -4,10 +4,18 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
-    name: ${{ matrix.os }}
+    name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -15,27 +23,32 @@ jobs:
 
     steps:
       - name: Checkout dicom-viewer
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           path: dicom-viewer
+          persist-credentials: false
 
-      - name: Checkout statumen
-        uses: actions/checkout@v4
+      - name: Checkout wsi-rs
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          repository: frames-sg/statumen
-          path: statumen
+          repository: frames-sg/wsi-rs
+          ref: v0.5.0
+          path: wsi-rs
+          persist-credentials: false
 
-      - name: Checkout signinum
-        uses: actions/checkout@v4
+      - name: Checkout j2k
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          repository: frames-sg/signinum
-          path: signinum
+          repository: frames-sg/j2k
+          ref: v0.7.4
+          path: j2k
+          persist-credentials: false
 
       - name: Install Linux GUI dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
+          sudo apt-get install -y --no-install-recommends \
             libgtk-3-dev \
             libxdo-dev \
             libxkbcommon-dev \
@@ -44,18 +57,85 @@ jobs:
             libxcb-xfixes0-dev
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.96
+        uses: dtolnay/rust-toolchain@a75363d06101555fc97c6c7e1e65670b99104d98 # 1.96.1
         with:
           components: rustfmt, clippy
 
       - name: Format
+        if: runner.os == 'Linux'
         working-directory: dicom-viewer
-        run: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: Verify locked dependency graph
+        working-directory: dicom-viewer
+        run: |
+          cargo metadata --locked --format-version 1 > /dev/null
+          git diff --exit-code -- Cargo.lock
 
       - name: Clippy
         working-directory: dicom-viewer
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Test
         working-directory: dicom-viewer
-        run: cargo test --workspace
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Test default macOS Metal tile output
+        if: runner.os == 'macOS'
+        working-directory: dicom-viewer
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo test -p dicom-viewer-core --locked macos_metal_options_return_resident_tiles_for_synthetic_dicom_htj2k
+
+      - name: Release build
+        working-directory: dicom-viewer
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo build --workspace --release --locked
+
+  dependencies:
+    name: Dependency policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout dicom-viewer
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          path: dicom-viewer
+          persist-credentials: false
+
+      - name: Checkout wsi-rs
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: frames-sg/wsi-rs
+          ref: v0.5.0
+          path: wsi-rs
+          persist-credentials: false
+
+      - name: Checkout j2k
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: frames-sg/j2k
+          ref: v0.7.4
+          path: j2k
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@a75363d06101555fc97c6c7e1e65670b99104d98 # 1.96.1
+
+      - name: Install dependency tools
+        run: |
+          cargo install cargo-audit --version 0.22.1 --locked
+          cargo install cargo-deny --version 0.19.4 --locked
+
+      - name: Audit RustSec advisories
+        working-directory: dicom-viewer
+        run: cargo audit --deny unsound
+
+      - name: Enforce dependency policy
+        working-directory: dicom-viewer
+        run: cargo deny check advisories bans licenses sources

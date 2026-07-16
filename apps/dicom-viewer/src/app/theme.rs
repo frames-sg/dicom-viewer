@@ -1,4 +1,4 @@
-use eframe::egui::Color32;
+use eframe::egui::{self, vec2, Color32, CornerRadius, FontId, Margin, Stroke, TextStyle};
 
 pub(super) const CANVAS: Color32 = Color32::from_rgb(11, 12, 14);
 pub(super) const CANVAS_EDGE: Color32 = Color32::from_rgb(5, 6, 7);
@@ -20,3 +20,66 @@ pub(super) const AMBER_GLOW: Color32 = Color32::from_rgb(58, 45, 26);
 pub(super) const CYAN: Color32 = Color32::from_rgb(112, 192, 206);
 pub(super) const GREEN: Color32 = Color32::from_rgb(112, 192, 116);
 pub(super) const WARN: Color32 = Color32::from_rgb(206, 142, 60);
+pub(super) fn install_visuals(ctx: &egui::Context) {
+    let mut style = (*ctx.global_style()).clone();
+
+    style.text_styles = [
+        (TextStyle::Heading, FontId::proportional(17.0)),
+        (TextStyle::Body, FontId::proportional(13.5)),
+        (TextStyle::Button, FontId::proportional(13.0)),
+        (TextStyle::Small, FontId::proportional(11.0)),
+        (TextStyle::Monospace, FontId::monospace(12.5)),
+    ]
+    .into();
+
+    style.spacing.item_spacing = vec2(8.0, 7.0);
+    style.spacing.button_padding = vec2(10.0, 5.0);
+    style.spacing.window_margin = Margin::same(0);
+    style.spacing.menu_margin = Margin::same(6);
+    style.spacing.interact_size.y = 26.0;
+
+    let v = &mut style.visuals;
+    v.dark_mode = true;
+    v.panel_fill = CHROME;
+    v.window_fill = CARD;
+    v.window_stroke = Stroke::new(1.0, HAIRLINE);
+    v.window_corner_radius = CornerRadius::same(8);
+    v.faint_bg_color = CARD_RAISED;
+    v.extreme_bg_color = CANVAS_EDGE;
+    v.override_text_color = Some(TEXT);
+    v.hyperlink_color = CYAN;
+
+    v.selection.bg_fill = AMBER_GLOW;
+    v.selection.stroke = Stroke::new(1.0, AMBER);
+
+    let w = &mut v.widgets;
+    w.noninteractive.bg_fill = CHROME;
+    w.noninteractive.weak_bg_fill = CHROME;
+    w.noninteractive.bg_stroke = Stroke::new(1.0, HAIRLINE_SOFT);
+    w.noninteractive.fg_stroke = Stroke::new(1.0, TEXT_MUTED);
+    w.noninteractive.corner_radius = CornerRadius::same(6);
+
+    w.inactive.bg_fill = CARD_RAISED;
+    w.inactive.weak_bg_fill = CHROME_RAISED;
+    w.inactive.bg_stroke = Stroke::new(1.0, HAIRLINE);
+    w.inactive.fg_stroke = Stroke::new(1.0, TEXT);
+    w.inactive.corner_radius = CornerRadius::same(6);
+
+    w.hovered.bg_fill = AMBER_GLOW;
+    w.hovered.weak_bg_fill = AMBER_GLOW;
+    w.hovered.bg_stroke = Stroke::new(1.0, AMBER);
+    w.hovered.fg_stroke = Stroke::new(1.0, AMBER_BRIGHT);
+    w.hovered.corner_radius = CornerRadius::same(6);
+
+    w.active.bg_fill = AMBER;
+    w.active.weak_bg_fill = AMBER;
+    w.active.bg_stroke = Stroke::new(1.0, AMBER_BRIGHT);
+    w.active.fg_stroke = Stroke::new(1.0, CANVAS_EDGE);
+    w.active.corner_radius = CornerRadius::same(6);
+
+    w.open.bg_fill = CARD_RAISED;
+    w.open.bg_stroke = Stroke::new(1.0, HAIRLINE);
+    w.open.fg_stroke = Stroke::new(1.0, TEXT);
+
+    ctx.set_global_style(style);
+}

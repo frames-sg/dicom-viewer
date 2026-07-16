@@ -1,0 +1,25 @@
+[package]
+name = "metal-wgpu-interop"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = []
+test-support = []
+
+[target.'cfg(target_os = "macos")'.dependencies]
+foreign-types = { workspace = true }
+j2k-core = { workspace = true }
+j2k-metal-support = { workspace = true }
+metal = { workspace = true }
+objc2 = { workspace = true }
+objc2-metal = { workspace = true }
+thiserror = { workspace = true }
+wgpu = { workspace = true }
+wgpu-hal = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+pollster = { workspace = true }

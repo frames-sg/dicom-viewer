@@ -1,10 +1,8 @@
 use dicom_viewer_core::{LevelIndex, LevelInfo, StudySummary, TileCoord};
 use eframe::egui::{vec2, Rect, Vec2};
 
-#[cfg(test)]
-use super::tile::TileRenderer;
+use super::camera::MIN_ZOOM;
 use super::tile::{TileKey, VisibleTile};
-use super::MIN_ZOOM;
 
 pub(super) fn base_level(summary: &StudySummary) -> Option<&LevelInfo> {
     summary.levels.first()
@@ -53,26 +51,22 @@ pub(super) fn choose_render_level(summary: &StudySummary, zoom: f32) -> Option<&
         })
 }
 
-#[cfg(test)]
 pub(super) fn choose_display_level_index(
-    renderer: &TileRenderer,
-    held_level: Option<&LevelInfo>,
-    held_visible: &[VisibleTile],
-    target_level: &LevelInfo,
-    target_visible: &[VisibleTile],
+    held_level: Option<LevelIndex>,
+    target_level: LevelIndex,
+    target_pending: usize,
+    held_pending: usize,
 ) -> LevelIndex {
     let Some(held_level) = held_level else {
-        return target_level.index;
+        return target_level;
     };
-    if held_level.index == target_level.index {
-        return target_level.index;
+    if held_level == target_level {
+        return target_level;
     }
-    let target_pending = renderer.pending_tile_count(target_visible, target_level.index);
-    let held_pending = renderer.pending_tile_count(held_visible, held_level.index);
     if target_pending > 0 && held_pending == 0 {
-        held_level.index
+        held_level
     } else {
-        target_level.index
+        target_level
     }
 }
 
@@ -96,7 +90,7 @@ pub(super) fn screen_to_base(
 pub(super) fn visible_tiles(
     rect: Rect,
     level: &LevelInfo,
-    slide_id: u64,
+    generation: u64,
     center_base: Vec2,
     zoom: f32,
     margin: i64,
@@ -143,7 +137,7 @@ pub(super) fn visible_tiles(
             let dr = u128::from(row.abs_diff(center_row));
             tiles.push(VisibleTile {
                 key: TileKey {
-                    slide_id,
+                    generation,
                     level: level.index,
                     coord: TileCoord::new(col, row),
                 },

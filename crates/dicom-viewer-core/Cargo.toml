@@ -9,7 +9,6 @@ publish = false
 [features]
 default = []
 cuda = ["wsi-rs/cuda"]
-metal = ["wsi-rs/metal"]
 
 [dependencies]
 dicom-core = { workspace = true }
@@ -19,7 +18,8 @@ wsi-rs = { workspace = true }
 thiserror = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-metal = "0.33"
+j2k-metal-support = { path = "../../../j2k/crates/j2k-metal-support", version = "=0.7.4" }
+metal = { workspace = true }
 wsi-rs = { workspace = true, features = ["metal"] }
 
 [dev-dependencies]

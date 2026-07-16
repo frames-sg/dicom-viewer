@@ -1,9 +1,9 @@
+#![forbid(unsafe_code)]
+
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Instant;
 
 use dicom_viewer_core::{LevelIndex, TileCoord, ViewerStudy};
-use rayon::prelude::*;
 
 fn main() {
     let path = std::env::args_os()
@@ -15,15 +15,15 @@ fn main() {
         });
 
     let start = Instant::now();
-    let study = Arc::new(ViewerStudy::open_path(&path).unwrap_or_else(|err| {
+    let study = ViewerStudy::open_path(&path).unwrap_or_else(|err| {
         eprintln!("open failed: {err}");
         std::process::exit(1);
-    }));
+    });
     println!("open_ms={:.3}", start.elapsed().as_secs_f64() * 1000.0);
 
     let summary = study.summary();
     println!(
-        "format={} tile_decode_backend={} files={} instances={} levels={}",
+        "format={} tile_output={} files={} instances={} levels={}",
         summary.format_label,
         summary.tile_decode_backend,
         summary.file_count,
@@ -96,7 +96,6 @@ fn main() {
             .map(|(col, row)| TileCoord::new(col, row))
             .collect::<Vec<_>>();
         measure_block_sequential(&study, level.index, &block);
-        measure_block_parallel(&study, level.index, &block);
         measure_block_batched(&study, level.index, &block);
     }
 }
@@ -126,26 +125,6 @@ fn measure_block_sequential(study: &ViewerStudy, level: LevelIndex, block: &[Til
     }
     println!(
         "block_sequential level={} tiles={} total_ms={:.3}",
-        level,
-        block.len(),
-        start.elapsed().as_secs_f64() * 1000.0
-    );
-}
-
-fn measure_block_parallel(study: &Arc<ViewerStudy>, level: LevelIndex, block: &[TileCoord]) {
-    let start = Instant::now();
-    block.par_iter().for_each(|&coord| {
-        let _ = study.read_tile_rgba(level, coord).unwrap_or_else(|err| {
-            eprintln!(
-                "parallel read failed: level={level} col={} row={}: {err}",
-                coord.col(),
-                coord.row()
-            );
-            std::process::exit(1);
-        });
-    });
-    println!(
-        "block_parallel level={} tiles={} total_ms={:.3}",
         level,
         block.len(),
         start.elapsed().as_secs_f64() * 1000.0
