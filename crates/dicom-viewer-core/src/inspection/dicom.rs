@@ -160,6 +160,11 @@ fn inspect_dicom_instance(path: &Path) -> Result<Option<(DicomInstanceSummary, O
     }
 
     let series_instance_uid = optional_string(&obj, tags::SERIES_INSTANCE_UID);
+    let concatenation_instance_count = if optional_string(&obj, tags::CONCATENATION_UID).is_some() {
+        optional_u32(&obj, tags::IN_CONCATENATION_TOTAL_NUMBER)
+    } else {
+        Some(1)
+    };
     Ok(Some((
         DicomInstanceSummary {
             path: path.to_path_buf(),
@@ -180,6 +185,9 @@ fn inspect_dicom_instance(path: &Path) -> Result<Option<(DicomInstanceSummary, O
             total_pixel_matrix_rows: optional_u32(&obj, tags::TOTAL_PIXEL_MATRIX_ROWS),
             total_pixel_matrix_columns: optional_u32(&obj, tags::TOTAL_PIXEL_MATRIX_COLUMNS),
             number_of_frames: optional_u32(&obj, tags::NUMBER_OF_FRAMES),
+            optical_path_count: optional_u32(&obj, tags::NUMBER_OF_OPTICAL_PATHS),
+            focal_plane_count: optional_u32(&obj, tags::NUMBER_OF_FOCAL_PLANES),
+            concatenation_instance_count,
             pixel_spacing: optional_spacing(&obj),
             dimension_organization_type: optional_string(&obj, tags::DIMENSION_ORGANIZATION_TYPE),
             samples_per_pixel: optional_u32(&obj, tags::SAMPLES_PER_PIXEL),
@@ -290,7 +298,15 @@ fn expected_tiled_full_frame_count(instance: &DicomInstanceSummary) -> Option<u6
     }
     let matrix_columns = instance.total_pixel_matrix_columns?;
     let matrix_rows = instance.total_pixel_matrix_rows?;
-    Some(u64::from(matrix_columns.div_ceil(columns)) * u64::from(matrix_rows.div_ceil(rows)))
+    let optical_paths = instance.optical_path_count?;
+    let focal_planes = instance.focal_plane_count?;
+    if optical_paths == 0 || focal_planes == 0 || instance.concatenation_instance_count? != 1 {
+        return None;
+    }
+    u64::from(matrix_columns.div_ceil(columns))
+        .checked_mul(u64::from(matrix_rows.div_ceil(rows)))?
+        .checked_mul(u64::from(optical_paths))?
+        .checked_mul(u64::from(focal_planes))
 }
 
 fn file_name_display(path: &Path) -> String {

@@ -4,7 +4,8 @@ use wsi_rs::{Dataset, PlaneIdx, SampleType, SceneId, SeriesId, Slide, TileLayout
 
 use crate::model::SelectedView;
 use crate::{
-    LevelIndex, LevelInfo, LevelTileLayout, Result, StudySummary, TileDecodeBackend, ViewerError,
+    ColorManagementSummary, LevelIndex, LevelInfo, LevelTileLayout, Result, StudySummary,
+    TileDecodeBackend, ViewerError,
 };
 
 use super::dicom::{build_fact_warnings, InputInspection};
@@ -18,6 +19,7 @@ pub(crate) fn summarize_slide(
     let dataset = slide.dataset();
     let (selected_view, mut warnings) = select_primary_view(dataset)?;
     let series = &dataset.scenes[selected_view.scene.get()].series[selected_view.series.get()];
+    let canvas_dimensions = canonical_canvas_dimensions(series)?;
     let (levels, level_warnings) = summarize_renderable_levels(series)?;
     warnings.extend(level_warnings);
 
@@ -37,14 +39,45 @@ pub(crate) fn summarize_slide(
             tile_decode_backend,
             file_count: input.file_count,
             dicom_instance_count: input.instances.len(),
+            canvas_dimensions,
             levels,
             instances: input.instances,
             warnings,
             mpp: dataset.properties.mpp(),
             objective_power: dataset.properties.objective_power(),
+            color_management: ColorManagementSummary::unprofiled(),
         },
         selected_view,
     ))
+}
+
+pub(crate) fn canonical_canvas_dimensions(series: &wsi_rs::Series) -> Result<(u64, u64)> {
+    let mut width = 0;
+    let mut height = 0;
+    for level in &series.levels {
+        let Some(level_width) = rounded_canvas_extent(level.dimensions.0, level.downsample) else {
+            continue;
+        };
+        let Some(level_height) = rounded_canvas_extent(level.dimensions.1, level.downsample) else {
+            continue;
+        };
+        width = width.max(level_width);
+        height = height.max(level_height);
+    }
+    if width == 0 || height == 0 {
+        return Err(ViewerError::Unsupported(
+            "WSI dataset has no levels with valid canvas geometry".into(),
+        ));
+    }
+    Ok((width, height))
+}
+
+fn rounded_canvas_extent(dimension: u64, downsample: f64) -> Option<u64> {
+    if dimension == 0 || !downsample.is_finite() || downsample <= 0.0 {
+        return None;
+    }
+    let extent = dimension as f64 * downsample;
+    (extent.is_finite() && extent > 0.0 && extent <= u64::MAX as f64).then(|| extent.ceil() as u64)
 }
 
 pub(crate) fn summarize_renderable_levels(

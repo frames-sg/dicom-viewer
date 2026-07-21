@@ -1,6 +1,6 @@
 use std::path::PathBuf;
-use std::sync::{mpsc::TryRecvError, Arc};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use dicom_viewer_core::{StudySummary, TileDecodeBackend, ViewerStudy};
 use eframe::egui::{self, Frame, Rect, Sense};
@@ -8,6 +8,7 @@ use eframe::egui::{self, Frame, Rect, Sense};
 mod camera;
 mod canvas;
 mod format;
+mod level_warmer;
 mod measurement;
 mod open_job;
 mod theme;
@@ -23,10 +24,12 @@ use measurement::{
     clamp_base_point, draw_measurement_overlay, measurement_ready_status, MeasurementInteraction,
     MeasurementState,
 };
-use open_job::OpenJob;
+use open_job::{OpenPoll, OpenQueue};
 use ui::chrome::{show_status_bar, show_toolbar};
 use ui::facts::show_facts_sidebar;
-use ui::overlay::{draw_canvas_overlays, paint_canvas_background, paint_empty_state, FrameStats};
+use ui::overlay::{
+    draw_canvas_overlays, paint_canvas_background, paint_empty_state, FrameStats, OverlayInfo,
+};
 use viewport::{base_contains_point, screen_to_base};
 #[cfg(test)]
 use viewport::{choose_render_level, visible_tiles};
@@ -42,12 +45,13 @@ const MAX_LOADER_MESSAGES_PER_FRAME: usize = 128;
 const LOADER_MESSAGE_BUDGET: Duration = Duration::from_millis(2);
 const MAX_VISIBLE_UPLOADS_PER_FRAME: usize = 24;
 const VISIBLE_UPLOAD_BUDGET: Duration = Duration::from_millis(6);
+const MAX_TRANSITION_UPLOADS_PER_FRAME: usize = 2;
 const MAX_PREFETCH_UPLOADS_PER_FRAME: usize = 4;
 const PREFETCH_UPLOAD_BUDGET: Duration = Duration::from_millis(1);
 
 pub struct DicomViewerApp {
     study: Option<Arc<ViewerStudy>>,
-    open_job: Option<OpenJob>,
+    open_queue: OpenQueue,
     active_generation: u64,
     next_generation: u64,
     status: String,
@@ -73,7 +77,7 @@ impl DicomViewerApp {
         );
         let mut app = Self {
             study: None,
-            open_job: None,
+            open_queue: OpenQueue::default(),
             active_generation: 0,
             next_generation: 1,
             status: initial_status,
@@ -108,8 +112,11 @@ impl DicomViewerApp {
         self.reported_cpu_fallbacks = 0;
         self.status = format!("Opening {}...", path.display());
 
-        match OpenJob::spawn(path.clone(), generation, ctx, options) {
-            Ok(job) => self.open_job = Some(job),
+        match self
+            .open_queue
+            .submit(path.clone(), generation, ctx, options)
+        {
+            Ok(()) => {}
             Err(err) => {
                 self.status = format!(
                     "Failed to open {}: could not start open worker: {err}",
@@ -121,13 +128,9 @@ impl DicomViewerApp {
     }
 
     fn poll_open_job(&mut self, ctx: &egui::Context) {
-        let Some(job) = &self.open_job else {
-            return;
-        };
-        match job.receiver.try_recv() {
-            Ok(result) => {
+        match self.open_queue.poll(ctx) {
+            Ok(Some(OpenPoll::Result(result))) => {
                 let current_generation = self.active_generation;
-                self.open_job = None;
                 if result.generation != current_generation {
                     return;
                 }
@@ -150,13 +153,12 @@ impl DicomViewerApp {
                 }
                 ctx.request_repaint();
             }
-            Err(TryRecvError::Empty) => {
-                // Don't spin — poll_open_job is called every frame from logic().
-            }
-            Err(TryRecvError::Disconnected) => {
-                let path = job.path.clone();
-                self.open_job = None;
+            Ok(Some(OpenPoll::Disconnected(path))) => {
                 self.status = format!("Failed to open {}: open worker exited", path.display());
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.status = format!("Failed to start pending open worker: {error}");
             }
         }
     }
@@ -280,16 +282,16 @@ impl eframe::App for DicomViewerApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let app_ui_started = self.canvas.debug_stats_enabled().then(Instant::now);
         let (stable_dt, predicted_dt) = ui.input(|input| (input.stable_dt, input.predicted_dt));
         self.frame_stats.record(stable_dt, predicted_dt);
 
-        let study = self.study.clone();
-        let opening = self.open_job.is_some();
+        let has_study = self.study.is_some();
 
         let had_measurement = self.measurement.has_points();
         let actions = show_toolbar(
             ui,
-            study.is_some(),
+            has_study,
             &mut self.show_facts_panel,
             &mut self.measurement.active,
             self.camera.smoothing_enabled_mut(),
@@ -300,6 +302,11 @@ impl eframe::App for DicomViewerApp {
         if actions.open_folder {
             self.pick_folder(ui.ctx());
         }
+        // Opening replaces the active study and generation. Refresh the frame
+        // snapshot after the modal picker returns so this frame cannot submit
+        // work for the previous study under the replacement generation.
+        let study = self.study.clone();
+        let opening = self.open_queue.is_opening();
         if actions.measure_clicked {
             self.handle_measure_tool_clicked(
                 study.as_ref().map(|study| study.summary()),
@@ -338,13 +345,16 @@ impl eframe::App for DicomViewerApp {
                 };
 
                 if actions.fit {
+                    self.canvas.record_zoom_input();
                     self.camera.request_fit();
                 }
                 self.camera.prepare_canvas(rect, study.summary());
                 if actions.zoom_out {
+                    self.canvas.record_zoom_input();
                     self.camera.zoom_about_center(rect, 0.8);
                 }
                 if actions.zoom_in {
+                    self.canvas.record_zoom_input();
                     self.camera.zoom_about_center(rect, 1.25);
                 }
 
@@ -363,6 +373,7 @@ impl eframe::App for DicomViewerApp {
                 }
                 if response.double_clicked() && !measurement_interaction.click_consumed {
                     let pointer = response.interact_pointer_pos().unwrap_or(rect.center());
+                    self.canvas.record_zoom_input();
                     self.camera.zoom_around(rect, pointer, 2.0);
                     ui.ctx().request_repaint();
                 }
@@ -373,6 +384,7 @@ impl eframe::App for DicomViewerApp {
                         let pointer = ui
                             .input(|input| input.pointer.hover_pos())
                             .unwrap_or(rect.center());
+                        self.canvas.record_zoom_input();
                         self.camera
                             .zoom_around(rect, pointer, wheel_zoom_factor(scroll_y));
                         ui.ctx().request_repaint();
@@ -382,6 +394,7 @@ impl eframe::App for DicomViewerApp {
                         let pointer = ui
                             .input(|input| input.pointer.hover_pos())
                             .unwrap_or(rect.center());
+                        self.canvas.record_zoom_input();
                         self.camera.zoom_around(rect, pointer, pinch);
                         ui.ctx().request_repaint();
                     }
@@ -392,7 +405,11 @@ impl eframe::App for DicomViewerApp {
 
                 let accepts_keys =
                     (response.hovered() || response.has_focus()) && !ui.ctx().text_edit_focused();
+                let zoom_before_keys = self.camera.target_view().zoom;
                 if self.camera.handle_keys(ui, rect, accepts_keys) {
+                    if (self.camera.target_view().zoom - zoom_before_keys).abs() > f32::EPSILON {
+                        self.canvas.record_zoom_input();
+                    }
                     ui.ctx().request_repaint();
                 }
                 let (render_view, animating_camera) =
@@ -426,14 +443,18 @@ impl eframe::App for DicomViewerApp {
                     .hover_pos()
                     .map(|p| screen_to_base(rect, p, render_view.center_base, render_view.zoom));
                 let tile_failure = self.canvas.tile_failure();
+                let debug_stats = self.canvas.debug_stats_text();
                 draw_canvas_overlays(
                     &painter,
                     rect,
-                    study.summary(),
-                    render_view.zoom,
-                    self.frame_stats.info(),
-                    hover_base,
-                    tile_failure,
+                    OverlayInfo {
+                        summary: study.summary(),
+                        zoom: render_view.zoom,
+                        frame_rate: self.frame_stats.info(),
+                        hover_base,
+                        tile_failure,
+                        debug_stats: debug_stats.as_deref(),
+                    },
                 );
                 draw_measurement_overlay(
                     &painter,
@@ -445,6 +466,9 @@ impl eframe::App for DicomViewerApp {
                     render_view.zoom,
                 );
             });
+        if let Some(started) = app_ui_started {
+            self.canvas.record_app_ui_cpu_time(started.elapsed());
+        }
     }
 }
 

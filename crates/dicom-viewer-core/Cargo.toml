@@ -16,6 +16,8 @@ dicom-dictionary-std = { workspace = true }
 dicom-object = { workspace = true }
 wsi-rs = { workspace = true }
 thiserror = { workspace = true }
+lcms2 = { workspace = true }
+sha2 = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 j2k-metal-support = { path = "../../../j2k/crates/j2k-metal-support", version = "=0.7.4" }

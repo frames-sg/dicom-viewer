@@ -1,8 +1,12 @@
 use wsi_rs::{TileOutputPreference, TilePixels};
 
-use crate::{RenderTile, Result, RgbaTile, TileDecodeBackend, ViewerError, ViewerOpenOptions};
+use crate::{
+    RenderTile, Result, RgbaTile, TileDecodeBackend, ViewerCacheBudgets, ViewerError,
+    ViewerOpenOptions,
+};
 
 const TILE_BACKEND_ENV: &str = "DICOM_VIEWER_TILE_BACKEND";
+const MEMORY_PROFILE_ENV: &str = "DICOM_VIEWER_MEMORY_PROFILE";
 
 pub(crate) fn rgba_tile_from_cpu_tile(tile: wsi_rs::CpuTile) -> Result<RgbaTile> {
     let image = tile.into_rgba()?;
@@ -29,7 +33,23 @@ pub(crate) fn rgba_tile_from_pixels(tile: TilePixels) -> Result<RgbaTile> {
 
 pub(crate) fn default_viewer_open_options() -> Result<ViewerOpenOptions> {
     let requested = std::env::var(TILE_BACKEND_ENV).unwrap_or_else(|_| "auto".into());
-    viewer_open_options(&requested)
+    let options = viewer_open_options(&requested)?;
+    Ok(options.with_cache_budgets(default_cache_budgets()?))
+}
+
+pub(crate) fn default_cache_budgets() -> Result<ViewerCacheBudgets> {
+    let profile = std::env::var(MEMORY_PROFILE_ENV).unwrap_or_else(|_| "balanced".into());
+    memory_profile_cache_budgets(&profile)
+}
+
+fn memory_profile_cache_budgets(profile: &str) -> Result<ViewerCacheBudgets> {
+    match profile.to_ascii_lowercase().as_str() {
+        "balanced" => Ok(ViewerCacheBudgets::balanced()),
+        "large" => Ok(ViewerCacheBudgets::large()),
+        other => Err(ViewerError::InvalidInput(format!(
+            "{MEMORY_PROFILE_ENV} only supports balanced or large; got {other:?}"
+        ))),
+    }
 }
 
 fn viewer_open_options(requested: &str) -> Result<ViewerOpenOptions> {
@@ -119,6 +139,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn balanced_and_large_memory_profiles_have_explicit_budgets() {
+        assert_eq!(
+            memory_profile_cache_budgets("balanced").unwrap(),
+            ViewerCacheBudgets::new(256 * 1024 * 1024, 128 * 1024 * 1024, 32 * 1024 * 1024)
+        );
+        assert_eq!(
+            memory_profile_cache_budgets("large").unwrap(),
+            ViewerCacheBudgets::new(512 * 1024 * 1024, 256 * 1024 * 1024, 64 * 1024 * 1024)
+        );
+        assert!(memory_profile_cache_budgets("huge").is_err());
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn auto_with_renderer_device_prefers_metal_but_keeps_cpu_compatibility_reads() {
@@ -132,6 +165,7 @@ mod tests {
         assert_eq!(backend, TileDecodeBackend::Metal);
         assert!(render.prefers_device());
         assert!(render.compressed_device_decode_enabled());
+        assert!(render.adaptive_decode_route_enabled());
         assert!(!cpu.prefers_device());
     }
 }

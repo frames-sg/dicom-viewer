@@ -9,15 +9,30 @@ use dicom_dictionary_std::{tags, uids};
 use dicom_object::{FileMetaTableBuilder, InMemDicomObject};
 
 use crate::inspection::{
-    build_fact_warnings, candidate_paths_with_limit, inspect_input, open_metadata_object,
-    select_primary_view, summarize_renderable_levels,
+    build_fact_warnings, candidate_paths_with_limit, canonical_canvas_dimensions, inspect_input,
+    open_metadata_object, select_primary_view, summarize_renderable_levels,
 };
 
 #[test]
+fn viewer_error_reports_typed_cancellation() {
+    assert!(ViewerError::Wsi(wsi_rs::WsiError::Cancelled).is_cancelled());
+    assert!(!ViewerError::Wsi(wsi_rs::WsiError::BackendContract {
+        context: "test",
+        expected: 1,
+        actual: 0,
+    })
+    .is_cancelled());
+    assert!(!ViewerError::InvalidInput("not cancelled".into()).is_cancelled());
+}
+
+#[test]
 fn jp2k_cpu_decode_budget_leaves_one_available_processor_for_the_viewer() {
-    assert_eq!(jp2k_cpu_decode_thread_budget(1).get(), 1);
-    assert_eq!(jp2k_cpu_decode_thread_budget(2).get(), 1);
-    assert_eq!(jp2k_cpu_decode_thread_budget(12).get(), 11);
+    assert_eq!(jp2k_cpu_decode_thread_budget(1, None).get(), 1);
+    assert_eq!(jp2k_cpu_decode_thread_budget(2, None).get(), 1);
+    assert_eq!(jp2k_cpu_decode_thread_budget(12, None).get(), 11);
+    assert_eq!(jp2k_cpu_decode_thread_budget(12, Some("2")).get(), 2);
+    assert_eq!(jp2k_cpu_decode_thread_budget(12, Some("99")).get(), 12);
+    assert_eq!(jp2k_cpu_decode_thread_budget(12, Some("invalid")).get(), 11);
 }
 
 #[test]
@@ -40,6 +55,206 @@ fn opened_study_applies_the_jp2k_cpu_decode_budget_to_wsi_rs() {
             .map(std::num::NonZeroUsize::get),
         Some(expected)
     );
+}
+
+#[test]
+fn controlled_viewer_read_honors_pre_cancelled_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("slide.j2k");
+    std::fs::write(&path, j2k_test_support::htj2k_rgb8_fixture(16, 16)).unwrap();
+    let study = ViewerStudy::open_path_with_options(&path, ViewerOpenOptions::cpu_only()).unwrap();
+    let token = wsi_rs::ReadCancellationToken::new();
+    token.cancel();
+
+    let error = study
+        .read_tiles_rgba_controlled(
+            &[(LevelIndex::from_u32(0), TileCoord::new(0, 0))],
+            &wsi_rs::ReadControl::new(token),
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ViewerError::Wsi(wsi_rs::WsiError::Cancelled)
+    ));
+}
+
+#[test]
+fn controlled_level_preparation_honors_pre_cancelled_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("slide.j2k");
+    std::fs::write(&path, j2k_test_support::htj2k_rgb8_fixture(16, 16)).unwrap();
+    let study = ViewerStudy::open_path_with_options(&path, ViewerOpenOptions::cpu_only()).unwrap();
+    let token = wsi_rs::ReadCancellationToken::new();
+    token.cancel();
+
+    let error = study
+        .prepare_level_controlled(LevelIndex::from_u32(0), &wsi_rs::ReadControl::new(token))
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ViewerError::Wsi(wsi_rs::WsiError::Cancelled)
+    ));
+}
+
+#[test]
+fn empty_batch_policy_is_consistent_across_public_batch_apis() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("slide.j2k");
+    std::fs::write(&path, j2k_test_support::htj2k_rgb8_fixture(16, 16)).unwrap();
+    let study = ViewerStudy::open_path_with_options(&path, ViewerOpenOptions::cpu_only()).unwrap();
+    let active_control = wsi_rs::ReadControl::new(wsi_rs::ReadCancellationToken::new());
+
+    assert!(study.read_tiles_rgba(&[]).unwrap().is_empty());
+    assert!(study.read_tiles_for_render(&[]).unwrap().is_empty());
+    assert!(study
+        .read_tiles_rgba_controlled(&[], &active_control)
+        .unwrap()
+        .is_empty());
+    assert!(study
+        .read_tiles_for_render_controlled(&[], &active_control)
+        .unwrap()
+        .is_empty());
+
+    let cancelled_token = wsi_rs::ReadCancellationToken::new();
+    cancelled_token.cancel();
+    let cancelled_control = wsi_rs::ReadControl::new(cancelled_token);
+    assert!(study
+        .read_tiles_rgba_controlled(&[], &cancelled_control)
+        .unwrap_err()
+        .is_cancelled());
+    assert!(study
+        .read_tiles_for_render_controlled(&[], &cancelled_control)
+        .unwrap_err()
+        .is_cancelled());
+}
+
+#[test]
+fn public_batch_apis_share_validation_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("slide.j2k");
+    std::fs::write(&path, j2k_test_support::htj2k_rgb8_fixture(16, 16)).unwrap();
+    let study = ViewerStudy::open_path_with_options(&path, ViewerOpenOptions::cpu_only()).unwrap();
+    let control = wsi_rs::ReadControl::new(wsi_rs::ReadCancellationToken::new());
+
+    for requests in [
+        [(LevelIndex::from_u32(99), TileCoord::new(0, 0))],
+        [(LevelIndex::from_u32(0), TileCoord::new(1, 0))],
+    ] {
+        let expected = study.read_tiles_rgba(&requests).unwrap_err().to_string();
+        assert_eq!(
+            study
+                .read_tiles_rgba_controlled(&requests, &control)
+                .unwrap_err()
+                .to_string(),
+            expected
+        );
+        assert_eq!(
+            study
+                .read_tiles_for_render(&requests)
+                .unwrap_err()
+                .to_string(),
+            expected
+        );
+        assert_eq!(
+            study
+                .read_tiles_for_render_controlled(&requests, &control)
+                .unwrap_err()
+                .to_string(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn controlled_and_uncontrolled_batches_share_cpu_conversion_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("slide.j2k");
+    std::fs::write(&path, j2k_test_support::htj2k_rgb8_fixture(16, 12)).unwrap();
+    let study = ViewerStudy::open_path_with_options(&path, ViewerOpenOptions::cpu_only()).unwrap();
+    let requests = [
+        (LevelIndex::from_u32(0), TileCoord::new(0, 0)),
+        (LevelIndex::from_u32(0), TileCoord::new(0, 0)),
+    ];
+    let control = wsi_rs::ReadControl::new(wsi_rs::ReadCancellationToken::new());
+
+    let rgba = study.read_tiles_rgba(&requests).unwrap();
+    let controlled_rgba = study
+        .read_tiles_rgba_controlled(&requests, &control)
+        .unwrap();
+    assert_eq!(controlled_rgba.len(), rgba.len());
+    for (actual, expected) in controlled_rgba.iter().zip(&rgba) {
+        assert_eq!(
+            (actual.width, actual.height),
+            (expected.width, expected.height)
+        );
+        assert_eq!(actual.rgba, expected.rgba);
+    }
+
+    for tiles in [
+        study.read_tiles_for_render(&requests).unwrap(),
+        study
+            .read_tiles_for_render_controlled(&requests, &control)
+            .unwrap(),
+    ] {
+        assert_eq!(tiles.len(), rgba.len());
+        for (actual, expected) in tiles.into_iter().zip(&rgba) {
+            let RenderTile::Cpu(actual) = actual else {
+                panic!("CPU-only viewer options returned a device tile");
+            };
+            assert_eq!(
+                (actual.width, actual.height),
+                (expected.width, expected.height)
+            );
+            assert_eq!(actual.rgba, expected.rgba);
+        }
+    }
+}
+
+#[test]
+fn whole_level_batch_fallback_shares_control_and_conversion_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("slide.j2k");
+    std::fs::write(&path, j2k_test_support::htj2k_rgb8_fixture(16, 12)).unwrap();
+    let mut study =
+        ViewerStudy::open_path_with_options(&path, ViewerOpenOptions::cpu_only()).unwrap();
+    study.summary.levels[0].tile_layout = LevelTileLayout::WholeLevel {
+        width: 16,
+        height: 12,
+        virtual_tile_width: 16,
+        virtual_tile_height: 12,
+    };
+    let requests = [(LevelIndex::from_u32(0), TileCoord::new(0, 0))];
+    let control = wsi_rs::ReadControl::new(wsi_rs::ReadCancellationToken::new());
+
+    let expected = study.read_tiles_rgba(&requests).unwrap().pop().unwrap();
+    let actual = study
+        .read_tiles_rgba_controlled(&requests, &control)
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(
+        (actual.width, actual.height),
+        (expected.width, expected.height)
+    );
+    assert_eq!(actual.rgba, expected.rgba);
+
+    for mut tiles in [
+        study.read_tiles_for_render(&requests).unwrap(),
+        study
+            .read_tiles_for_render_controlled(&requests, &control)
+            .unwrap(),
+    ] {
+        let RenderTile::Cpu(actual) = tiles.pop().unwrap() else {
+            panic!("whole-level fallback returned a device tile");
+        };
+        assert_eq!(
+            (actual.width, actual.height),
+            (expected.width, expected.height)
+        );
+        assert_eq!(actual.rgba, expected.rgba);
+    }
 }
 
 #[test]
@@ -174,6 +389,10 @@ fn macos_metal_options_return_resident_tiles_for_synthetic_dicom_htj2k() {
         ViewerOpenOptions::auto().with_metal_device(device.clone()),
     )
     .unwrap();
+    assert!(
+        !study.render_tile_output.adaptive_decode_route_enabled(),
+        "the viewer's explicit same-device DICOM Metal path must not spend the first batch probing CPU throughput"
+    );
     let requests = (0..8)
         .map(|col| (LevelIndex::from_u32(0), TileCoord::new(col, 0)))
         .collect::<Vec<_>>();
@@ -204,6 +423,28 @@ fn macos_metal_options_return_resident_tiles_for_synthetic_dicom_htj2k() {
         assert_eq!((tile.width(), tile.height()), (2, 2));
         assert!(tile.byte_len() >= 12);
     }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_metal_options_keep_adaptive_routing_for_non_dicom_sources() {
+    let Some(device) = metal::Device::system_default() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("adaptive.j2k");
+    std::fs::write(&path, j2k_test_support::htj2k_rgb8_fixture(16, 12)).unwrap();
+
+    let study = ViewerStudy::open_path_with_options(
+        &path,
+        ViewerOpenOptions::auto().with_metal_device(device),
+    )
+    .unwrap();
+
+    assert!(
+        study.render_tile_output.adaptive_decode_route_enabled(),
+        "the DICOM-specific first-batch optimization must not disable adaptive routing for other formats"
+    );
 }
 
 #[test]
@@ -364,6 +605,54 @@ fn renderable_levels_skip_known_irregular_layouts_without_renumbering() {
 }
 
 #[test]
+fn canvas_dimensions_use_all_valid_source_levels_and_round_up() {
+    use std::collections::HashMap;
+    use wsi_rs::{AxesShape, ChannelInfo, Level, SampleType, Series, TileLayout};
+
+    let series = Series::new(
+        "series",
+        AxesShape::default(),
+        vec![
+            Level::new(
+                (1001, 777),
+                1.0,
+                TileLayout::Irregular {
+                    tile_advance: (256.0, 256.0),
+                    extra_tiles: (0, 0, 0, 0),
+                    tiles: HashMap::new(),
+                },
+            ),
+            Level::new(
+                (250, 194),
+                4.0,
+                TileLayout::Regular {
+                    tile_width: 128,
+                    tile_height: 128,
+                    tiles_across: 2,
+                    tiles_down: 2,
+                },
+            ),
+            Level::new(
+                (323, 201),
+                3.1,
+                TileLayout::Regular {
+                    tile_width: 128,
+                    tile_height: 128,
+                    tiles_across: 3,
+                    tiles_down: 2,
+                },
+            ),
+        ],
+        SampleType::Uint8,
+        vec![ChannelInfo::new()],
+    );
+
+    // The skipped leading irregular level still defines the height, while the
+    // third level's non-integral extent rounds up to define the width.
+    assert_eq!(canonical_canvas_dimensions(&series).unwrap(), (1002, 777));
+}
+
+#[test]
 fn irregular_only_series_is_rejected_during_open_summary() {
     use std::collections::HashMap;
     use wsi_rs::{AxesShape, ChannelInfo, Level, SampleType, Series, TileLayout};
@@ -456,6 +745,9 @@ fn warns_when_tiled_full_frame_count_mismatches_dense_grid() {
         total_pixel_matrix_rows: Some(5),
         total_pixel_matrix_columns: Some(5),
         number_of_frames: Some(8),
+        optical_path_count: Some(1),
+        focal_plane_count: Some(1),
+        concatenation_instance_count: Some(1),
         pixel_spacing: None,
         dimension_organization_type: Some("TILED_FULL".into()),
         samples_per_pixel: Some(3),
@@ -474,6 +766,49 @@ fn warns_when_tiled_full_frame_count_mismatches_dense_grid() {
             .any(|warning| warning.contains("dense TILED_FULL grid expects 9")),
         "expected dense-grid frame warning, got {warnings:?}"
     );
+}
+
+#[test]
+fn tiled_full_frame_warning_requires_all_dimension_counts() {
+    let mut instance = DicomInstanceSummary {
+        path: PathBuf::from("multidimensional.dcm"),
+        sop_class_uid: uids::VL_WHOLE_SLIDE_MICROSCOPY_IMAGE_STORAGE.into(),
+        series_instance_uid_present: true,
+        transfer_syntax_uid: uids::EXPLICIT_VR_LITTLE_ENDIAN.into(),
+        image_type: vec!["ORIGINAL".into(), "PRIMARY".into(), "VOLUME".into()],
+        rows: Some(2),
+        columns: Some(2),
+        total_pixel_matrix_rows: Some(5),
+        total_pixel_matrix_columns: Some(5),
+        number_of_frames: Some(53),
+        optical_path_count: None,
+        focal_plane_count: Some(3),
+        concatenation_instance_count: Some(1),
+        pixel_spacing: None,
+        dimension_organization_type: Some("TILED_FULL".into()),
+        samples_per_pixel: Some(3),
+        photometric_interpretation: Some("RGB".into()),
+        planar_configuration: Some(0),
+        bits_allocated: Some(8),
+        bits_stored: Some(8),
+        high_bit: Some(7),
+        pixel_representation: Some(0),
+    };
+
+    assert!(build_fact_warnings(&[instance.clone()], &[])
+        .iter()
+        .all(|warning| !warning.contains("dense TILED_FULL")));
+
+    instance.optical_path_count = Some(2);
+    let warnings = build_fact_warnings(&[instance.clone()], &[]);
+    assert!(warnings
+        .iter()
+        .any(|warning| warning.contains("expects 54")));
+
+    instance.concatenation_instance_count = Some(2);
+    assert!(build_fact_warnings(&[instance], &[])
+        .iter()
+        .all(|warning| !warning.contains("dense TILED_FULL")));
 }
 
 #[test]

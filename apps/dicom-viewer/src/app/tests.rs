@@ -1,8 +1,14 @@
 use super::canvas::{fallback_levels, PREFETCH_MARGIN_TILES};
-use super::measurement::{format_measurement_distance, measurement_distance, MeasurementDistance};
-use super::viewport::choose_display_level_index;
+use super::measurement::{
+    clamp_base_point, format_measurement_distance, measurement_distance, MeasurementDistance,
+};
+use super::viewport::{
+    base_size, choose_display_level_index, choose_render_level_with_hysteresis,
+    nearest_grid_coordinates, tile_screen_rect, CanvasView,
+};
 use super::*;
-use dicom_viewer_core::LevelTileLayout;
+use dicom_viewer_core::{LevelTileLayout, TileCoord};
+use eframe::egui::Vec2;
 
 fn level(index: usize, width: u64, height: u64, downsample: f64) -> LevelInfo {
     LevelInfo {
@@ -27,6 +33,7 @@ fn summary() -> StudySummary {
         tile_decode_backend: TileDecodeBackend::Cpu,
         file_count: 1,
         dicom_instance_count: 0,
+        canvas_dimensions: (4096, 4096),
         levels: vec![
             level(0, 4096, 4096, 1.0),
             level(1, 1024, 1024, 4.0),
@@ -36,6 +43,7 @@ fn summary() -> StudySummary {
         warnings: Vec::new(),
         mpp: None,
         objective_power: None,
+        color_management: dicom_viewer_core::ColorManagementSummary::unprofiled(),
     }
 }
 
@@ -74,6 +82,38 @@ fn render_level_does_not_upscale_lower_resolution_tiles() {
     assert_eq!(
         choose_render_level(&summary, 0.0625).unwrap().index,
         LevelIndex::from_u32(2)
+    );
+}
+
+#[test]
+fn render_level_hysteresis_holds_across_small_threshold_oscillations() {
+    let summary = summary();
+    let fine = LevelIndex::from_u32(0);
+    let coarse = LevelIndex::from_u32(1);
+
+    assert_eq!(
+        choose_render_level_with_hysteresis(&summary, 0.24, Some(fine))
+            .unwrap()
+            .index,
+        fine
+    );
+    assert_eq!(
+        choose_render_level_with_hysteresis(&summary, 0.22, Some(fine))
+            .unwrap()
+            .index,
+        coarse
+    );
+    assert_eq!(
+        choose_render_level_with_hysteresis(&summary, 0.26, Some(coarse))
+            .unwrap()
+            .index,
+        coarse
+    );
+    assert_eq!(
+        choose_render_level_with_hysteresis(&summary, 0.28, Some(coarse))
+            .unwrap()
+            .index,
+        fine
     );
 }
 
@@ -134,6 +174,109 @@ fn visible_tiles_cover_view_and_margin() {
 }
 
 #[test]
+fn visible_tile_planning_is_bounded_for_pathological_grids() {
+    let mut summary = summary();
+    summary.levels = vec![LevelInfo {
+        index: LevelIndex::from_u32(0),
+        width: 25_600,
+        height: 25_600,
+        downsample: 1.0,
+        tile_layout: LevelTileLayout::Regular {
+            tile_width: 256,
+            tile_height: 256,
+            tiles_across: 100,
+            tiles_down: 100,
+        },
+    }];
+    let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(25_600.0, 25_600.0));
+
+    let tiles = visible_tiles(
+        rect,
+        &summary.levels[0],
+        1,
+        vec2(12_800.0, 12_800.0),
+        1.0,
+        0,
+    );
+
+    assert_eq!(
+        tiles.len(),
+        8_193,
+        "visible planning must retain one overflow candidate so the atomic scheduler cap can diagnose and trim visible-only overflow"
+    );
+    assert!(
+        tiles
+            .iter()
+            .any(|tile| tile.key.coord.col() == 50 && tile.key.coord.row() == 4),
+        "bounded planning must retain globally nearer axis tiles instead of farther corners from an arbitrary rectangular crop"
+    );
+}
+
+#[test]
+fn nearest_grid_planning_is_bounded_and_center_first_for_huge_grids() {
+    let cols = 1_000_000_000;
+    let rows = 2_000_000_000;
+
+    let coordinates = nearest_grid_coordinates(cols, rows, 8_192);
+
+    assert_eq!(coordinates.len(), 8_192);
+    assert_eq!(coordinates[0], (0, rows / 2, cols / 2));
+    assert!(coordinates.windows(2).all(|pair| pair[0] <= pair[1]));
+}
+
+#[test]
+fn canonical_canvas_drives_fit_tile_geometry_measurements_and_edge_reachability() {
+    let mut summary = summary();
+    summary.canvas_dimensions = (1005, 781);
+    summary.levels = vec![LevelInfo {
+        index: LevelIndex::from_u32(1),
+        width: 251,
+        height: 195,
+        downsample: 4.0,
+        tile_layout: LevelTileLayout::Regular {
+            tile_width: 128,
+            tile_height: 128,
+            tiles_across: 2,
+            tiles_down: 2,
+        },
+    }];
+
+    assert_eq!(base_size(&summary), Some(vec2(1005.0, 781.0)));
+
+    let fit_rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(1005.0, 781.0));
+    let mut camera = CameraState::default();
+    camera.reset_for_study(&summary);
+    camera.prepare_canvas(fit_rect, &summary);
+    assert_eq!(camera.target_view().center_base, vec2(502.5, 390.5));
+    assert!((camera.target_view().zoom - 1.0).abs() < f32::EPSILON);
+
+    let edge_rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(100.0, 100.0));
+    let edge_tiles = visible_tiles(edge_rect, &summary.levels[0], 3, vec2(955.0, 731.0), 1.0, 0);
+    assert!(edge_tiles
+        .iter()
+        .any(|tile| tile.key.coord == TileCoord::new(1, 1)));
+
+    let tile_rect = tile_screen_rect(
+        CanvasView {
+            rect: edge_rect,
+            center_base: Vec2::ZERO,
+            zoom: 1.0,
+        },
+        &summary.levels[0],
+        TileCoord::new(1, 1),
+        123,
+        67,
+    );
+    assert_eq!(tile_rect.min, pos2(562.0, 562.0));
+    assert_eq!(tile_rect.size(), vec2(492.0, 268.0));
+
+    assert_eq!(
+        clamp_base_point(&summary, vec2(f32::MAX, f32::MAX)),
+        vec2(1004.0, 780.0)
+    );
+}
+
+#[test]
 fn fallback_levels_include_coarser_levels_and_held_level() {
     let summary = summary();
     let levels = fallback_levels(&summary, &summary.levels[1], Some(&summary.levels[0]));
@@ -142,6 +285,32 @@ fn fallback_levels_include_coarser_levels_and_held_level() {
     assert_eq!(
         indexes,
         vec![LevelIndex::from_u32(2), LevelIndex::from_u32(0)]
+    );
+}
+
+#[test]
+fn fallback_levels_include_regular_1024_tiles_for_clean_failure_recovery() {
+    let mut summary = summary();
+    summary.levels.push(LevelInfo {
+        index: LevelIndex::from_u32(3),
+        width: 1024,
+        height: 1024,
+        downsample: 32.0,
+        tile_layout: LevelTileLayout::Regular {
+            tile_width: 1024,
+            tile_height: 1024,
+            tiles_across: 1,
+            tiles_down: 1,
+        },
+    });
+
+    let levels = fallback_levels(&summary, &summary.levels[1], None);
+    let indexes = levels.iter().map(|level| level.index).collect::<Vec<_>>();
+
+    assert_eq!(
+        indexes,
+        vec![LevelIndex::from_u32(3), LevelIndex::from_u32(2)],
+        "a failed target must retain an ordinary 1024x1024 coarser layer to draw underneath it"
     );
 }
 
@@ -170,12 +339,12 @@ fn fallback_levels_skip_oversized_coarser_tiles() {
     let mut summary = summary();
     summary.levels.push(LevelInfo {
         index: LevelIndex::from_u32(3),
-        width: 2048,
-        height: 2048,
+        width: 4096,
+        height: 4096,
         downsample: 32.0,
         tile_layout: LevelTileLayout::Regular {
-            tile_width: 2048,
-            tile_height: 2048,
+            tile_width: 4096,
+            tile_height: 4096,
             tiles_across: 1,
             tiles_down: 1,
         },
@@ -282,6 +451,20 @@ fn camera_state_owns_fit_resize_pan_and_zoom_lifecycle() {
 
     camera.zoom_about_center(small, 2.0);
     assert!((camera.target_view().zoom - 0.5).abs() < f32::EPSILON);
+}
+
+#[test]
+fn camera_zoom_out_stops_ten_percent_past_fit() {
+    let summary = summary();
+    let mut camera = CameraState::default();
+    let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(512.0, 512.0));
+    camera.reset_for_study(&summary);
+    camera.prepare_canvas(rect, &summary);
+
+    camera.zoom_about_center(rect, 0.01);
+
+    let fit_zoom = 512.0 / 4096.0;
+    assert!((camera.target_view().zoom - fit_zoom * 0.9).abs() < f32::EPSILON);
 }
 
 #[test]

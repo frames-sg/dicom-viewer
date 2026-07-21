@@ -7,10 +7,13 @@ other wsi-rs-supported WSI inputs. It does not upload files or use DICOMweb.
 Its facts panel reads only the technical WSI tags documented below; local file
 paths can still be visible in the UI and in screenshots.
 
+See [Architecture](docs/ARCHITECTURE.md) for ownership, scheduling, cache, and
+Metal interoperability invariants.
+
 ## Build
 
-This repo expects `../wsi-rs` version 0.5.0 and `../j2k` version 0.7.4 sibling
-checkouts for its local path dependencies. CI pins `wsi-rs` to `v0.5.0` and
+This repo expects `../wsi-rs` version 0.5.2 and `../j2k` version 0.7.4 sibling
+checkouts for its local path dependencies. CI pins `wsi-rs` to `v0.5.2` and
 `j2k` to `v0.7.4`.
 
 ```sh
@@ -28,6 +31,36 @@ create another renderer.
 prefers renderer-resident Metal tiles on macOS and falls back to CPU output for
 unsupported codecs or failed imports. `cpu` forces CPU-resident decode output
 while retaining wgpu presentation.
+
+`DICOM_VIEWER_MEMORY_PROFILE` accepts `balanced` (the default: 256 MiB viewer,
+128 MiB shared source, 32 MiB display) or `large` (512/256/64 MiB). Set
+`DICOM_VIEWER_DEBUG_STATS=1` to show pipeline statistics in the canvas and
+emit a schema-v4 JSONL diagnostic per second to stderr. Latency distributions
+include sample counts and use `null` percentiles when no samples exist. The
+`app_ui_cpu_ms` metric measures only the viewer's `eframe::App::ui` CPU work;
+it does not include egui tessellation, GPU execution, or presentation. The
+diagnostics use a trailing one-second window, report visible-lane queue latency
+separately, and distinguish DICOM index work performed by level preparation
+from indexing that raced inside a tile read. The `tile_probe` utility opens an
+independent study for each trial, prepares the requested pyramid level, and
+times identical first and warm batches through the selected production API:
+
+```sh
+cargo run --release -p dicom-viewer --bin tile_probe -- \
+  --trials 5 --json --api controlled-render --backend auto --batch-size 8 sample.svs
+```
+
+Probe output calls the first batch “study-cold”; it does not claim to flush the
+operating-system file cache. Use the live viewer JSONL for scheduler, source,
+upload, and app-UI CPU diagnostics rather than treating `tile_probe` as an
+end-to-end UI benchmark. End-to-end frame-time acceptance still requires an
+external capture or additional renderer instrumentation.
+
+For measurement only, `DICOM_VIEWER_TILE_WORKERS` and
+`DICOM_VIEWER_JP2K_THREADS` override the bounded viewer-worker and JP2K CPU
+thread counts. `DICOM_VIEWER_INTERACTIVE_BATCH_SIZE` accepts `2`, `4`, or `8`
+for CPU-backed interactive tile reads and defaults to `2`. Invalid values
+retain the measured defaults.
 
 ## Verify
 

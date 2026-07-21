@@ -17,6 +17,7 @@ rfd = { workspace = true }
 thiserror = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+metal = { workspace = true }
 metal-wgpu-interop = { version = "=0.1.0", path = "../../crates/metal-wgpu-interop" }
 
 [dev-dependencies]

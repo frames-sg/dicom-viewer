@@ -157,6 +157,30 @@ pub(in crate::app) fn facts_panel(ui: &mut egui::Ui, summary: &StudySummary) {
                     }
                     kv_row(ui, "Tile output", &summary.tile_decode_backend.to_string());
 
+                    section_header(ui, "Color management");
+                    kv_row(ui, "Status", &summary.color_management.status.to_string());
+                    kv_row(
+                        ui,
+                        "Mode",
+                        &summary.color_management.applied_mode.to_string(),
+                    );
+                    optional_kv_row(
+                        ui,
+                        "Profile bytes",
+                        summary
+                            .color_management
+                            .byte_size
+                            .map(|bytes| format_integer(bytes as u64)),
+                    );
+                    optional_kv_row(
+                        ui,
+                        "Provenance",
+                        summary.color_management.provenance.as_deref(),
+                    );
+                    if let Some(sha256) = &summary.color_management.sha256 {
+                        kv_row(ui, "SHA-256", sha256);
+                    }
+
                     if summary.mpp.is_some() || summary.objective_power.is_some() {
                         section_header(ui, "Optics");
                         if let Some((x, y)) = summary.mpp {

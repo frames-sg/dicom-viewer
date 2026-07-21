@@ -32,7 +32,7 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           repository: frames-sg/wsi-rs
-          ref: v0.5.0
+          ref: v0.5.2
           path: wsi-rs
           persist-credentials: false
 
@@ -112,7 +112,7 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           repository: frames-sg/wsi-rs
-          ref: v0.5.0
+          ref: v0.5.2
           path: wsi-rs
           persist-credentials: false
 
