@@ -1,5 +1,5 @@
 #[cfg(target_os = "macos")]
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -7,6 +7,10 @@ use dicom_viewer_core::{ColorLut3d, RgbaTile, ViewerOpenOptions};
 use eframe::{egui, egui_wgpu, wgpu};
 
 use super::DecodedTile;
+
+#[cfg(target_os = "macos")]
+// Keep the renderer copy bound aligned with the process-wide ICC proof cache.
+const RENDERER_COLOR_LUT_CACHE_CAPACITY: usize = 16;
 
 const RGB_TO_RGBA_SHADER: &str = r#"
 struct TileLayout {
@@ -81,6 +85,83 @@ struct WgpuContext {
     state: egui_wgpu::RenderState,
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ColorLutTextureKey {
+    profile_sha256: String,
+    edge: u32,
+}
+
+#[cfg(target_os = "macos")]
+struct ColorLutTextureCache {
+    entries: HashMap<ColorLutTextureKey, Arc<wgpu::Texture>>,
+    lru: VecDeque<ColorLutTextureKey>,
+}
+
+#[cfg(target_os = "macos")]
+impl ColorLutTextureCache {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            lru: VecDeque::new(),
+        }
+    }
+
+    fn get_or_insert_with(
+        &mut self,
+        key: ColorLutTextureKey,
+        create: impl FnOnce() -> wgpu::Texture,
+    ) -> Arc<wgpu::Texture> {
+        if let Some(texture) = self.entries.get(&key).cloned() {
+            self.touch(&key);
+            return texture;
+        }
+        while self.entries.len() >= RENDERER_COLOR_LUT_CACHE_CAPACITY {
+            let Some(evicted) = self.lru.pop_front() else {
+                self.entries.clear();
+                break;
+            };
+            self.entries.remove(&evicted);
+        }
+        let texture = Arc::new(create());
+        self.entries.insert(key.clone(), Arc::clone(&texture));
+        self.lru.push_back(key);
+        texture
+    }
+
+    fn touch(&mut self, key: &ColorLutTextureKey) {
+        if let Some(position) = self.lru.iter().position(|candidate| candidate == key) {
+            self.lru.remove(position);
+        }
+        self.lru.push_back(key.clone());
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.lru.clear();
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    fn contains_profile(&self, profile_sha256: &str) -> bool {
+        self.entries
+            .keys()
+            .any(|key| key.profile_sha256 == profile_sha256)
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct ColorLutBinding {
+    view: wgpu::TextureView,
+    edge: u32,
+    enabled: bool,
+    owner: Arc<wgpu::Texture>,
+}
+
 /// Owns a native wgpu texture and its egui registration as one lifetime.
 pub(super) struct RegisteredTileTexture {
     context: Arc<WgpuContext>,
@@ -122,9 +203,9 @@ pub(super) struct WgpuTileUploader {
     #[cfg(target_os = "macos")]
     color_lut_sampler: wgpu::Sampler,
     #[cfg(target_os = "macos")]
-    identity_color_lut: wgpu::Texture,
+    identity_color_lut: Arc<wgpu::Texture>,
     #[cfg(target_os = "macos")]
-    color_luts: HashMap<String, wgpu::Texture>,
+    color_luts: ColorLutTextureCache,
     #[cfg(target_os = "macos")]
     metal_bridge: Option<metal_wgpu_interop::MetalWgpuBridge>,
     #[cfg(target_os = "macos")]
@@ -176,13 +257,13 @@ impl WgpuTileUploader {
             ..wgpu::SamplerDescriptor::default()
         });
         #[cfg(target_os = "macos")]
-        let identity_color_lut = create_color_lut_texture(
+        let identity_color_lut = Arc::new(create_color_lut_texture(
             &state.device,
             &state.queue,
             2,
             &identity_color_lut_rgba(),
             "DICOM viewer identity color LUT",
-        );
+        ));
         #[cfg(target_os = "macos")]
         let (metal_bridge, metal_bridge_error) =
             match metal_wgpu_interop::MetalWgpuBridge::new(&state.device) {
@@ -198,7 +279,7 @@ impl WgpuTileUploader {
             #[cfg(target_os = "macos")]
             identity_color_lut,
             #[cfg(target_os = "macos")]
-            color_luts: HashMap::new(),
+            color_luts: ColorLutTextureCache::new(),
             #[cfg(target_os = "macos")]
             metal_bridge,
             #[cfg(target_os = "macos")]
@@ -221,6 +302,21 @@ impl WgpuTileUploader {
         return self.metal_bridge_error.as_deref();
         #[cfg(not(target_os = "macos"))]
         None
+    }
+
+    pub(super) fn clear_study_resources(&mut self) {
+        #[cfg(target_os = "macos")]
+        self.color_luts.clear();
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(super) fn cache_color_lut_for_test(&mut self, color_lut: &ColorLut3d) {
+        drop(self.color_lut_binding(Some(color_lut)));
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(super) fn cached_color_lut_count_for_test(&self) -> usize {
+        self.color_luts.len()
     }
 
     /// Upload one coherent UI batch. Every Metal conversion is encoded into a
@@ -416,14 +512,14 @@ impl WgpuTileUploader {
             wgpu::TextureUsages::STORAGE_BINDING,
         );
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let (color_lut_view, color_lut_edge, use_color_lut) = self.color_lut_view(color_lut);
+        let color_lut = self.color_lut_binding(color_lut);
         let params = [
             width,
             height,
             imported.pitch_bytes(),
             imported.byte_offset(),
-            u32::from(use_color_lut),
-            color_lut_edge,
+            u32::from(color_lut.enabled),
+            color_lut.edge,
             0,
             0,
         ];
@@ -464,7 +560,7 @@ impl WgpuTileUploader {
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
-                        resource: wgpu::BindingResource::TextureView(&color_lut_view),
+                        resource: wgpu::BindingResource::TextureView(&color_lut.view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 4,
@@ -485,35 +581,42 @@ impl WgpuTileUploader {
             texture,
             width,
             height,
+            _color_lut_owner: Some(color_lut.owner),
         })
     }
 
     #[cfg(target_os = "macos")]
-    fn color_lut_view(&mut self, color_lut: Option<&ColorLut3d>) -> (wgpu::TextureView, u32, bool) {
+    fn color_lut_binding(&mut self, color_lut: Option<&ColorLut3d>) -> ColorLutBinding {
         let Some(color_lut) = color_lut else {
-            return (
-                self.identity_color_lut
-                    .create_view(&wgpu::TextureViewDescriptor::default()),
-                2,
-                false,
-            );
+            let owner = Arc::clone(&self.identity_color_lut);
+            return ColorLutBinding {
+                view: owner.create_view(&wgpu::TextureViewDescriptor::default()),
+                edge: 2,
+                enabled: false,
+                owner,
+            };
         };
-        let key = color_lut.profile_sha256().to_string();
-        if !self.color_luts.contains_key(&key) {
-            let texture = create_color_lut_texture(
-                &self.context.state.device,
-                &self.context.state.queue,
+        let key = ColorLutTextureKey {
+            profile_sha256: color_lut.profile_sha256().to_string(),
+            edge: color_lut.edge(),
+        };
+        let device = self.context.state.device.clone();
+        let queue = self.context.state.queue.clone();
+        let owner = self.color_luts.get_or_insert_with(key, || {
+            create_color_lut_texture(
+                &device,
+                &queue,
                 color_lut.edge(),
                 color_lut.rgba(),
                 "DICOM viewer embedded ICC color LUT",
-            );
-            self.color_luts.insert(key.clone(), texture);
+            )
+        });
+        ColorLutBinding {
+            view: owner.create_view(&wgpu::TextureViewDescriptor::default()),
+            edge: color_lut.edge(),
+            enabled: true,
+            owner,
         }
-        (
-            self.color_luts[&key].create_view(&wgpu::TextureViewDescriptor::default()),
-            color_lut.edge(),
-            true,
-        )
     }
 }
 
@@ -598,6 +701,8 @@ struct PreparedTexture {
     texture: wgpu::Texture,
     width: u32,
     height: u32,
+    #[cfg(target_os = "macos")]
+    _color_lut_owner: Option<Arc<wgpu::Texture>>,
 }
 
 fn prepare_and_register_cpu<Prepared, Registered, Error>(
@@ -651,6 +756,8 @@ fn prepare_cpu_texture(
         texture,
         width: tile.width,
         height: tile.height,
+        #[cfg(target_os = "macos")]
+        _color_lut_owner: None,
     })
 }
 
@@ -756,6 +863,35 @@ fn conversion_pipeline(
 }
 
 #[cfg(test)]
+pub(super) fn render_state() -> Option<egui_wgpu::RenderState> {
+    let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+    #[cfg(target_os = "macos")]
+    {
+        descriptor.backends = wgpu::Backends::METAL;
+    }
+    let instance = wgpu::Instance::new(descriptor);
+    let adapter =
+        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+            .ok()?;
+    let (device, queue) =
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()?;
+    let renderer = egui_wgpu::Renderer::new(
+        &device,
+        wgpu::TextureFormat::Rgba8Unorm,
+        egui_wgpu::RendererOptions::PREDICTABLE,
+    );
+    Some(egui_wgpu::RenderState {
+        adapter,
+        #[cfg(not(target_arch = "wasm32"))]
+        available_adapters: Vec::new(),
+        device,
+        queue,
+        target_format: wgpu::TextureFormat::Rgba8Unorm,
+        renderer: Arc::new(egui::mutex::RwLock::new(renderer)),
+    })
+}
+
+#[cfg(test)]
 mod tests {
     use std::cell::RefCell;
     use std::sync::{mpsc, Arc};
@@ -778,34 +914,6 @@ mod tests {
 
         assert_eq!(result, Ok(8));
         assert_eq!(*events.borrow(), ["prepare", "register"]);
-    }
-
-    fn render_state() -> Option<egui_wgpu::RenderState> {
-        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
-        #[cfg(target_os = "macos")]
-        {
-            descriptor.backends = wgpu::Backends::METAL;
-        }
-        let instance = wgpu::Instance::new(descriptor);
-        let adapter =
-            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
-                .ok()?;
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()?;
-        let renderer = egui_wgpu::Renderer::new(
-            &device,
-            wgpu::TextureFormat::Rgba8Unorm,
-            egui_wgpu::RendererOptions::PREDICTABLE,
-        );
-        Some(egui_wgpu::RenderState {
-            adapter,
-            #[cfg(not(target_arch = "wasm32"))]
-            available_adapters: Vec::new(),
-            device,
-            queue,
-            target_format: wgpu::TextureFormat::Rgba8Unorm,
-            renderer: Arc::new(egui::mutex::RwLock::new(renderer)),
-        })
     }
 
     fn read_texture(
@@ -963,6 +1071,50 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    fn synthetic_color_lut(profile: &str) -> ColorLut3d {
+        ColorLut3d::from_rgba8(2, identity_color_lut_rgba(), profile).unwrap()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn renderer_color_lut_cache_is_bounded_and_evicts_the_least_recent_profile() {
+        let Some(state) = render_state() else {
+            return;
+        };
+        let mut uploader = WgpuTileUploader::new(state);
+        for index in 0..16 {
+            let lut = synthetic_color_lut(&format!("profile-{index}"));
+            drop(uploader.color_lut_binding(Some(&lut)));
+        }
+
+        let recently_used = synthetic_color_lut("profile-0");
+        drop(uploader.color_lut_binding(Some(&recently_used)));
+        let newest = synthetic_color_lut("profile-16");
+        drop(uploader.color_lut_binding(Some(&newest)));
+
+        assert_eq!(uploader.color_luts.len(), 16);
+        assert!(uploader.color_luts.contains_profile("profile-0"));
+        assert!(!uploader.color_luts.contains_profile("profile-1"));
+        assert!(uploader.color_luts.contains_profile("profile-16"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn renderer_study_clear_releases_all_cached_color_luts() {
+        let Some(state) = render_state() else {
+            return;
+        };
+        let mut uploader = WgpuTileUploader::new(state);
+        let lut = synthetic_color_lut("study-profile");
+        drop(uploader.color_lut_binding(Some(&lut)));
+        assert_eq!(uploader.color_luts.len(), 1);
+
+        uploader.clear_study_resources();
+
+        assert_eq!(uploader.color_luts.len(), 0);
+    }
+
+    #[cfg(target_os = "macos")]
     #[test]
     fn mixed_cpu_and_multiple_metal_tiles_use_exactly_one_submission() {
         let Some(state) = render_state() else {
@@ -1087,7 +1239,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn metal_color_lut_matches_expected_srgb_code_values() {
+    fn active_metal_color_lut_survives_cache_clear_and_matches_expected_code_values() {
         let Some(state) = render_state() else {
             return;
         };
@@ -1112,6 +1264,10 @@ mod tests {
         let prepared = uploader
             .prepare_metal_image(&mut encoder, &image, Some(&lut))
             .unwrap();
+        assert!(prepared._color_lut_owner.is_some());
+        assert_eq!(uploader.color_luts.len(), 1);
+        uploader.clear_study_resources();
+        assert_eq!(uploader.color_luts.len(), 0);
         queue.submit([encoder.take().unwrap().finish()]);
         let uploaded = uploader.register(prepared);
 

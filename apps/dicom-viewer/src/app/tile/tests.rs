@@ -91,6 +91,23 @@ fn tile_key_generation_is_the_only_stale_result_identity() {
     assert!(is_stale_job(key(3), 4));
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn clearing_tile_renderer_releases_study_color_luts() {
+    let Some(state) = upload::render_state() else {
+        return;
+    };
+    let mut renderer = TileRenderer::new(state, 64);
+    let lut = dicom_viewer_core::ColorLut3d::from_rgba8(2, vec![0; 2 * 2 * 2 * 4], "study-profile")
+        .unwrap();
+    renderer.uploader.cache_color_lut_for_test(&lut);
+    assert_eq!(renderer.uploader.cached_color_lut_count_for_test(), 1);
+
+    renderer.clear();
+
+    assert_eq!(renderer.uploader.cached_color_lut_count_for_test(), 0);
+}
+
 #[test]
 fn edge_tile_texture_preflight_uses_checked_final_rgba_bytes() {
     let level = LevelInfo {

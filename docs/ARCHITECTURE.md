@@ -147,6 +147,10 @@ independent color transform. Cache, worker, transform, or proof infrastructure
 failure is visible and forces CPU color conversion; it never accepts an
 unproved LUT.
 
+The Metal uploader keeps at most 16 GPU copies of proved LUTs in an LRU and
+clears them when the study is replaced. A LUT evicted or cleared while an
+upload batch is being encoded remains explicitly owned through submission.
+
 ## Metal boundary
 
 The application and core crates use `forbid(unsafe_code)`. The

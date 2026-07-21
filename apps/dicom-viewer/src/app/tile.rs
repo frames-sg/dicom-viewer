@@ -265,6 +265,7 @@ impl TileRenderer {
     pub(super) fn clear(&mut self) {
         self.loader.clear_queued();
         self.store.clear();
+        self.uploader.clear_study_resources();
         self.stats.clear_study_counters();
         self.demand_lanes.clear();
         self.active_demand_keys.clear();
