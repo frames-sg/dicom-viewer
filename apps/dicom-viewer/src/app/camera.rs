@@ -43,6 +43,13 @@ impl Default for CameraView {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(super) struct CameraFrame {
+    pub(super) rendered: CameraView,
+    pub(super) target: CameraView,
+    pub(super) animating: bool,
+}
+
 #[derive(Debug)]
 pub(super) struct CameraMotion {
     pub(super) rendered: CameraView,
@@ -170,12 +177,29 @@ impl CameraState {
         (rendered, animating)
     }
 
+    pub(super) fn frame(&mut self, rect: Rect, summary: &StudySummary, dt: f32) -> CameraFrame {
+        let (rendered, animating) = self.render_view(rect, summary, dt);
+        CameraFrame {
+            rendered,
+            target: self.target,
+            animating,
+        }
+    }
+
     pub(super) fn pan_by(&mut self, delta_screen: Vec2) {
         if delta_screen == Vec2::ZERO {
             return;
         }
         self.leave_fit_mode();
         self.target.center_base -= delta_screen / self.target.zoom.max(MIN_ZOOM);
+    }
+
+    pub(super) fn pan_by_rendered(&mut self, delta_screen: Vec2, rendered: CameraView) {
+        if delta_screen == Vec2::ZERO {
+            return;
+        }
+        self.leave_fit_mode();
+        self.target.center_base -= delta_screen / rendered.zoom.max(MIN_ZOOM);
     }
 
     pub(super) fn zoom_around(&mut self, rect: Rect, pointer: egui::Pos2, factor: f32) {
@@ -191,6 +215,25 @@ impl CameraState {
         let base_under_pointer = old_top_left + pointer_canvas / old_zoom;
         let new_top_left = base_under_pointer - pointer_canvas / new_zoom;
         self.target.center_base = new_top_left + rect.size() / (2.0 * new_zoom);
+        self.target.zoom = new_zoom;
+    }
+
+    pub(super) fn zoom_around_rendered(
+        &mut self,
+        rect: Rect,
+        pointer: egui::Pos2,
+        factor: f32,
+        rendered: CameraView,
+    ) {
+        let new_zoom = (self.target.zoom * factor).clamp(self.minimum_zoom, MAX_ZOOM);
+        if (new_zoom - self.target.zoom).abs() < f32::EPSILON {
+            return;
+        }
+
+        self.leave_fit_mode();
+        let base_under_pointer =
+            rendered.center_base + (pointer - rect.center()) / rendered.zoom.max(MIN_ZOOM);
+        self.target.center_base = base_under_pointer - (pointer - rect.center()) / new_zoom;
         self.target.zoom = new_zoom;
     }
 

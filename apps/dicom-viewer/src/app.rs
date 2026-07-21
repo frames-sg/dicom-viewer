@@ -19,7 +19,7 @@ mod viewport;
 use camera::{wheel_zoom_factor, CameraState, CameraView};
 #[cfg(test)]
 use camera::{CameraMotion, MAX_ZOOM, MIN_ZOOM};
-use canvas::{CanvasCamera, SlideCanvas};
+use canvas::SlideCanvas;
 use measurement::{
     clamp_base_point, draw_measurement_overlay, measurement_ready_status, MeasurementInteraction,
     MeasurementState,
@@ -358,23 +358,38 @@ impl eframe::App for DicomViewerApp {
                     self.camera.zoom_about_center(rect, 1.25);
                 }
 
-                let measurement_view = self.camera.target_view();
+                let accepts_keys =
+                    (response.hovered() || response.has_focus()) && !ui.ctx().text_edit_focused();
+                let zoom_before_keys = self.camera.target_view().zoom;
+                if self.camera.handle_keys(ui, rect, accepts_keys) {
+                    if (self.camera.target_view().zoom - zoom_before_keys).abs() > f32::EPSILON {
+                        self.canvas.record_zoom_input();
+                    }
+                    ui.ctx().request_repaint();
+                }
+
+                let camera_frame = self.camera.frame(rect, study.summary(), stable_dt);
+                if camera_frame.animating {
+                    ui.ctx().request_repaint();
+                }
                 let measurement_interaction = self.handle_measurement_interaction(
                     ui,
                     &response,
                     rect,
                     study.summary(),
-                    measurement_view,
+                    camera_frame.rendered,
                 );
 
                 if response.dragged() && !measurement_interaction.drag_consumed {
-                    self.camera.pan_by(response.drag_delta());
+                    self.camera
+                        .pan_by_rendered(response.drag_delta(), camera_frame.rendered);
                     ui.ctx().request_repaint();
                 }
                 if response.double_clicked() && !measurement_interaction.click_consumed {
                     let pointer = response.interact_pointer_pos().unwrap_or(rect.center());
                     self.canvas.record_zoom_input();
-                    self.camera.zoom_around(rect, pointer, 2.0);
+                    self.camera
+                        .zoom_around_rendered(rect, pointer, 2.0, camera_frame.rendered);
                     ui.ctx().request_repaint();
                 }
 
@@ -385,8 +400,12 @@ impl eframe::App for DicomViewerApp {
                             .input(|input| input.pointer.hover_pos())
                             .unwrap_or(rect.center());
                         self.canvas.record_zoom_input();
-                        self.camera
-                            .zoom_around(rect, pointer, wheel_zoom_factor(scroll_y));
+                        self.camera.zoom_around_rendered(
+                            rect,
+                            pointer,
+                            wheel_zoom_factor(scroll_y),
+                            camera_frame.rendered,
+                        );
                         ui.ctx().request_repaint();
                     }
                     let pinch = ui.input(|input| input.zoom_delta());
@@ -395,7 +414,12 @@ impl eframe::App for DicomViewerApp {
                             .input(|input| input.pointer.hover_pos())
                             .unwrap_or(rect.center());
                         self.canvas.record_zoom_input();
-                        self.camera.zoom_around(rect, pointer, pinch);
+                        self.camera.zoom_around_rendered(
+                            rect,
+                            pointer,
+                            pinch,
+                            camera_frame.rendered,
+                        );
                         ui.ctx().request_repaint();
                     }
                     if ui.input(|input| input.pointer.any_down()) {
@@ -403,45 +427,32 @@ impl eframe::App for DicomViewerApp {
                     }
                 }
 
-                let accepts_keys =
-                    (response.hovered() || response.has_focus()) && !ui.ctx().text_edit_focused();
-                let zoom_before_keys = self.camera.target_view().zoom;
-                if self.camera.handle_keys(ui, rect, accepts_keys) {
-                    if (self.camera.target_view().zoom - zoom_before_keys).abs() > f32::EPSILON {
-                        self.canvas.record_zoom_input();
-                    }
-                    ui.ctx().request_repaint();
-                }
-                let (render_view, animating_camera) =
-                    self.camera.render_view(rect, study.summary(), stable_dt);
-                let target_view = self.camera.target_view();
-                if animating_camera {
-                    ui.ctx().request_repaint();
-                }
                 self.canvas.paint(
                     ui.ctx(),
                     &painter,
                     rect,
                     &study,
                     self.active_generation,
-                    CanvasCamera {
-                        rendered: render_view,
-                        target: target_view,
-                        camera_animating: animating_camera,
-                    },
+                    camera_frame,
                 );
                 if let Some((count, reason)) = self.canvas.cpu_fallback() {
                     if count > self.reported_cpu_fallbacks {
                         self.reported_cpu_fallbacks = count;
                         self.status = format!(
-                            "Metal preferred → wgpu; CPU fallback used for {count} tile(s): {reason}"
+                            "{} preferred → wgpu; CPU fallback used for {count} tile(s): {reason}",
+                            study.summary().tile_decode_backend
                         );
                     }
                 }
 
-                let hover_base = response
-                    .hover_pos()
-                    .map(|p| screen_to_base(rect, p, render_view.center_base, render_view.zoom));
+                let hover_base = response.hover_pos().map(|p| {
+                    screen_to_base(
+                        rect,
+                        p,
+                        camera_frame.rendered.center_base,
+                        camera_frame.rendered.zoom,
+                    )
+                });
                 let tile_failure = self.canvas.tile_failure();
                 let debug_stats = self.canvas.debug_stats_text();
                 draw_canvas_overlays(
@@ -449,7 +460,7 @@ impl eframe::App for DicomViewerApp {
                     rect,
                     OverlayInfo {
                         summary: study.summary(),
-                        zoom: render_view.zoom,
+                        zoom: camera_frame.rendered.zoom,
                         frame_rate: self.frame_stats.info(),
                         hover_base,
                         tile_failure,
@@ -462,8 +473,8 @@ impl eframe::App for DicomViewerApp {
                     study.summary(),
                     &self.measurement,
                     hover_base,
-                    render_view.center_base,
-                    render_view.zoom,
+                    camera_frame.rendered.center_base,
+                    camera_frame.rendered.zoom,
                 );
             });
         if let Some(started) = app_ui_started {

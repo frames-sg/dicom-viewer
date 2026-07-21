@@ -84,6 +84,13 @@ jobs:
           RUSTFLAGS: -D warnings
         run: cargo test --workspace --all-targets --locked
 
+      - name: Check CUDA feature compilation
+        if: runner.os == 'Linux'
+        working-directory: dicom-viewer
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo check --workspace --all-targets --locked --features cuda
+
       - name: Test default macOS Metal tile output
         if: runner.os == 'macOS'
         working-directory: dicom-viewer

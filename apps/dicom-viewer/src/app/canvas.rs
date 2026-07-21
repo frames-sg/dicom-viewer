@@ -8,6 +8,8 @@ use dicom_viewer_core::{
 };
 use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Rect, Stroke, StrokeKind};
 
+use super::camera::CameraFrame;
+#[cfg(test)]
 use super::camera::CameraView;
 use super::level_warmer::{LevelWarmer, LevelWarmerEvent};
 use super::theme;
@@ -25,13 +27,6 @@ const OVERVIEW_PIN_BYTES: usize = 32 * 1024 * 1024;
 const MAX_FALLBACK_TILE_BYTES: u64 = OVERVIEW_PIN_BYTES as u64;
 const MAX_PLANNED_TILES: usize = 8_192;
 pub(super) const TILE_RESIDENT_CACHE_BYTES: usize = 256 * 1024 * 1024;
-
-#[derive(Debug, Clone, Copy)]
-pub(super) struct CanvasCamera {
-    pub(super) rendered: CameraView,
-    pub(super) target: CameraView,
-    pub(super) camera_animating: bool,
-}
 
 #[derive(Debug)]
 struct OverviewTileCache {
@@ -164,7 +159,7 @@ impl SlideCanvas {
         rect: Rect,
         study: &Arc<ViewerStudy>,
         generation: u64,
-        camera: CanvasCamera,
+        camera: CameraFrame,
     ) {
         self.tiles.request_debug_stats_repaint(ctx);
         let summary = study.summary();
@@ -201,7 +196,7 @@ impl SlideCanvas {
         let foreground_work_pending = foreground.pending + foreground.missing > 0;
         let prefetch_coverage = self.tiles.coverage(&plan.prefetch, plan.prefetch_level);
         let activity = frame_activity(
-            camera.camera_animating,
+            camera.animating,
             plan.prefetch_level != plan.render_level,
             foreground_work_pending,
             prefetch_coverage.pending,
@@ -461,7 +456,7 @@ impl TileFramePlan {
         rect: Rect,
         generation: u64,
         overview: Arc<[VisibleTile]>,
-        camera: CanvasCamera,
+        camera: CameraFrame,
         displayed_level: Option<LevelIndex>,
         previous_render_level: Option<LevelIndex>,
     ) -> Result<Self, ()> {
@@ -472,7 +467,7 @@ impl TileFramePlan {
             previous_render_level,
         )
         .unwrap_or(preferred_render_level);
-        let target_level = if camera.camera_animating {
+        let target_level = if camera.animating {
             choose_render_level(summary, camera.target.zoom).unwrap_or(render_level)
         } else {
             preferred_render_level
@@ -486,7 +481,7 @@ impl TileFramePlan {
             camera.rendered.zoom,
             0,
         );
-        let prefetch = if camera.camera_animating {
+        let prefetch = if camera.animating {
             visible_tiles(
                 rect,
                 target_level,
@@ -549,7 +544,7 @@ impl TileFramePlan {
                 ),
             })
             .collect::<Vec<_>>();
-        let fallback_prefetch_layers = if camera.camera_animating {
+        let fallback_prefetch_layers = if camera.animating {
             Vec::new()
         } else {
             fallback_levels
@@ -848,10 +843,10 @@ mod tests {
             rect,
             9,
             Arc::from(overview_tiles(&summary, 9)),
-            CanvasCamera {
+            CameraFrame {
                 rendered: view,
                 target: view,
-                camera_animating: false,
+                animating: false,
             },
             None,
             None,
@@ -911,10 +906,10 @@ mod tests {
             rect,
             9,
             Arc::from(overview_tiles(&summary, 9)),
-            CanvasCamera {
+            CameraFrame {
                 rendered: view,
                 target: view,
-                camera_animating: false,
+                animating: false,
             },
             None,
             None,
@@ -952,10 +947,10 @@ mod tests {
             rect,
             9,
             Arc::from(overview_tiles(&summary, 9)),
-            CanvasCamera {
+            CameraFrame {
                 rendered,
                 target,
-                camera_animating: true,
+                animating: true,
             },
             None,
             None,
@@ -988,7 +983,7 @@ mod tests {
             rect,
             9,
             Arc::from(overview_tiles(&summary, 9)),
-            CanvasCamera {
+            CameraFrame {
                 rendered: CameraView {
                     center_base: vec2(512.0, 512.0),
                     zoom: 0.25,
@@ -997,7 +992,7 @@ mod tests {
                     center_base: vec2(512.0, 512.0),
                     zoom: 1.0,
                 },
-                camera_animating: true,
+                animating: true,
             },
             None,
             None,
@@ -1026,10 +1021,10 @@ mod tests {
             rect,
             9,
             Arc::from(overview_tiles(&summary, 9)),
-            CanvasCamera {
+            CameraFrame {
                 rendered: view,
                 target: view,
-                camera_animating: false,
+                animating: false,
             },
             Some(LevelIndex::from_u32(1)),
             Some(LevelIndex::from_u32(1)),
@@ -1057,10 +1052,10 @@ mod tests {
             rect,
             9,
             Arc::from(overview_tiles(&summary, 9)),
-            CanvasCamera {
+            CameraFrame {
                 rendered: view,
                 target: view,
-                camera_animating: false,
+                animating: false,
             },
             Some(LevelIndex::from_u32(1)),
             Some(LevelIndex::from_u32(1)),

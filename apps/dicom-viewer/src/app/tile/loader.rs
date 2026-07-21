@@ -165,12 +165,15 @@ trait TileSource: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TileSourceError {
     Cancelled,
+    CudaDownload(String),
     Failed(String),
 }
 
 impl TileSourceError {
     fn from_viewer(error: dicom_viewer_core::ViewerError) -> Self {
-        if error.is_cancelled() {
+        if error.is_cuda_download_failure() {
+            Self::CudaDownload(error.to_string())
+        } else if error.is_cancelled() {
             Self::Cancelled
         } else {
             Self::Failed(error.to_string())
@@ -839,6 +842,19 @@ fn decode_source_requests(
                 source_cancellations = 1;
                 cancelled_tiles(keys)
             }
+            Ok(Err(TileSourceError::CudaDownload(error))) => {
+                let recovery = retry_tiles_individually(
+                    source,
+                    keys,
+                    requests,
+                    TileReadMode::CpuFallback,
+                    control,
+                    error,
+                );
+                retries = recovery.retries;
+                source_cancellations = recovery.source_cancellations;
+                recovery.results
+            }
             Ok(Err(TileSourceError::Failed(error)))
                 if requests.len() > 1 && !control.cancellation().is_cancelled() =>
             {
@@ -935,6 +951,9 @@ fn retry_tiles_individually(
                         used_cpu_fallback: false,
                     };
                 }
+                Ok(Err(TileSourceError::CudaDownload(error))) => Err(format!(
+                    "tile batch recovery after {batch_error} hit another CUDA download failure: {error}"
+                )),
                 Ok(Err(TileSourceError::Failed(error))) => Err(format!(
                     "tile batch recovery after {batch_error} failed: {error}"
                 )),
@@ -1079,6 +1098,88 @@ mod tests {
         assert_eq!(configured_interactive_batch_size(Some("1")), 2);
         assert_eq!(configured_interactive_batch_size(Some("16")), 2);
         assert_eq!(configured_interactive_batch_size(Some("invalid")), 2);
+    }
+
+    struct CudaDownloadRetrySource {
+        calls: Mutex<Vec<(TileReadMode, Vec<u64>)>>,
+    }
+
+    impl TileSource for CudaDownloadRetrySource {
+        fn read_tiles(
+            &self,
+            requests: &[(LevelIndex, TileCoord)],
+            read_mode: TileReadMode,
+            _control: &ReadControl,
+        ) -> std::result::Result<Vec<DecodedTile>, TileSourceError> {
+            self.calls.lock().unwrap().push((
+                read_mode,
+                requests.iter().map(|(_, coord)| coord.col()).collect(),
+            ));
+            match read_mode {
+                TileReadMode::Preferred => Err(TileSourceError::CudaDownload(
+                    "synthetic CUDA download failure".into(),
+                )),
+                TileReadMode::CpuFallback => Ok(requests
+                    .iter()
+                    .map(|(_, coord)| {
+                        DecodedTile::Cpu(dicom_viewer_core::RgbaTile {
+                            width: 1,
+                            height: 1,
+                            rgba: vec![coord.col() as u8, 0, 0, 255],
+                        })
+                    })
+                    .collect()),
+            }
+        }
+
+        fn device_was_preferred(&self, read_mode: TileReadMode) -> bool {
+            read_mode == TileReadMode::Preferred
+        }
+    }
+
+    #[test]
+    fn cuda_download_failure_gets_exactly_one_ordered_cpu_retry_per_tile() {
+        let source = CudaDownloadRetrySource {
+            calls: Mutex::new(Vec::new()),
+        };
+        let keys = vec![key(0), key(1)];
+        let requests = vec![
+            (LevelIndex::from_u32(0), TileCoord::new(0, 0)),
+            (LevelIndex::from_u32(0), TileCoord::new(1, 0)),
+        ];
+
+        let decoded = decode_source_requests(
+            &source,
+            keys.clone(),
+            &requests,
+            TileReadMode::Preferred,
+            &ReadControl::default(),
+        );
+
+        assert_eq!(decoded.retries, 2);
+        assert_eq!(
+            decoded
+                .results
+                .iter()
+                .map(|result| result.key)
+                .collect::<Vec<_>>(),
+            keys
+        );
+        assert!(decoded.results.iter().all(|result| {
+            result.used_cpu_fallback
+                && matches!(
+                    result.outcome,
+                    TileLoadOutcome::Decoded(DecodedTile::Cpu(_))
+                )
+        }));
+        assert_eq!(
+            *source.calls.lock().unwrap(),
+            vec![
+                (TileReadMode::Preferred, vec![0, 1]),
+                (TileReadMode::CpuFallback, vec![0]),
+                (TileReadMode::CpuFallback, vec![1]),
+            ]
+        );
     }
 
     fn study() -> Arc<ViewerStudy> {

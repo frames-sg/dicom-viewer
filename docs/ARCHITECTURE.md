@@ -62,8 +62,9 @@ visible.
 `TileState` owns the lifecycle of a cache entry:
 
 ```text
-missing -> queued -> decoding -> decoded -> ready
-                                      \-> failed
+missing -> queued -> decoding -> decoded -> uploading -> ready
+                                      \             \-> failed
+                                       \-> failed
 ```
 
 The queued and decoding states retain `TileReadMode`, so reprioritization does
@@ -99,8 +100,12 @@ they affect current presentation state or statistics.
 | `balanced` | 256 MiB | 128 MiB | 32 MiB |
 | `large` | 512 MiB | 256 MiB | 64 MiB |
 
-`TileStore` accounts decoded and ready resident bytes incrementally and keeps
-the viewer cache at or below its configured ceiling. Eviction order is
+`TileStore` accounts decoded source bytes, ready texture bytes, and synchronous
+upload overlap incrementally and keeps the viewer cache at or below its
+configured ceiling. An uploading entry reserves source plus destination bytes
+and cannot be evicted until the uploader returns ownership. Every upload
+outcome, including missing or surplus results, reconciles that reservation to
+ready, deferred decoded, one CPU retry, or terminal failure. Eviction order is
 unprotected LRU, frame-pinned LRU, then overview-reserved LRU.
 
 The overview plan selects center-nearest tiles from the coarsest regular level
@@ -108,8 +113,16 @@ up to 32 MiB. Those keys receive stronger cache protection than current-frame
 pins so a close-up-to-fit transition can reuse them. The hard viewer ceiling
 still takes precedence over protection.
 
-Queued, decoding, and decoded-awaiting-upload tiles count as loading. Failed
-tiles remain uncovered but do not keep the loading indicator active.
+Queued, decoding, decoded-awaiting-upload, and uploading tiles count as
+loading. Failed tiles remain uncovered but do not keep the loading indicator
+active. Checked edge dimensions reject a tile before decode when its final
+RGBA texture cannot fit; an actual decoded or upload-peak overrun is a
+persistent failure and that key is not decoded again.
+
+The ceiling is deliberately scoped to store-owned decoded data, ready
+textures, and synchronous source-plus-destination upload overlap. Decoder
+scratch, wsi-rs source caches, bounded channel messages, and driver overhead
+are outside it.
 
 ## Upload and color management
 
@@ -126,6 +139,14 @@ used by the existing RGB-to-RGBA compute pass. A profile that cannot meet the
 validated LUT error bound forces the correct CPU color path. A malformed
 profile leaves pixels uncorrected and produces a persistent warning.
 
+The exhaustive `256^3` LUT proof is cached process-locally in a 16-entry LRU
+keyed by profile hash, LUT edge, error bound, and validation-algorithm version.
+Concurrent requests for one key share one proof, and both pass and fail
+results are cached. A cold proof uses at most four scoped workers, each with an
+independent color transform. Cache, worker, transform, or proof infrastructure
+failure is visible and forces CPU color conversion; it never accepts an
+unproved LUT.
+
 ## Metal boundary
 
 The application and core crates use `forbid(unsafe_code)`. The
@@ -135,8 +156,12 @@ adopting a buffer. Imported storage is read-only and independently retained.
 Raw handles do not escape this crate.
 
 CPU fallback is a normal tile-source outcome, not a second presentation
-backend. wgpu remains the only renderer. The `cuda` feature exposes decode
-capability through wsi-rs but does not add CUDA-to-wgpu interop.
+backend. wgpu remains the only renderer. On macOS the renderer-local Metal
+path remains preferred. On other platforms, `--features cuda` creates reusable
+wsi-rs CUDA sessions for compressed decode. A CUDA tile is converted only by
+the wsi-rs `download_cpu` boundary, then follows the existing RGBA, ICC, cache,
+and wgpu upload path. CUDA download failure permits exactly one ordered CPU
+retry. No CUDA allocation or surface internals escape into the viewer.
 
 ## Diagnostics
 

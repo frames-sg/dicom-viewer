@@ -126,6 +126,13 @@ pub(super) enum DecodedTile {
     Metal(dicom_viewer_core::MetalRenderTile),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TileMemoryCost {
+    decoded_bytes: usize,
+    texture_bytes: usize,
+    upload_peak_bytes: usize,
+}
+
 impl DecodedTile {
     fn from_render_tile(tile: RenderTile) -> std::result::Result<Self, String> {
         match tile {
@@ -141,7 +148,6 @@ impl DecodedTile {
         Self::Cpu(tile)
     }
 
-    #[cfg(test)]
     fn dimensions(&self) -> (u32, u32) {
         match self {
             Self::Cpu(tile) => (tile.width, tile.height),
@@ -150,12 +156,43 @@ impl DecodedTile {
         }
     }
 
-    fn decoded_byte_len(&self) -> usize {
-        match self {
-            Self::Cpu(tile) => tile.rgba.len(),
+    fn memory_cost(&self) -> Result<TileMemoryCost, String> {
+        let (width, height) = self.dimensions();
+        let texture_bytes = usize::try_from(width)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(height)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| {
+                format!("decoded tile dimensions {width}x{height} overflow RGBA texture bytes")
+            })?;
+        let decoded_bytes = match self {
+            Self::Cpu(tile) => {
+                if tile.rgba.len() != texture_bytes {
+                    return Err(format!(
+                        "decoded CPU tile dimensions {width}x{height} require {texture_bytes} RGBA bytes, got {}",
+                        tile.rgba.len()
+                    ));
+                }
+                tile.rgba.len()
+            }
             #[cfg(target_os = "macos")]
-            Self::Metal(tile) => tile.byte_len(),
-        }
+            Self::Metal(tile) => tile
+                .resident_image()
+                .map_err(|error| format!("invalid decoded Metal tile: {error}"))?
+                .byte_len(),
+        };
+        let upload_peak_bytes = decoded_bytes
+            .checked_add(texture_bytes)
+            .ok_or_else(|| format!("decoded tile {width}x{height} upload peak overflows usize"))?;
+        Ok(TileMemoryCost {
+            decoded_bytes,
+            texture_bytes,
+            upload_peak_bytes,
+        })
     }
 
     const fn is_cpu(&self) -> bool {
@@ -342,6 +379,16 @@ impl TileRenderer {
         ordered.sort_by_key(|(key, (lane, distance2))| (*lane, *distance2, *key));
         let mut requests = Vec::with_capacity(ordered.len());
         for (key, (lane, distance2)) in ordered {
+            let texture_bytes = study
+                .summary()
+                .levels
+                .iter()
+                .find(|level| level.index == key.level)
+                .ok_or_else(|| format!("level {} is not renderable", key.level))
+                .and_then(|level| planned_texture_bytes(level, key.coord));
+            if self.store.reject_texture_preflight(key, texture_bytes) {
+                continue;
+            }
             let read_mode = match self.store.queue_for_demand(key) {
                 TileDemandStatus::Queue(read_mode) => read_mode,
                 TileDemandStatus::Ready => {
@@ -502,6 +549,58 @@ impl TileRenderer {
         self.store
             .draw_ready_tile(painter, rect, level, tile, center_base, zoom)
     }
+}
+
+fn planned_texture_bytes(level: &LevelInfo, coord: TileCoord) -> Result<usize, String> {
+    let (tile_width, tile_height) = level.tile_layout.display_tile_size();
+    let x = coord
+        .col()
+        .checked_mul(u64::from(tile_width))
+        .ok_or_else(|| {
+            format!(
+                "tile column {} overflows level {} pixel coordinates",
+                coord.col(),
+                level.index
+            )
+        })?;
+    let y = coord
+        .row()
+        .checked_mul(u64::from(tile_height))
+        .ok_or_else(|| {
+            format!(
+                "tile row {} overflows level {} pixel coordinates",
+                coord.row(),
+                level.index
+            )
+        })?;
+    if x >= level.width || y >= level.height {
+        return Err(format!(
+            "tile {},{} is outside level {} dimensions {}x{}",
+            coord.col(),
+            coord.row(),
+            level.index,
+            level.width,
+            level.height
+        ));
+    }
+    let width = level.width.saturating_sub(x).min(u64::from(tile_width));
+    let height = level.height.saturating_sub(y).min(u64::from(tile_height));
+    usize::try_from(width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| {
+            format!(
+                "tile {},{} on level {} overflows final RGBA texture bytes",
+                coord.col(),
+                coord.row(),
+                level.index
+            )
+        })
 }
 
 const fn poll_requires_followup(finished_results: usize, uploaded: usize, failures: usize) -> bool {

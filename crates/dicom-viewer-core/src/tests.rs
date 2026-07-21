@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use super::*;
 use dicom_core::value::PrimitiveValue;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", feature = "cuda"))]
 use dicom_core::value::{fragments::Fragments, PixelFragmentSequence, Value};
 use dicom_core::{DataElement, VR};
 use dicom_dictionary_std::{tags, uids};
@@ -423,6 +423,41 @@ fn macos_metal_options_return_resident_tiles_for_synthetic_dicom_htj2k() {
         assert_eq!((tile.width(), tile.height()), (2, 2));
         assert!(tile.byte_len() >= 12);
     }
+}
+
+#[cfg(all(feature = "cuda", not(target_os = "macos")))]
+#[test]
+fn cuda_viewer_download_matches_strict_cpu_for_synthetic_dicom_htj2k() {
+    let require_cuda = std::env::var_os("J2K_REQUIRE_CUDA_RUNTIME").is_some();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cuda.dcm");
+    write_test_htj2k_dicom(&path, j2k_test_support::htj2k_rgb8_fixture(2, 2));
+    let cpu = ViewerStudy::open_path_with_options(&path, ViewerOpenOptions::cpu_only()).unwrap();
+    let expected = cpu
+        .read_tiles_rgba(&[(LevelIndex::from_u32(0), TileCoord::new(0, 0))])
+        .unwrap()
+        .remove(0);
+    let cuda = ViewerStudy::open_path_with_options(&path, ViewerOpenOptions::auto()).unwrap();
+    assert_eq!(cuda.summary().tile_decode_backend, TileDecodeBackend::Cuda);
+
+    let actual =
+        match cuda.read_tiles_for_render(&[(LevelIndex::from_u32(0), TileCoord::new(0, 0))]) {
+            Ok(mut tiles) => tiles.remove(0),
+            Err(error) if !require_cuda => {
+                eprintln!("skipping CUDA viewer parity without required runtime: {error}");
+                return;
+            }
+            Err(error) => panic!("required CUDA viewer decode/download failed: {error}"),
+        };
+    let RenderTile::Cpu(actual) = actual else {
+        panic!("CUDA renderer boundary must return downloaded CPU pixels to wgpu");
+    };
+
+    assert_eq!(
+        (actual.width, actual.height),
+        (expected.width, expected.height)
+    );
+    assert_eq!(actual.rgba, expected.rgba);
 }
 
 #[cfg(target_os = "macos")]
@@ -986,7 +1021,7 @@ fn write_test_dicom(path: &Path, sop_instance_uid: &'static str, series_uid: &'s
         .unwrap();
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", feature = "cuda"))]
 fn write_test_htj2k_dicom(path: &Path, codestream: Vec<u8>) {
     let sop_instance_uid = "1.2.826.0.1.3680043.10.777.2001";
     let series_uid = "1.2.826.0.1.3680043.10.777.2000";

@@ -1,3 +1,4 @@
+use super::camera::CameraFrame;
 use super::canvas::{fallback_levels, PREFETCH_MARGIN_TILES};
 use super::measurement::{
     clamp_base_point, format_measurement_distance, measurement_distance, MeasurementDistance,
@@ -465,6 +466,74 @@ fn camera_zoom_out_stops_ten_percent_past_fit() {
 
     let fit_zoom = 512.0 / 4096.0;
     assert!((camera.target_view().zoom - fit_zoom * 0.9).abs() < f32::EPSILON);
+}
+
+#[test]
+fn pointer_zoom_preserves_the_base_point_in_the_rendered_frame() {
+    let summary = summary();
+    let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(512.0, 512.0));
+    let pointer = pos2(400.0, 180.0);
+    let mut camera = CameraState::default();
+    camera.reset_for_study(&summary);
+    camera.prepare_canvas(rect, &summary);
+    let _ = camera.frame(rect, &summary, 1.0 / 60.0);
+    camera.zoom_about_center(rect, 4.0);
+    let frame = camera.frame(rect, &summary, 1.0 / 60.0);
+    assert!(frame.animating);
+    assert_ne!(frame.rendered.zoom, frame.target.zoom);
+    let displayed_base = screen_to_base(
+        rect,
+        pointer,
+        frame.rendered.center_base,
+        frame.rendered.zoom,
+    );
+
+    camera.zoom_around_rendered(rect, pointer, 1.25, frame.rendered);
+
+    let target = camera.target_view();
+    let target_base = screen_to_base(rect, pointer, target.center_base, target.zoom);
+    assert!((target_base - displayed_base).length() < 0.001);
+}
+
+#[test]
+fn rendered_camera_frame_is_shared_by_measurement_hit_testing_and_coordinates() {
+    let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(512.0, 512.0));
+    let rendered = CameraView {
+        center_base: vec2(100.0, 120.0),
+        zoom: 2.0,
+    };
+    let target = CameraView {
+        center_base: vec2(300.0, 320.0),
+        zoom: 4.0,
+    };
+    let frame = CameraFrame {
+        rendered,
+        target,
+        animating: true,
+    };
+    let point = vec2(130.0, 140.0);
+    let pointer = rect.center() + (point - frame.rendered.center_base) * frame.rendered.zoom;
+    let measurement = MeasurementState {
+        active: true,
+        points: [Some(point), None],
+        dragging: None,
+    };
+
+    assert_eq!(measurement.hit_test(rect, pointer, frame.rendered), Some(0));
+    assert!(
+        (screen_to_base(
+            rect,
+            pointer,
+            frame.rendered.center_base,
+            frame.rendered.zoom,
+        ) - point)
+            .length()
+            < f32::EPSILON
+    );
+    assert_ne!(
+        screen_to_base(rect, pointer, frame.target.center_base, frame.target.zoom),
+        point
+    );
 }
 
 #[test]

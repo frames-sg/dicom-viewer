@@ -41,6 +41,13 @@ enum TileState {
         byte_len: usize,
         last_used: u64,
     },
+    Uploading {
+        read_mode: TileReadMode,
+        source_byte_len: usize,
+        texture_byte_len: usize,
+        byte_len: usize,
+        last_used: u64,
+    },
     Ready {
         texture: ReadyTexture,
         width: u32,
@@ -72,6 +79,12 @@ pub(super) struct UploadBatchOutcome {
     pub(super) deferred: usize,
     pub(super) cpu_retries: Vec<TileKey>,
     pub(super) failures: usize,
+}
+
+struct UploadBatch {
+    keys: Vec<TileKey>,
+    tiles: Vec<DecodedTile>,
+    deferred: usize,
 }
 
 pub(super) struct TileStore {
@@ -139,6 +152,46 @@ impl TileStore {
         });
     }
 
+    fn record_terminal_failure(&mut self, key: TileKey, message: String) {
+        if matches!(self.entries.get(&key), Some(TileState::Failed)) {
+            return;
+        }
+        self.insert_entry(key, TileState::Failed);
+        self.record_failure(format!(
+            "level {}, tile {},{}: {message}",
+            key.level,
+            key.coord.col(),
+            key.coord.row(),
+        ));
+    }
+
+    pub(super) fn reject_texture_preflight(
+        &mut self,
+        key: TileKey,
+        texture_bytes: Result<usize, String>,
+    ) -> bool {
+        if matches!(self.entries.get(&key), Some(TileState::Failed)) {
+            return true;
+        }
+        match texture_bytes {
+            Ok(texture_bytes) if texture_bytes <= self.max_resident_bytes => false,
+            Ok(texture_bytes) => {
+                self.record_terminal_failure(
+                    key,
+                    format!(
+                        "final RGBA texture requires {texture_bytes} bytes, exceeding the {}-byte viewer ceiling",
+                        self.max_resident_bytes
+                    ),
+                );
+                true
+            }
+            Err(error) => {
+                self.record_terminal_failure(key, error);
+                true
+            }
+        }
+    }
+
     pub(super) fn tile_failure(&self) -> Option<&TileFailureInfo> {
         self.last_failure.as_ref()
     }
@@ -200,6 +253,7 @@ impl TileStore {
             Some(
                 TileState::Decoding { .. }
                 | TileState::Decoded { .. }
+                | TileState::Uploading { .. }
                 | TileState::Ready { .. }
                 | TileState::Failed,
             ) => QueueStatus::Ignore,
@@ -218,9 +272,11 @@ impl TileStore {
     pub(super) fn queue_for_demand(&mut self, key: TileKey) -> TileDemandStatus {
         match self.entries.get(&key) {
             Some(TileState::Queued { read_mode }) => TileDemandStatus::Queue(*read_mode),
-            Some(TileState::Decoding { .. } | TileState::Decoded { .. }) => {
-                TileDemandStatus::Deduplicated
-            }
+            Some(
+                TileState::Decoding { .. }
+                | TileState::Decoded { .. }
+                | TileState::Uploading { .. },
+            ) => TileDemandStatus::Deduplicated,
             Some(TileState::Ready { .. }) => TileDemandStatus::Ready,
             Some(TileState::Failed) => TileDemandStatus::Failed,
             None => {
@@ -276,7 +332,7 @@ impl TileStore {
         }
         if result.used_cpu_fallback && matches!(&result.outcome, TileLoadOutcome::Decoded(_)) {
             self.record_cpu_fallback(
-                "wsi-rs returned CPU pixels for a Metal-preferred tile; rendering remains on wgpu"
+                "wsi-rs returned CPU pixels for a device-preferred tile; rendering remains on wgpu"
                     .into(),
             );
         }
@@ -289,7 +345,37 @@ impl TileStore {
                 if matches!(self.entries.get(&result.key), Some(TileState::Ready { .. })) {
                     return false;
                 }
-                let byte_len = tile.decoded_byte_len();
+                if matches!(self.entries.get(&result.key), Some(TileState::Failed)) {
+                    return false;
+                }
+                let cost = match tile.memory_cost() {
+                    Ok(cost) => cost,
+                    Err(error) => {
+                        self.record_terminal_failure(result.key, error);
+                        return false;
+                    }
+                };
+                if cost.decoded_bytes > self.max_resident_bytes {
+                    self.record_terminal_failure(
+                        result.key,
+                        format!(
+                            "decoded allocation requires {} bytes, exceeding the {}-byte viewer ceiling",
+                            cost.decoded_bytes, self.max_resident_bytes
+                        ),
+                    );
+                    return false;
+                }
+                if cost.upload_peak_bytes > self.max_resident_bytes {
+                    self.record_terminal_failure(
+                        result.key,
+                        format!(
+                            "upload requires {} source-plus-texture bytes, exceeding the {}-byte viewer ceiling",
+                            cost.upload_peak_bytes, self.max_resident_bytes
+                        ),
+                    );
+                    return false;
+                }
+                let byte_len = cost.decoded_bytes;
                 let last_used = self.next_use_generation();
                 let read_mode = match self.entries.get(&result.key) {
                     Some(TileState::Queued { read_mode } | TileState::Decoding { read_mode }) => {
@@ -346,9 +432,74 @@ impl TileStore {
                     TileState::Queued { .. }
                         | TileState::Decoding { .. }
                         | TileState::Decoded { .. }
+                        | TileState::Uploading { .. }
                 )
             )
         })
+    }
+
+    fn begin_upload_batch(&mut self, keys: &[TileKey]) -> UploadBatch {
+        let mut batch = UploadBatch {
+            keys: Vec::new(),
+            tiles: Vec::new(),
+            deferred: 0,
+        };
+        for &key in keys {
+            let Some(state) = self.remove_entry(&key) else {
+                continue;
+            };
+            let TileState::Decoded {
+                tile,
+                read_mode,
+                byte_len,
+                last_used,
+            } = state
+            else {
+                self.insert_entry(key, state);
+                continue;
+            };
+            let cost = match tile.memory_cost() {
+                Ok(cost) => cost,
+                Err(error) => {
+                    self.record_terminal_failure(key, error);
+                    continue;
+                }
+            };
+            if cost.decoded_bytes != byte_len {
+                self.record_terminal_failure(
+                    key,
+                    "decoded allocation changed before upload reservation".into(),
+                );
+                continue;
+            }
+            if !self.evict_to_fit(cost.upload_peak_bytes) {
+                self.insert_entry(
+                    key,
+                    TileState::Decoded {
+                        tile,
+                        read_mode,
+                        byte_len,
+                        last_used,
+                    },
+                );
+                self.evict_resident_tiles();
+                batch.deferred = batch.deferred.saturating_add(1);
+                continue;
+            }
+            self.insert_entry(
+                key,
+                TileState::Uploading {
+                    read_mode,
+                    source_byte_len: cost.decoded_bytes,
+                    texture_byte_len: cost.texture_bytes,
+                    byte_len: cost.upload_peak_bytes,
+                    last_used,
+                },
+            );
+            batch.keys.push(key);
+            batch.tiles.push(tile);
+        }
+        batch
     }
 
     pub(super) fn upload_pending_tiles<U: TileUploadSink>(
@@ -357,54 +508,73 @@ impl TileStore {
         keys: &[TileKey],
         cpu_budget: Duration,
     ) -> UploadBatchOutcome {
-        let mut pending = Vec::new();
-        for &key in keys {
-            let Some(state) = self.remove_entry(&key) else {
-                continue;
-            };
-            match state {
-                TileState::Decoded {
-                    tile,
-                    read_mode,
-                    byte_len,
-                    last_used,
-                } => pending.push((key, tile, read_mode, byte_len, last_used)),
-                other => {
-                    self.insert_entry(key, other);
-                }
-            }
-        }
-        let mut pending_keys = Vec::with_capacity(pending.len());
-        let mut pending_tiles = Vec::with_capacity(pending.len());
-        let mut pending_modes = Vec::with_capacity(pending.len());
-        let mut pending_metadata = Vec::with_capacity(pending.len());
-        for (key, tile, read_mode, byte_len, last_used) in pending {
-            pending_keys.push(key);
-            pending_tiles.push(tile);
-            pending_modes.push(read_mode);
-            pending_metadata.push((byte_len, last_used));
-        }
-        let expected_uploads = pending_tiles.len();
-        let uploads = uploader.upload_batch_budgeted(pending_tiles, cpu_budget);
-        debug_assert_eq!(uploads.len(), expected_uploads);
+        let batch = self.begin_upload_batch(keys);
+        let expected_uploads = batch.keys.len();
+        let uploads = uploader.upload_batch_budgeted(batch.tiles, cpu_budget);
         let mut outcome = UploadBatchOutcome {
             uploaded: 0,
-            deferred: 0,
+            deferred: batch.deferred,
             cpu_retries: Vec::new(),
             failures: 0,
         };
-        for (((key, read_mode), (byte_len, last_used)), upload) in pending_keys
-            .into_iter()
-            .zip(pending_modes)
-            .zip(pending_metadata)
-            .zip(uploads)
-        {
+        let actual_uploads = uploads.len();
+        let mut uploads = uploads.into_iter();
+        for key in batch.keys {
+            let Some(upload) = uploads.next() else {
+                self.remove_entry(&key);
+                self.record_terminal_failure(
+                    key,
+                    format!(
+                        "uploader returned {actual_uploads} outcomes for {expected_uploads} owned inputs"
+                    ),
+                );
+                outcome.failures = outcome.failures.saturating_add(1);
+                continue;
+            };
+            let Some(TileState::Uploading {
+                read_mode,
+                source_byte_len,
+                texture_byte_len,
+                last_used,
+                ..
+            }) = self.remove_entry(&key)
+            else {
+                self.record_terminal_failure(
+                    key,
+                    "upload ownership state disappeared before reconciliation".into(),
+                );
+                outcome.failures = outcome.failures.saturating_add(1);
+                continue;
+            };
             match upload {
                 BudgetedUploadOutcome::Ready(texture) => {
                     let (width, height) = texture.dimensions();
-                    let byte_len = (width as usize)
-                        .saturating_mul(height as usize)
-                        .saturating_mul(4);
+                    let byte_len = usize::try_from(width)
+                        .ok()
+                        .and_then(|width| {
+                            usize::try_from(height)
+                                .ok()
+                                .and_then(|height| width.checked_mul(height))
+                        })
+                        .and_then(|pixels| pixels.checked_mul(4));
+                    let Some(byte_len) = byte_len else {
+                        self.record_terminal_failure(
+                            key,
+                            format!("uploaded texture dimensions {width}x{height} overflow bytes"),
+                        );
+                        outcome.failures = outcome.failures.saturating_add(1);
+                        continue;
+                    };
+                    if byte_len != texture_byte_len || byte_len > self.max_resident_bytes {
+                        self.record_terminal_failure(
+                            key,
+                            format!(
+                                "uploader produced {byte_len} texture bytes after reserving {texture_byte_len}"
+                            ),
+                        );
+                        outcome.failures = outcome.failures.saturating_add(1);
+                        continue;
+                    }
                     let last_used = self.next_use_generation();
                     self.insert_entry(
                         key,
@@ -422,18 +592,47 @@ impl TileStore {
                     self.handle_upload_error(key, read_mode, error, &mut outcome);
                 }
                 BudgetedUploadOutcome::Deferred(tile) => {
+                    let cost = match tile.memory_cost() {
+                        Ok(cost)
+                            if cost.decoded_bytes == source_byte_len
+                                && cost.texture_bytes == texture_byte_len =>
+                        {
+                            cost
+                        }
+                        Ok(_) => {
+                            self.record_terminal_failure(
+                                key,
+                                "uploader returned a different decoded allocation for a deferred tile"
+                                    .into(),
+                            );
+                            outcome.failures = outcome.failures.saturating_add(1);
+                            continue;
+                        }
+                        Err(error) => {
+                            self.record_terminal_failure(key, error);
+                            outcome.failures = outcome.failures.saturating_add(1);
+                            continue;
+                        }
+                    };
                     self.insert_entry(
                         key,
                         TileState::Decoded {
                             tile,
                             read_mode,
-                            byte_len,
+                            byte_len: cost.decoded_bytes,
                             last_used,
                         },
                     );
                     outcome.deferred = outcome.deferred.saturating_add(1);
                 }
             }
+        }
+        let surplus = uploads.count();
+        if surplus > 0 {
+            outcome.failures = outcome.failures.saturating_add(1);
+            self.record_failure(format!(
+                "uploader returned {actual_uploads} outcomes for {expected_uploads} owned inputs; discarded {surplus} surplus outcome(s)"
+            ));
         }
         self.evict_resident_tiles();
         outcome
@@ -496,7 +695,8 @@ impl TileStore {
                 Some(
                     TileState::Queued { .. }
                     | TileState::Decoding { .. }
-                    | TileState::Decoded { .. },
+                    | TileState::Decoded { .. }
+                    | TileState::Uploading { .. },
                 ) => coverage.pending += 1,
                 Some(TileState::Failed) => coverage.failed += 1,
                 None => coverage.missing += 1,
@@ -599,9 +799,12 @@ impl TileStore {
         Some(removed)
     }
 
-    fn evict_resident_tiles(&mut self) {
-        if self.resident_bytes <= self.max_resident_bytes {
-            return;
+    fn evict_to_fit(&mut self, additional_bytes: usize) -> bool {
+        let Some(required) = self.resident_bytes.checked_add(additional_bytes) else {
+            return false;
+        };
+        if required <= self.max_resident_bytes {
+            return true;
         }
         let started = self.measure_eviction.then(std::time::Instant::now);
         let mut candidates = self
@@ -623,21 +826,34 @@ impl TileStore {
             .collect::<Vec<_>>();
         candidates.sort_unstable();
         for (_, _, key) in candidates {
-            if self.resident_bytes <= self.max_resident_bytes {
+            if self
+                .resident_bytes
+                .checked_add(additional_bytes)
+                .is_some_and(|required| required <= self.max_resident_bytes)
+            {
                 break;
             }
             self.remove_entry(&key);
         }
-        debug_assert!(self.resident_bytes <= self.max_resident_bytes);
         if let Some(started) = started {
             self.pending_eviction_samples.push(started.elapsed());
         }
+        self.resident_bytes
+            .checked_add(additional_bytes)
+            .is_some_and(|required| required <= self.max_resident_bytes)
+    }
+
+    fn evict_resident_tiles(&mut self) {
+        let fits = self.evict_to_fit(0);
+        debug_assert!(fits);
     }
 }
 
 fn resident_byte_len(state: &TileState) -> Option<usize> {
     match state {
-        TileState::Decoded { byte_len, .. } | TileState::Ready { byte_len, .. } => Some(*byte_len),
+        TileState::Decoded { byte_len, .. }
+        | TileState::Uploading { byte_len, .. }
+        | TileState::Ready { byte_len, .. } => Some(*byte_len),
         _ => None,
     }
 }
@@ -653,7 +869,10 @@ pub(in crate::app) struct TileCoverage {
 fn is_loading_state(state: &TileState) -> bool {
     matches!(
         state,
-        TileState::Queued { .. } | TileState::Decoding { .. } | TileState::Decoded { .. }
+        TileState::Queued { .. }
+            | TileState::Decoding { .. }
+            | TileState::Decoded { .. }
+            | TileState::Uploading { .. }
     )
 }
 
@@ -671,6 +890,38 @@ mod tests {
         calls: usize,
         batch_sizes: Vec<usize>,
         budgets: Vec<Duration>,
+    }
+
+    struct MissingOutcomeUploader;
+
+    impl TileUploadSink for MissingOutcomeUploader {
+        fn upload_batch_budgeted(
+            &mut self,
+            _tiles: Vec<DecodedTile>,
+            _cpu_budget: Duration,
+        ) -> Vec<BudgetedUploadOutcome> {
+            Vec::new()
+        }
+    }
+
+    struct SurplusOutcomeUploader;
+
+    impl TileUploadSink for SurplusOutcomeUploader {
+        fn upload_batch_budgeted(
+            &mut self,
+            mut tiles: Vec<DecodedTile>,
+            _cpu_budget: Duration,
+        ) -> Vec<BudgetedUploadOutcome> {
+            let owned = tiles.pop().expect("one planned tile");
+            vec![
+                BudgetedUploadOutcome::Deferred(owned),
+                BudgetedUploadOutcome::Deferred(DecodedTile::Cpu(dicom_viewer_core::RgbaTile {
+                    width: 1,
+                    height: 1,
+                    rgba: vec![0, 0, 0, 255],
+                })),
+            ]
+        }
     }
 
     impl TileUploadSink for DeferringUploader {
@@ -711,19 +962,14 @@ mod tests {
 
     fn make_ready(store: &mut TileStore, key: TileKey) {
         assert!(matches!(store.queue(key), QueueStatus::New));
-        store.stage_finished(key.generation, &HashSet::from([key]), decoded(key, 1, 1));
-        let Some(TileState::Decoded { tile, .. }) = store.remove_entry(&key) else {
-            panic!("test tile should be decoded");
-        };
-        let (width, height) = tile.dimensions();
         let last_used = store.next_use_generation();
         store.insert_entry(
             key,
             TileState::Ready {
                 texture: ReadyTexture::Fake(egui::TextureId::User(key.coord.col())),
-                width,
-                height,
-                byte_len: width as usize * height as usize * 4,
+                width: 1,
+                height: 1,
+                byte_len: 4,
                 last_used,
             },
         );
@@ -794,12 +1040,7 @@ mod tests {
         let expendable = key(1, 1);
         store.set_cache_protection(HashSet::from([pinned, expendable]), HashSet::from([pinned]));
         make_ready(&mut store, pinned);
-        store.queue(expendable);
-        store.stage_finished(
-            expendable.generation,
-            &HashSet::from([expendable]),
-            decoded(expendable, 1, 1),
-        );
+        make_ready(&mut store, expendable);
         store.set_pinned(HashSet::from([pinned]));
 
         assert!(matches!(
@@ -970,6 +1211,150 @@ mod tests {
         store.mark_decoding(&[tile], 1);
         store.stage_finished(1, &HashSet::from([tile]), decoded(tile, 1, 1));
 
+        assert_eq!(store.loading_count(), 1);
+    }
+
+    #[test]
+    fn decoded_or_upload_peak_over_budget_is_terminal_and_never_requeues() {
+        let mut store = TileStore::new(7);
+        let tile = key(1, 0);
+        store.queue(tile);
+
+        store.stage_finished(1, &HashSet::from([tile]), decoded(tile, 1, 1));
+
+        assert!(matches!(store.entries.get(&tile), Some(TileState::Failed)));
+        assert_eq!(store.resident_bytes(), 0);
+        assert_eq!(store.queue_for_demand(tile), TileDemandStatus::Failed);
+        assert_eq!(store.tile_failure().map(|failure| failure.count), Some(1));
+    }
+
+    #[test]
+    fn impossible_texture_is_rejected_once_before_decode() {
+        let mut store = TileStore::new(8);
+        let exact = key(1, 0);
+        let oversized = key(1, 1);
+
+        assert!(!store.reject_texture_preflight(exact, Ok(8)));
+        assert_eq!(
+            store.queue_for_demand(exact),
+            TileDemandStatus::Queue(TileReadMode::Preferred)
+        );
+        assert!(store.reject_texture_preflight(oversized, Ok(9)));
+        assert!(store.reject_texture_preflight(oversized, Ok(9)));
+
+        assert_eq!(store.queue_for_demand(oversized), TileDemandStatus::Failed);
+        assert_eq!(store.tile_failure().map(|failure| failure.count), Some(1));
+    }
+
+    #[test]
+    fn malformed_decoded_dimensions_become_one_terminal_failure() {
+        let mut store = TileStore::new(64);
+        let tile = key(1, 0);
+        store.queue(tile);
+        let result = TileLoadResult {
+            key: tile,
+            outcome: TileLoadOutcome::Decoded(DecodedTile::Cpu(dicom_viewer_core::RgbaTile {
+                width: u32::MAX,
+                height: u32::MAX,
+                rgba: Vec::new(),
+            })),
+            used_cpu_fallback: false,
+        };
+
+        store.stage_finished(1, &HashSet::from([tile]), result);
+        store.stage_finished(1, &HashSet::from([tile]), decoded(tile, 1, 1));
+
+        assert!(matches!(store.entries.get(&tile), Some(TileState::Failed)));
+        assert_eq!(store.tile_failure().map(|failure| failure.count), Some(1));
+    }
+
+    #[test]
+    fn uploading_reserves_source_plus_destination_and_cannot_be_evicted() {
+        let mut store = TileStore::new(8);
+        let tile = key(1, 0);
+        store.queue(tile);
+        store.stage_finished(1, &HashSet::from([tile]), decoded(tile, 1, 1));
+
+        let batch = store.begin_upload_batch(&[tile]);
+
+        assert_eq!(batch.keys, vec![tile]);
+        assert_eq!(batch.tiles.len(), 1);
+        assert_eq!(store.resident_bytes(), 8);
+        assert!(matches!(
+            store.entries.get(&tile),
+            Some(TileState::Uploading { .. })
+        ));
+        store.evict_resident_tiles();
+        assert!(matches!(
+            store.entries.get(&tile),
+            Some(TileState::Uploading { .. })
+        ));
+        assert_eq!(store.resident_bytes(), 8);
+    }
+
+    #[test]
+    fn upload_reservations_never_exceed_the_ceiling() {
+        let mut store = TileStore::new(8);
+        let first = key(1, 0);
+        let second = key(1, 1);
+        let relevant = HashSet::from([first, second]);
+        for tile in [first, second] {
+            store.queue(tile);
+            store.stage_finished(1, &relevant, decoded(tile, 1, 1));
+        }
+
+        let batch = store.begin_upload_batch(&[first, second]);
+
+        assert_eq!(batch.tiles.len(), 1);
+        assert!(store.resident_bytes() <= 8);
+        assert_eq!(
+            store
+                .entries
+                .values()
+                .filter(|state| matches!(state, TileState::Uploading { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn missing_upload_outcome_releases_accounting_and_fails_the_tile() {
+        let mut store = TileStore::new(8);
+        let tile = key(1, 0);
+        store.queue(tile);
+        store.stage_finished(1, &HashSet::from([tile]), decoded(tile, 1, 1));
+
+        let outcome = store.upload_pending_tiles(
+            &mut MissingOutcomeUploader,
+            &[tile],
+            Duration::from_millis(1),
+        );
+
+        assert_eq!(outcome.failures, 1);
+        assert!(matches!(store.entries.get(&tile), Some(TileState::Failed)));
+        assert_eq!(store.resident_bytes(), 0);
+        assert_eq!(store.loading_count(), 0);
+    }
+
+    #[test]
+    fn surplus_upload_outcome_is_dropped_and_cannot_strand_accounting() {
+        let mut store = TileStore::new(8);
+        let tile = key(1, 0);
+        store.queue(tile);
+        store.stage_finished(1, &HashSet::from([tile]), decoded(tile, 1, 1));
+
+        let outcome = store.upload_pending_tiles(
+            &mut SurplusOutcomeUploader,
+            &[tile],
+            Duration::from_millis(1),
+        );
+
+        assert_eq!(outcome.failures, 1);
+        assert!(matches!(
+            store.entries.get(&tile),
+            Some(TileState::Decoded { .. })
+        ));
+        assert_eq!(store.resident_bytes(), 4);
         assert_eq!(store.loading_count(), 1);
     }
 

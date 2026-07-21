@@ -92,6 +92,44 @@ fn tile_key_generation_is_the_only_stale_result_identity() {
 }
 
 #[test]
+fn edge_tile_texture_preflight_uses_checked_final_rgba_bytes() {
+    let level = LevelInfo {
+        index: LevelIndex::from_u32(0),
+        width: 3,
+        height: 2,
+        downsample: 1.0,
+        tile_layout: dicom_viewer_core::LevelTileLayout::Regular {
+            tile_width: 2,
+            tile_height: 2,
+            tiles_across: 2,
+            tiles_down: 1,
+        },
+    };
+
+    assert_eq!(planned_texture_bytes(&level, TileCoord::new(0, 0)), Ok(16));
+    assert_eq!(planned_texture_bytes(&level, TileCoord::new(1, 0)), Ok(8));
+}
+
+#[test]
+fn tile_texture_preflight_fails_closed_on_coordinate_arithmetic_overflow() {
+    let level = LevelInfo {
+        index: LevelIndex::from_u32(0),
+        width: u64::MAX,
+        height: 1,
+        downsample: 1.0,
+        tile_layout: dicom_viewer_core::LevelTileLayout::Regular {
+            tile_width: u32::MAX,
+            tile_height: 1,
+            tiles_across: u64::MAX,
+            tiles_down: 1,
+        },
+    };
+
+    let error = planned_texture_bytes(&level, TileCoord::new(u64::MAX, 0)).unwrap_err();
+    assert!(error.contains("overflow"), "{error}");
+}
+
+#[test]
 fn loader_metrics_accept_only_batches_wholly_owned_by_the_active_study() {
     assert!(loader_batch_belongs_to_generation(
         3,

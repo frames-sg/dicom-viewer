@@ -1,0 +1,122 @@
+name: CUDA validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      wsi_rs_ref:
+        description: Exact remediated wsi-rs commit SHA
+        required: true
+        type: string
+      j2k_ref:
+        description: Exact remediated J2K commit SHA
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  J2K_REQUIRE_CUDA_RUNTIME: "1"
+  J2K_REQUIRE_CUDA_OXIDE_BUILD: "1"
+  RUSTFLAGS: "-D warnings"
+  RUST_TEST_THREADS: "1"
+
+jobs:
+  cuda-runtime:
+    name: CUDA decode and viewer parity
+    runs-on: [self-hosted, Linux, X64, cuda]
+    timeout-minutes: 60
+    steps:
+      - name: Checkout dicom-viewer
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          path: dicom-viewer
+          persist-credentials: false
+
+      - name: Checkout wsi-rs
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: frames-sg/wsi-rs
+          ref: ${{ inputs.wsi_rs_ref }}
+          path: wsi-rs
+          persist-credentials: false
+
+      - name: Checkout j2k
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: frames-sg/j2k
+          ref: ${{ inputs.j2k_ref }}
+          path: j2k
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@a75363d06101555fc97c6c7e1e65670b99104d98 # 1.96.1
+        with:
+          components: clippy
+
+      - name: Verify exact upstream revisions
+        shell: bash
+        env:
+          WSI_RS_REF: ${{ inputs.wsi_rs_ref }}
+          J2K_REF: ${{ inputs.j2k_ref }}
+        run: |
+          test "$(git -C wsi-rs rev-parse HEAD)" = "${WSI_RS_REF}" || {
+            echo "wsi_rs_ref must be the exact checked-out commit SHA" >&2
+            exit 1
+          }
+          test "$(git -C j2k rev-parse HEAD)" = "${J2K_REF}" || {
+            echo "j2k_ref must be the exact checked-out commit SHA" >&2
+            exit 1
+          }
+
+      - name: Configure CUDA Oxide bindgen
+        shell: bash
+        run: |
+          if [[ -z "${LIBCLANG_PATH:-}" ]]; then
+            libclang_dir=""
+            for dir in /usr/lib/llvm-*/lib "${HOME}"/.local/llvm*/usr/lib/llvm-*/lib; do
+              if compgen -G "${dir}/libclang*.so*" >/dev/null; then
+                libclang_dir="${dir}"
+              fi
+            done
+            test -n "${libclang_dir}" || {
+              echo "libclang not found; CUDA Oxide bindgen cannot run" >&2
+              exit 1
+            }
+            echo "LIBCLANG_PATH=${libclang_dir}" >> "${GITHUB_ENV}"
+          fi
+
+          resource_dir=""
+          for dir in /usr/lib/llvm-*/lib/clang/[0-9]* "${HOME}"/.local/llvm*/usr/lib/llvm-*/lib/clang/[0-9]*; do
+            if [[ -d "${dir}/include" ]]; then
+              resource_dir="${dir}"
+            fi
+          done
+
+          bindgen_args="${BINDGEN_EXTRA_CLANG_ARGS:-}"
+          if [[ -n "${resource_dir}" ]]; then
+            bindgen_args="${bindgen_args:+${bindgen_args} }-resource-dir=${resource_dir}"
+          fi
+          gcc_include="$(gcc -print-file-name=include)"
+          if [[ -d "${gcc_include}" ]]; then
+            bindgen_args="${bindgen_args:+${bindgen_args} }-I${gcc_include}"
+          fi
+          if [[ -d /usr/local/cuda/include ]]; then
+            bindgen_args="${bindgen_args:+${bindgen_args} }-I/usr/local/cuda/include"
+          fi
+          echo "BINDGEN_EXTRA_CLANG_ARGS=${bindgen_args}" >> "${GITHUB_ENV}"
+
+      - name: Check viewer CUDA compilation
+        working-directory: dicom-viewer
+        run: cargo check --workspace --all-targets --locked --features cuda
+
+      - name: Validate wsi-rs CUDA JPEG and J2K downloads
+        working-directory: wsi-rs
+        run: cargo test --locked --features cuda --lib cuda_download_cpu
+
+      - name: Validate viewer CUDA download and CPU parity
+        working-directory: dicom-viewer
+        run: >-
+          cargo test -p dicom-viewer-core --locked --features cuda
+          cuda_viewer_download_matches_strict_cpu_for_synthetic_dicom_htj2k

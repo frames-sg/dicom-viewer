@@ -24,8 +24,12 @@ wgpu is the only presentation backend on every platform. On macOS, ordinary
 builds automatically enable `wsi-rs` Metal decoding and use the renderer's
 exact Metal device; resident RGB tiles are converted to RGBA by a wgpu compute
 pass without host readback. CPU-decoded tiles use the same wgpu texture path.
-The `cuda` feature enables the corresponding decode capability but does not
-create another renderer.
+On other platforms, the `cuda` feature lets `auto` reuse wsi-rs CUDA sessions
+for compressed JPEG and JPEG 2000 decode. CUDA tiles cross the viewer boundary
+only through checked, pitch-aware host download and then use the existing CPU
+RGBA, ICC, cache, and wgpu upload path. wgpu remains the only renderer; there
+is no CUDA-to-wgpu interop. A CUDA download failure receives exactly one
+ordered CPU retry.
 
 `DICOM_VIEWER_TILE_BACKEND` accepts `auto` (the default) or `cpu`. `auto`
 prefers renderer-resident Metal tiles on macOS and falls back to CPU output for
@@ -61,6 +65,11 @@ For measurement only, `DICOM_VIEWER_TILE_WORKERS` and
 thread counts. `DICOM_VIEWER_INTERACTIVE_BATCH_SIZE` accepts `2`, `4`, or `8`
 for CPU-backed interactive tile reads and defaults to `2`. Invalid values
 retain the measured defaults.
+
+The viewer-memory ceiling covers store-owned decoded tiles, ready textures,
+and the source-plus-destination overlap of synchronous upload. It does not
+cover decoder scratch space, wsi-rs source caches, channel messages, or GPU
+driver overhead.
 
 ## Verify
 

@@ -34,6 +34,21 @@ impl ViewerError {
     pub const fn is_cancelled(&self) -> bool {
         matches!(self, Self::Wsi(wsi_rs::WsiError::Cancelled))
     }
+
+    /// Returns whether a renderer-facing CUDA tile failed at the checked host-download boundary.
+    #[must_use]
+    pub fn is_cuda_download_failure(&self) -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            return matches!(
+                self,
+                Self::Wsi(wsi_rs::WsiError::Codec { codec, .. })
+                    if matches!(*codec, "cuda-jpeg-download" | "cuda-j2k-download")
+            );
+        }
+        #[cfg(not(feature = "cuda"))]
+        false
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

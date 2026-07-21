@@ -69,11 +69,9 @@ pub(crate) fn tile_output_config(
     TileOutputPreference,
     TileOutputPreference,
 ) {
-    let cpu = if options.requests_cpu_only() {
-        TileOutputPreference::cpu_only()
-    } else {
-        TileOutputPreference::cpu()
-    };
+    // Compatibility reads and ordered device-failure retries must never
+    // select the same device backend that just failed its download boundary.
+    let cpu = TileOutputPreference::cpu_only();
     #[cfg(target_os = "macos")]
     if !options.requests_cpu_only() {
         if let Some(device) = options.metal_device() {
@@ -82,6 +80,13 @@ pub(crate) fn tile_output_config(
                 TileOutputPreference::prefer_device_auto_with_metal_and_compressed_decode(sessions);
             return (TileDecodeBackend::Metal, render, cpu);
         }
+    }
+    #[cfg(all(feature = "cuda", not(target_os = "macos")))]
+    if !options.requests_cpu_only() {
+        let sessions = wsi_rs::output::cuda::CudaBackendSessions::new();
+        let render =
+            TileOutputPreference::prefer_device_auto_with_cuda_and_compressed_decode(sessions);
+        return (TileDecodeBackend::Cuda, render, cpu);
     }
     (TileDecodeBackend::Cpu, cpu.clone(), cpu)
 }
@@ -109,16 +114,25 @@ fn render_tile_from_device(device: wsi_rs::DeviceTile) -> Result<RenderTile> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn render_tile_from_device(_device: wsi_rs::DeviceTile) -> Result<RenderTile> {
-    Err(ViewerError::Unsupported(
-        "wsi-rs returned device-resident pixels without a configured viewer interop path".into(),
-    ))
+fn render_tile_from_device(device: wsi_rs::DeviceTile) -> Result<RenderTile> {
+    match device {
+        #[cfg(feature = "cuda")]
+        wsi_rs::DeviceTile::Cuda(tile) => {
+            rgba_tile_from_cpu_tile(tile.download_cpu()?).map(RenderTile::Cpu)
+        }
+        #[allow(unreachable_patterns)]
+        _ => Err(ViewerError::Unsupported(
+            "wsi-rs returned device-resident pixels without a configured viewer download path"
+                .into(),
+        )),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "cuda"), target_os = "macos"))]
     #[test]
     fn auto_requests_host_resident_output() {
         let options = viewer_open_options("auto").unwrap();
@@ -150,6 +164,20 @@ mod tests {
             ViewerCacheBudgets::new(512 * 1024 * 1024, 256 * 1024 * 1024, 64 * 1024 * 1024)
         );
         assert!(memory_profile_cache_budgets("huge").is_err());
+    }
+
+    #[cfg(all(feature = "cuda", not(target_os = "macos")))]
+    #[test]
+    fn cuda_feature_auto_prefers_reusable_compressed_decode_sessions() {
+        let options = ViewerOpenOptions::auto();
+
+        let (backend, render, cpu) = tile_output_config(&options);
+
+        assert_eq!(backend, TileDecodeBackend::Cuda);
+        assert!(render.prefers_device());
+        assert!(render.compressed_device_decode_enabled());
+        assert!(render.adaptive_decode_route_enabled());
+        assert!(!cpu.prefers_device());
     }
 
     #[cfg(target_os = "macos")]

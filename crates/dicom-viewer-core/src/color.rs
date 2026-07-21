@@ -1,4 +1,6 @@
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, VecDeque};
+use std::ops::Range;
+use std::sync::{Arc, Condvar, Mutex, OnceLock, TryLockError};
 
 use lcms2::{DisallowCache, Flags, Intent, PixelFormat, Profile, ThreadContext, Transform};
 use sha2::{Digest, Sha256};
@@ -12,6 +14,153 @@ use crate::{
 
 const LUT_EDGE: u32 = 65;
 const MAX_LUT_CHANNEL_ERROR: u8 = 2;
+const LUT_VALIDATION_ALGORITHM_VERSION: u32 = 1;
+const ICC_PROOF_CACHE_CAPACITY: usize = 16;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IccProofFailure {
+    Validation { max_error: u8 },
+    Infrastructure(String),
+}
+
+type IccProofResult = Result<Arc<ColorLut3d>, IccProofFailure>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct IccProofKey {
+    profile_sha256: [u8; 32],
+    lut_edge: u32,
+    max_channel_error: u8,
+    algorithm_version: u32,
+}
+
+enum IccProofState {
+    InFlight,
+    Complete(IccProofResult),
+}
+
+struct IccProofEntry {
+    state: Mutex<IccProofState>,
+    ready: Condvar,
+}
+
+#[derive(Default)]
+struct IccProofCacheState {
+    entries: HashMap<IccProofKey, Arc<IccProofEntry>>,
+    lru: VecDeque<IccProofKey>,
+}
+
+struct IccProofCache {
+    capacity: usize,
+    state: Mutex<IccProofCacheState>,
+}
+
+impl IccProofCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            state: Mutex::new(IccProofCacheState::default()),
+        }
+    }
+
+    fn get_or_compute(
+        &self,
+        key: IccProofKey,
+        compute: impl FnOnce() -> IccProofResult,
+    ) -> IccProofResult {
+        let (entry, computes) = {
+            let mut cache = self.state.lock().map_err(|_| {
+                IccProofFailure::Infrastructure("ICC proof cache lock is poisoned".into())
+            })?;
+            if let Some(entry) = cache.entries.get(&key).cloned() {
+                touch_lru(&mut cache.lru, &key);
+                (entry, false)
+            } else {
+                while cache.entries.len() >= self.capacity {
+                    let Some(evicted) = oldest_completed_entry(&cache) else {
+                        return Err(IccProofFailure::Infrastructure(format!(
+                            "ICC proof cache has {} validations in flight",
+                            cache.entries.len()
+                        )));
+                    };
+                    cache.entries.remove(&evicted);
+                    remove_lru(&mut cache.lru, &evicted);
+                }
+                let entry = Arc::new(IccProofEntry {
+                    state: Mutex::new(IccProofState::InFlight),
+                    ready: Condvar::new(),
+                });
+                cache.entries.insert(key.clone(), Arc::clone(&entry));
+                cache.lru.push_back(key);
+                (entry, true)
+            }
+        };
+
+        if computes {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(compute))
+                .unwrap_or_else(|_| {
+                    Err(IccProofFailure::Infrastructure(
+                        "ICC proof computation panicked".into(),
+                    ))
+                });
+            let mut state = match entry.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *state = IccProofState::Complete(result.clone());
+            entry.ready.notify_all();
+            return result;
+        }
+
+        let mut state = entry.state.lock().map_err(|_| {
+            IccProofFailure::Infrastructure("ICC proof entry lock is poisoned".into())
+        })?;
+        loop {
+            match &*state {
+                IccProofState::Complete(result) => return result.clone(),
+                IccProofState::InFlight => {
+                    state = entry.ready.wait(state).map_err(|_| {
+                        IccProofFailure::Infrastructure(
+                            "ICC proof coalescing wait lock is poisoned".into(),
+                        )
+                    })?;
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.state.lock().map_or(0, |state| state.entries.len())
+    }
+}
+
+fn touch_lru(lru: &mut VecDeque<IccProofKey>, key: &IccProofKey) {
+    remove_lru(lru, key);
+    lru.push_back(key.clone());
+}
+
+fn remove_lru(lru: &mut VecDeque<IccProofKey>, key: &IccProofKey) {
+    if let Some(position) = lru.iter().position(|candidate| candidate == key) {
+        lru.remove(position);
+    }
+}
+
+fn oldest_completed_entry(cache: &IccProofCacheState) -> Option<IccProofKey> {
+    cache.lru.iter().find_map(|key| {
+        let entry = cache.entries.get(key)?;
+        let complete = match entry.state.try_lock() {
+            Ok(state) => matches!(*state, IccProofState::Complete(_)),
+            Err(TryLockError::Poisoned(_)) => true,
+            Err(TryLockError::WouldBlock) => false,
+        };
+        complete.then(|| key.clone())
+    })
+}
+
+fn process_icc_proof_cache() -> &'static IccProofCache {
+    static CACHE: OnceLock<IccProofCache> = OnceLock::new();
+    CACHE.get_or_init(|| IccProofCache::new(ICC_PROOF_CACHE_CAPACITY))
+}
 
 type RgbaTransform = Transform<u8, u8, ThreadContext, DisallowCache>;
 
@@ -98,7 +247,8 @@ impl ColorManagement {
             };
         };
 
-        let sha256 = profile_sha256(&profile.bytes);
+        let profile_digest = profile_sha256_digest(&profile.bytes);
+        let sha256 = profile_sha256(&profile_digest);
         let provenance = provenance_label(&profile.provenance);
         let mut warnings = Vec::new();
         if profiles.len() > 1 {
@@ -136,17 +286,34 @@ impl ColorManagement {
         let mut force_cpu = false;
         let mut status = ColorManagementStatus::Applied;
         let applied_mode = if backend == TileDecodeBackend::Metal {
-            let generated = generate_lut(&transform, &sha256);
-            match validate_lut(&transform, &generated) {
-                Ok(()) => {
-                    lut = Some(Arc::new(generated));
+            let key = IccProofKey {
+                profile_sha256: profile_digest,
+                lut_edge: LUT_EDGE,
+                max_channel_error: MAX_LUT_CHANNEL_ERROR,
+                algorithm_version: LUT_VALIDATION_ALGORITHM_VERSION,
+            };
+            match process_icc_proof_cache().get_or_compute(key, || {
+                let generated = Arc::new(generate_lut(&transform, &sha256));
+                validate_lut_parallel(&profile.bytes, &generated)?;
+                Ok(generated)
+            }) {
+                Ok(proved_lut) => {
+                    lut = Some(proved_lut);
                     ColorManagementMode::MetalLut65
                 }
-                Err(max_error) => {
+                Err(IccProofFailure::Validation { max_error }) => {
                     force_cpu = true;
                     status = ColorManagementStatus::LutValidationFailed;
                     warnings.push(format!(
                         "ICC Metal LUT validation reached {max_error} code values; using the direct CPU color path"
+                    ));
+                    ColorManagementMode::CpuLutValidationFallback
+                }
+                Err(IccProofFailure::Infrastructure(error)) => {
+                    force_cpu = true;
+                    status = ColorManagementStatus::LutValidationFailed;
+                    warnings.push(format!(
+                        "ICC Metal LUT proof infrastructure failed ({error}); using the direct CPU color path"
                     ));
                     ColorManagementMode::CpuLutValidationFallback
                 }
@@ -199,8 +366,11 @@ pub(crate) struct ColorManagementBuild {
     pub(crate) force_cpu: bool,
 }
 
-fn profile_sha256(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
+fn profile_sha256_digest(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
+fn profile_sha256(digest: &[u8; 32]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
@@ -266,7 +436,56 @@ fn lut_axis_samples(edge: usize) -> [LutAxisSample; 256] {
     })
 }
 
+#[cfg(test)]
 fn validate_lut(transform: &IccTransform, lut: &ColorLut3d) -> Result<(), u8> {
+    validate_lut_range(transform, lut, 0..256)
+}
+
+fn icc_validation_worker_count() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .clamp(1, 4)
+}
+
+fn validate_lut_parallel(profile_bytes: &[u8], lut: &ColorLut3d) -> Result<(), IccProofFailure> {
+    let worker_count = icc_validation_worker_count();
+    std::thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(worker_count);
+        for worker_index in 0..worker_count {
+            let start = worker_index * 256 / worker_count;
+            let end = (worker_index + 1) * 256 / worker_count;
+            let worker = std::thread::Builder::new()
+                .name(format!("icc-proof-{worker_index}"))
+                .spawn_scoped(scope, move || {
+                    let transform = IccTransform::new(profile_bytes).map_err(|error| {
+                        IccProofFailure::Infrastructure(format!(
+                            "worker {worker_index} could not create its color transform: {error}"
+                        ))
+                    })?;
+                    validate_lut_range(&transform, lut, start..end)
+                        .map_err(|max_error| IccProofFailure::Validation { max_error })
+                })
+                .map_err(|error| {
+                    IccProofFailure::Infrastructure(format!(
+                        "could not start ICC proof worker {worker_index}: {error}"
+                    ))
+                })?;
+            workers.push(worker);
+        }
+        for worker in workers {
+            worker.join().map_err(|_| {
+                IccProofFailure::Infrastructure("ICC proof worker panicked".into())
+            })??;
+        }
+        Ok(())
+    })
+}
+
+fn validate_lut_range(
+    transform: &IccTransform,
+    lut: &ColorLut3d,
+    blue_values: Range<usize>,
+) -> Result<(), u8> {
     const CODE_VALUES: usize = 256;
     const WEIGHT_SCALE: u32 = 255;
     const TRILINEAR_SCALE: u32 = WEIGHT_SCALE * WEIGHT_SCALE * WEIGHT_SCALE;
@@ -279,7 +498,8 @@ fn validate_lut(transform: &IccTransform, lut: &ColorLut3d) -> Result<(), u8> {
     let mut blue_plane = vec![[0_u16; 3]; edge * edge];
     let mut green_row = vec![[0_u32; 3]; edge];
 
-    for (blue, blue_axis) in axes.iter().enumerate() {
+    for blue in blue_values {
+        let blue_axis = &axes[blue];
         for green in 0..CODE_VALUES {
             for red in 0..CODE_VALUES {
                 let offset = (green * CODE_VALUES + red) * 4;
@@ -337,6 +557,9 @@ fn validate_lut(transform: &IccTransform, lut: &ColorLut3d) -> Result<(), u8> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+
     use lcms2::{CIExyY, CIExyYTRIPLE, Profile, ToneCurve};
     use wsi_rs::{
         DatasetId, IccProfileProvenance, SceneId, SeriesId, SourceIccProfile, SourceIccProfileKey,
@@ -467,7 +690,12 @@ mod tests {
             None,
             "gamma 1.8 test profile",
         )]);
+        let cold_started = std::time::Instant::now();
         let build = ColorManagement::build(&dataset, selected_view(), TileDecodeBackend::Metal);
+        let cold_elapsed = cold_started.elapsed();
+        let warm_started = std::time::Instant::now();
+        let warm = ColorManagement::build(&dataset, selected_view(), TileDecodeBackend::Metal);
+        let warm_elapsed = warm_started.elapsed();
         let mut tile = RgbaTile {
             width: 1,
             height: 1,
@@ -479,7 +707,16 @@ mod tests {
         assert_ne!(tile.rgba[..3], [128, 96, 64]);
         assert_eq!(build.summary.applied_mode, ColorManagementMode::MetalLut65);
         let lut = build.color.lut.as_deref().unwrap();
+        assert!(Arc::ptr_eq(
+            build.color.lut.as_ref().unwrap(),
+            warm.color.lut.as_ref().unwrap()
+        ));
         validate_lut(build.color.transform.as_deref().unwrap(), lut).unwrap();
+        eprintln!(
+            "ICC proof timing: cold={:.3}ms warm={:.3}ms",
+            cold_elapsed.as_secs_f64() * 1_000.0,
+            warm_elapsed.as_secs_f64() * 1_000.0,
+        );
     }
 
     #[test]
@@ -539,5 +776,114 @@ mod tests {
             .warnings
             .iter()
             .any(|warning| warning.contains("displaying uncorrected pixels")));
+    }
+
+    fn proof_key(byte: u8) -> IccProofKey {
+        IccProofKey {
+            profile_sha256: [byte; 32],
+            lut_edge: LUT_EDGE,
+            max_channel_error: MAX_LUT_CHANNEL_ERROR,
+            algorithm_version: LUT_VALIDATION_ALGORITHM_VERSION,
+        }
+    }
+
+    #[test]
+    fn same_profile_icc_proof_is_coalesced_and_failure_is_cached() {
+        let cache = Arc::new(IccProofCache::new(16));
+        let executions = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(8));
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let cache = Arc::clone(&cache);
+            let executions = Arc::clone(&executions);
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                cache.get_or_compute(proof_key(7), || {
+                    executions.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    Err(IccProofFailure::Validation { max_error: 9 })
+                })
+            }));
+        }
+
+        for worker in workers {
+            assert_eq!(
+                worker.join().unwrap().unwrap_err(),
+                IccProofFailure::Validation { max_error: 9 }
+            );
+        }
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        assert_eq!(cache.len(), 1);
+
+        let cached = cache.get_or_compute(proof_key(7), || {
+            panic!("cached failed proofs must not execute again")
+        });
+        assert_eq!(
+            cached.unwrap_err(),
+            IccProofFailure::Validation { max_error: 9 }
+        );
+    }
+
+    #[test]
+    fn icc_proof_cache_is_a_bounded_lru() {
+        let cache = IccProofCache::new(2);
+        let executions = AtomicUsize::new(0);
+        let compute = || {
+            executions.fetch_add(1, Ordering::SeqCst);
+            Err(IccProofFailure::Validation { max_error: 3 })
+        };
+
+        cache.get_or_compute(proof_key(1), compute).unwrap_err();
+        cache.get_or_compute(proof_key(2), compute).unwrap_err();
+        cache
+            .get_or_compute(proof_key(1), || panic!("LRU hit must be cached"))
+            .unwrap_err();
+        cache.get_or_compute(proof_key(3), compute).unwrap_err();
+        assert_eq!(cache.len(), 2);
+        cache.get_or_compute(proof_key(2), compute).unwrap_err();
+
+        assert_eq!(executions.load(Ordering::SeqCst), 4);
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn successful_icc_proof_result_is_cached() {
+        let cache = IccProofCache::new(16);
+        let executions = AtomicUsize::new(0);
+        let build = || {
+            executions.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::new(ColorLut3d::new(
+                2,
+                vec![0; 2 * 2 * 2 * 4],
+                "cached-pass".into(),
+            )))
+        };
+
+        let first = cache.get_or_compute(proof_key(8), build).unwrap();
+        let second = cache
+            .get_or_compute(proof_key(8), || panic!("proved LUT must be cached"))
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cold_proof_uses_at_most_four_worker_local_transforms() {
+        assert!((1..=4).contains(&icc_validation_worker_count()));
+        let profile = srgb_profile();
+        let transform = IccTransform::new(&profile).unwrap();
+        let generated = generate_lut(&transform, "sRGB parallel proof");
+        let mut rgba = generated.rgba().to_vec();
+        let interior_node = ((2 * LUT_EDGE as usize + 2) * LUT_EDGE as usize + 2) * 4;
+        rgba[interior_node] = 255;
+        let corrupted = ColorLut3d::new(LUT_EDGE, rgba, "sRGB parallel proof".into());
+
+        assert!(matches!(
+            validate_lut_parallel(&profile, &corrupted),
+            Err(IccProofFailure::Validation { max_error })
+                if max_error > MAX_LUT_CHANNEL_ERROR
+        ));
     }
 }
