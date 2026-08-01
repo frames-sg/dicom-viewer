@@ -29,13 +29,13 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout dicom-viewer
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: dicom-viewer
           persist-credentials: false
 
       - name: Checkout wsi-rs
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: frames-sg/wsi-rs
           ref: ${{ inputs.wsi_rs_ref }}
@@ -43,7 +43,7 @@ jobs:
           persist-credentials: false
 
       - name: Checkout j2k
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: frames-sg/j2k
           ref: ${{ inputs.j2k_ref }}
