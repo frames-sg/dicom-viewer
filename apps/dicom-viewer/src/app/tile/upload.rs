@@ -3,7 +3,9 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use dicom_viewer_core::{ColorLut3d, RgbaTile, ViewerOpenOptions};
+#[cfg(target_os = "macos")]
+use dicom_viewer_core::ColorLut3d;
+use dicom_viewer_core::{RgbaTile, ViewerOpenOptions};
 use eframe::{egui, egui_wgpu, wgpu};
 
 use super::DecodedTile;
@@ -376,6 +378,7 @@ impl WgpuTileUploader {
         }
         let device = self.context.state.device.clone();
         let queue = self.context.state.queue.clone();
+        #[cfg(target_os = "macos")]
         let mut encoder = None;
         let mut prepared = Vec::with_capacity(inputs.len());
         let mut cpu_uploads = 0_usize;
@@ -422,6 +425,7 @@ impl WgpuTileUploader {
             prepared.push(result);
         }
 
+        #[cfg(target_os = "macos")]
         if let Some(encoder) = encoder {
             queue.submit([encoder.finish()]);
             self.submissions = self.submissions.saturating_add(1);
