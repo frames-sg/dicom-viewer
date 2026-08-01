@@ -11,21 +11,14 @@ const CAMERA_SMOOTHING_SNAP_PX: f32 = 0.25;
 const CAMERA_SMOOTHING_SNAP_ZOOM: f32 = 0.0005;
 const WHEEL_ZOOM_SENSITIVITY: f32 = 0.0015;
 
-fn clamp_camera_view_to_min(
-    view: &mut CameraView,
-    rect: Rect,
-    summary: &StudySummary,
-    minimum_zoom: f32,
-) {
+fn clamp_camera_view_to_min(view: &mut CameraView, summary: &StudySummary, minimum_zoom: f32) {
     view.zoom = view.zoom.clamp(minimum_zoom, MAX_ZOOM);
     let Some(size) = base_size(summary) else {
         return;
     };
-    let visible_w = rect.width() / view.zoom.max(MIN_ZOOM);
-    let visible_h = rect.height() / view.zoom.max(MIN_ZOOM);
 
-    view.center_base.x = clamp_center_axis(view.center_base.x, visible_w, size.x);
-    view.center_base.y = clamp_center_axis(view.center_base.y, visible_h, size.y);
+    view.center_base.x = clamp_center_axis(view.center_base.x, size.x);
+    view.center_base.y = clamp_center_axis(view.center_base.y, size.y);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -158,7 +151,7 @@ impl CameraState {
         if self.fit_pending || (self.fit_mode && resized) {
             self.fit_to_rect(rect, summary);
         }
-        clamp_camera_view_to_min(&mut self.target, rect, summary, self.minimum_zoom);
+        clamp_camera_view_to_min(&mut self.target, summary, self.minimum_zoom);
     }
 
     pub(super) fn target_view(&self) -> CameraView {
@@ -167,13 +160,13 @@ impl CameraState {
 
     pub(super) fn render_view(
         &mut self,
-        rect: Rect,
+        _rect: Rect,
         summary: &StudySummary,
         dt: f32,
     ) -> (CameraView, bool) {
-        clamp_camera_view_to_min(&mut self.target, rect, summary, self.minimum_zoom);
+        clamp_camera_view_to_min(&mut self.target, summary, self.minimum_zoom);
         let (mut rendered, animating) = self.motion.render_view(self.target, dt);
-        clamp_camera_view_to_min(&mut rendered, rect, summary, self.minimum_zoom);
+        clamp_camera_view_to_min(&mut rendered, summary, self.minimum_zoom);
         (rendered, animating)
     }
 

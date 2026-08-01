@@ -1,5 +1,5 @@
 #[cfg(target_os = "macos")]
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -94,16 +94,14 @@ struct ColorLutTextureKey {
 
 #[cfg(target_os = "macos")]
 struct ColorLutTextureCache {
-    entries: HashMap<ColorLutTextureKey, Arc<wgpu::Texture>>,
-    lru: VecDeque<ColorLutTextureKey>,
+    entries: VecDeque<(ColorLutTextureKey, Arc<wgpu::Texture>)>,
 }
 
 #[cfg(target_os = "macos")]
 impl ColorLutTextureCache {
     fn new() -> Self {
         Self {
-            entries: HashMap::new(),
-            lru: VecDeque::new(),
+            entries: VecDeque::new(),
         }
     }
 
@@ -112,33 +110,29 @@ impl ColorLutTextureCache {
         key: ColorLutTextureKey,
         create: impl FnOnce() -> wgpu::Texture,
     ) -> Arc<wgpu::Texture> {
-        if let Some(texture) = self.entries.get(&key).cloned() {
-            self.touch(&key);
+        if let Some(position) = self
+            .entries
+            .iter()
+            .position(|(candidate, _)| candidate == &key)
+        {
+            let entry = self
+                .entries
+                .remove(position)
+                .expect("located color LUT entry remains present");
+            let texture = Arc::clone(&entry.1);
+            self.entries.push_back(entry);
             return texture;
         }
-        while self.entries.len() >= RENDERER_COLOR_LUT_CACHE_CAPACITY {
-            let Some(evicted) = self.lru.pop_front() else {
-                self.entries.clear();
-                break;
-            };
-            self.entries.remove(&evicted);
+        if self.entries.len() >= RENDERER_COLOR_LUT_CACHE_CAPACITY {
+            self.entries.pop_front();
         }
         let texture = Arc::new(create());
-        self.entries.insert(key.clone(), Arc::clone(&texture));
-        self.lru.push_back(key);
+        self.entries.push_back((key, Arc::clone(&texture)));
         texture
-    }
-
-    fn touch(&mut self, key: &ColorLutTextureKey) {
-        if let Some(position) = self.lru.iter().position(|candidate| candidate == key) {
-            self.lru.remove(position);
-        }
-        self.lru.push_back(key.clone());
     }
 
     fn clear(&mut self) {
         self.entries.clear();
-        self.lru.clear();
     }
 
     #[cfg(test)]
@@ -149,8 +143,8 @@ impl ColorLutTextureCache {
     #[cfg(test)]
     fn contains_profile(&self, profile_sha256: &str) -> bool {
         self.entries
-            .keys()
-            .any(|key| key.profile_sha256 == profile_sha256)
+            .iter()
+            .any(|(key, _)| key.profile_sha256 == profile_sha256)
     }
 }
 
@@ -488,6 +482,13 @@ impl WgpuTileUploader {
         image: &metal_wgpu_interop::ResidentMetalImage,
         color_lut: Option<&ColorLut3d>,
     ) -> Result<PreparedTexture, TileUploadError> {
+        let (width, height) = image.dimensions();
+        validate_texture_dimensions(
+            width,
+            height,
+            self.context.state.device.limits().max_texture_dimension_2d,
+        )
+        .map_err(|message| TileUploadError::MetalTile(message.into()))?;
         let bridge = self.metal_bridge.as_ref().ok_or_else(|| {
             TileUploadError::MetalTile(
                 self.metal_bridge_error
@@ -722,6 +723,12 @@ fn prepare_cpu_texture(
             "dimensions must be nonzero",
         ));
     }
+    validate_texture_dimensions(
+        tile.width,
+        tile.height,
+        device.limits().max_texture_dimension_2d,
+    )
+    .map_err(TileUploadError::InvalidCpuTile)?;
     let expected = usize::try_from(tile.width)
         .ok()
         .and_then(|width| width.checked_mul(tile.height as usize))
@@ -759,6 +766,20 @@ fn prepare_cpu_texture(
         #[cfg(target_os = "macos")]
         _color_lut_owner: None,
     })
+}
+
+fn validate_texture_dimensions(
+    width: u32,
+    height: u32,
+    max_dimension_2d: u32,
+) -> Result<(), &'static str> {
+    if width > max_dimension_2d {
+        return Err("width exceeds the renderer texture limit");
+    }
+    if height > max_dimension_2d {
+        return Err("height exceeds the renderer texture limit");
+    }
+    Ok(())
 }
 
 fn create_rgba_texture(
@@ -897,6 +918,19 @@ mod tests {
     use std::sync::{mpsc, Arc};
 
     use super::*;
+
+    #[test]
+    fn texture_dimensions_are_rejected_before_wgpu_resource_creation() {
+        assert_eq!(validate_texture_dimensions(4096, 4096, 4096), Ok(()));
+        assert_eq!(
+            validate_texture_dimensions(4097, 1, 4096),
+            Err("width exceeds the renderer texture limit")
+        );
+        assert_eq!(
+            validate_texture_dimensions(1, 4097, 4096),
+            Err("height exceeds the renderer texture limit")
+        );
+    }
 
     #[test]
     fn cpu_upload_unit_completes_registration_inside_the_budgeted_operation() {

@@ -28,22 +28,6 @@ jobs:
           path: dicom-viewer
           persist-credentials: false
 
-      - name: Checkout wsi-rs
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          repository: frames-sg/wsi-rs
-          ref: v0.5.2
-          path: wsi-rs
-          persist-credentials: false
-
-      - name: Checkout j2k
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          repository: frames-sg/j2k
-          ref: v0.7.4
-          path: j2k
-          persist-credentials: false
-
       - name: Install Linux GUI dependencies
         if: runner.os == 'Linux'
         run: |
@@ -113,22 +97,6 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           path: dicom-viewer
-          persist-credentials: false
-
-      - name: Checkout wsi-rs
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          repository: frames-sg/wsi-rs
-          ref: v0.5.2
-          path: wsi-rs
-          persist-credentials: false
-
-      - name: Checkout j2k
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          repository: frames-sg/j2k
-          ref: v0.7.4
-          path: j2k
           persist-credentials: false
 
       - name: Install Rust

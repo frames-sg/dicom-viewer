@@ -7,8 +7,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use dicom_viewer_core::{
-    DicomIndexDiagnostic, LevelIndex, ReadCancellationToken, ReadControl, ReadDiagnostic,
-    ViewerStudy,
+    DicomIndexDiagnostic, LevelIndex, ReadCancellationToken, ReadControl, ViewerStudy,
 };
 
 const EVENT_CHANNEL_CAPACITY: usize = 16;
@@ -364,13 +363,11 @@ fn wait_for_work(shared: &Shared) -> Option<PreparationWork> {
                 let mut control = ReadControl::new(token.clone());
                 if let Some(diagnostics) = &index_diagnostics {
                     let captured = Arc::clone(diagnostics);
-                    control = control.with_diagnostic_sink(Arc::new(move |event| {
-                        if let ReadDiagnostic::DicomIndex(diagnostic) = event {
-                            captured
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .push(diagnostic);
-                        }
+                    control = control.with_diagnostic_sink(Arc::new(move |diagnostic| {
+                        captured
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(diagnostic);
                     }));
                 }
                 state.active = Some(ActivePreparation {
@@ -522,7 +519,7 @@ mod tests {
 
     use dicom_viewer_core::{
         DicomIndexDiagnostic, DicomIndexMapping, DicomIndexOutcome, LevelIndex,
-        ReadCancellationToken, ReadControl, ReadDiagnostic,
+        ReadCancellationToken, ReadControl,
     };
 
     use super::{LevelPreparer, LevelWarmer, LevelWarmerEvent};
@@ -583,12 +580,12 @@ mod tests {
             _level: LevelIndex,
             control: &ReadControl,
         ) -> std::result::Result<(), String> {
-            control.record_diagnostic(ReadDiagnostic::DicomIndex(DicomIndexDiagnostic::new(
+            control.record_diagnostic(DicomIndexDiagnostic::new(
                 DicomIndexOutcome::BuiltFast {
                     mapping: DicomIndexMapping::ExtendedOffsetTableDirect,
                 },
                 Duration::from_millis(7),
-            )));
+            ));
             Ok(())
         }
     }

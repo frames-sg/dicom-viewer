@@ -120,9 +120,10 @@ RGBA texture cannot fit; an actual decoded or upload-peak overrun is a
 persistent failure and that key is not decoded again.
 
 The ceiling is deliberately scoped to store-owned decoded data, ready
-textures, and synchronous source-plus-destination upload overlap. Decoder
-scratch, wsi-rs source caches, bounded channel messages, and driver overhead
-are outside it.
+textures, synchronous source-plus-destination upload overlap, and one shared
+decoded-byte reservation across all worker batches. Reservations remain held
+until the UI has transferred every batch result into the byte-accounted store.
+Decoder scratch, wsi-rs source caches, and driver overhead are outside it.
 
 ## Upload and color management
 
@@ -206,9 +207,9 @@ for this reason.
 
 ## Release integration
 
-The viewer workspace expects sibling `wsi-rs` 0.5.2 and `j2k` 0.7.4
-checkouts. Its direct dependencies are exact-versioned and CI substitutes the
-corresponding tags. wsi-rs owns codec selection; the viewer must not create a
+The viewer workspace resolves exact `wsi-rs` 0.5.2 and J2K 0.8.0 releases from
+the locked crates.io graph. CI and clean checkouts must not overlay sibling
+codec sources. wsi-rs owns codec selection; the viewer must not create a
 parallel codec or device-session stack.
 
 Large conformance slides remain local. Repository tests use synthetic fixtures

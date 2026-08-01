@@ -469,6 +469,46 @@ fn camera_zoom_out_stops_ten_percent_past_fit() {
 }
 
 #[test]
+fn camera_zoom_out_at_slide_edge_preserves_center_focus() {
+    let summary = summary();
+    let mut camera = CameraState::default();
+    *camera.smoothing_enabled_mut() = false;
+    let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(512.0, 512.0));
+    camera.reset_for_study(&summary);
+    camera.prepare_canvas(rect, &summary);
+    camera.zoom_about_center(rect, 8.0);
+    camera.prepare_canvas(rect, &summary);
+
+    camera.pan_by(vec2(10_000.0, 10_000.0));
+    camera.prepare_canvas(rect, &summary);
+    let focus = camera
+        .frame(rect, &summary, 1.0 / 60.0)
+        .rendered
+        .center_base;
+    assert_eq!(focus, Vec2::ZERO);
+
+    camera.zoom_about_center(rect, 0.5);
+    camera.prepare_canvas(rect, &summary);
+    assert_eq!(
+        camera
+            .frame(rect, &summary, 1.0 / 60.0)
+            .rendered
+            .center_base,
+        focus
+    );
+
+    camera.zoom_about_center(rect, 2.0);
+    camera.prepare_canvas(rect, &summary);
+    assert_eq!(
+        camera
+            .frame(rect, &summary, 1.0 / 60.0)
+            .rendered
+            .center_base,
+        focus
+    );
+}
+
+#[test]
 fn pointer_zoom_preserves_the_base_point_in_the_rendered_frame() {
     let summary = summary();
     let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(512.0, 512.0));

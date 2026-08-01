@@ -16,7 +16,10 @@ repository = "https://github.com/frames-sg/dicom-viewer"
 [workspace.dependencies]
 dicom-core = "0.9"
 dicom-dictionary-std = "0.9"
+dicom-encoding = "0.9"
 dicom-object = "0.9"
+dicom-parser = "0.9"
+dicom-transfer-syntax-registry = { version = "0.9", default-features = false }
 eframe = { version = "0.34.2", default-features = false, features = [
     "accesskit",
     "default_fonts",
@@ -31,14 +34,13 @@ metal = "0.33"
 objc2 = "0.6.4"
 objc2-metal = "0.3.2"
 foreign-types = "0.5"
-j2k-core = { version = "=0.7.4", path = "../j2k/crates/j2k-core" }
-j2k-metal-support = { version = "=0.7.4", path = "../j2k/crates/j2k-metal-support" }
+j2k-core = "=0.8.0"
+j2k-metal-support = "=0.8.0"
+j2k-native = "=0.8.0"
 pollster = "0.4"
 rfd = "0.17.2"
-wsi-rs = { version = "=0.5.2", path = "../wsi-rs" }
-j2k-test-support = { version = "=0.7.4", path = "../j2k/crates/j2k-test-support", features = [
-    "j2k-native-fixtures",
-] }
+serde_json = "1"
+wsi-rs = "=0.5.2"
 tempfile = "3"
 thiserror = "2"
 lcms2 = { version = "6.1.1", features = ["static"] }
@@ -49,18 +51,6 @@ sha2 = "0.10"
 # quick-xml >= 0.41. See vendor/wayland-scanner/SECURITY-PATCH.md.
 [patch.crates-io]
 wayland-scanner = { path = "vendor/wayland-scanner" }
-# `wsi-rs` 0.5 accepts the 0.7.x j2k family. Keep its codec crates aligned
-# with the sibling 0.7.4 test fixtures so Cargo links one native codec build.
-j2k = { path = "../j2k/crates/j2k" }
-j2k-core = { path = "../j2k/crates/j2k-core" }
-j2k-cuda = { path = "../j2k/crates/j2k-cuda" }
-j2k-jpeg = { path = "../j2k/crates/j2k-jpeg" }
-j2k-jpeg-cuda = { path = "../j2k/crates/j2k-jpeg-cuda" }
-j2k-jpeg-metal = { path = "../j2k/crates/j2k-jpeg-metal" }
-j2k-metal = { path = "../j2k/crates/j2k-metal" }
-j2k-metal-support = { path = "../j2k/crates/j2k-metal-support" }
-j2k-native = { path = "../j2k/crates/j2k-native" }
-j2k-tilecodec = { path = "../j2k/crates/j2k-tilecodec" }
 
 [profile.release]
 lto = "fat"

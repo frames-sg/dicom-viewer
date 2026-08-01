@@ -9,7 +9,7 @@ use wsi_rs::{
 };
 pub use wsi_rs::{
     DicomIndexDiagnostic, DicomIndexMapping, DicomIndexOutcome, ReadCancellationToken, ReadControl,
-    ReadDiagnostic, ReadDiagnosticSink,
+    ReadDiagnosticSink,
 };
 
 mod color;

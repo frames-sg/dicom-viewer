@@ -17,15 +17,19 @@ use super::tile::{
     DicomIndexDiagnosticSource, FrameTileDemand, LevelPreparationStatus, TileFailureInfo,
     TilePollRequest, TileRenderer, VisibleTile,
 };
+#[cfg(test)]
+use super::viewport::visible_tiles;
 use super::viewport::{
     base_size, choose_display_level_index, choose_render_level,
-    choose_render_level_with_hysteresis, level_by_index, nearest_grid_coordinates, visible_tiles,
+    choose_render_level_with_hysteresis, level_by_index, nearest_grid_coordinates,
+    visible_tiles_with_limit,
 };
 
 pub(super) const PREFETCH_MARGIN_TILES: i64 = 1;
 const OVERVIEW_PIN_BYTES: usize = 32 * 1024 * 1024;
 const MAX_FALLBACK_TILE_BYTES: u64 = OVERVIEW_PIN_BYTES as u64;
 const MAX_PLANNED_TILES: usize = 8_192;
+const MAX_FRAME_PLANNING_REFERENCES: usize = MAX_PLANNED_TILES + 1;
 pub(super) const TILE_RESIDENT_CACHE_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Debug)]
@@ -450,6 +454,38 @@ struct TileFramePlan {
     pinned: HashSet<super::tile::TileKey>,
 }
 
+struct FramePlanningBudget {
+    remaining: usize,
+}
+
+impl FramePlanningBudget {
+    const fn new(limit: usize) -> Self {
+        Self { remaining: limit }
+    }
+
+    fn visible_tiles(
+        &mut self,
+        rect: Rect,
+        level: &LevelInfo,
+        generation: u64,
+        center_base: egui::Vec2,
+        zoom: f32,
+        margin: i64,
+    ) -> Vec<VisibleTile> {
+        let tiles = visible_tiles_with_limit(
+            rect,
+            level,
+            generation,
+            center_base,
+            zoom,
+            margin,
+            self.remaining,
+        );
+        self.remaining = self.remaining.saturating_sub(tiles.len());
+        tiles
+    }
+}
+
 impl TileFramePlan {
     fn build(
         summary: &StudySummary,
@@ -472,8 +508,9 @@ impl TileFramePlan {
         } else {
             preferred_render_level
         };
+        let mut planning_budget = FramePlanningBudget::new(MAX_FRAME_PLANNING_REFERENCES);
 
-        let render_visible = visible_tiles(
+        let render_visible = planning_budget.visible_tiles(
             rect,
             render_level,
             generation,
@@ -482,7 +519,7 @@ impl TileFramePlan {
             0,
         );
         let prefetch = if camera.animating {
-            visible_tiles(
+            planning_budget.visible_tiles(
                 rect,
                 target_level,
                 generation,
@@ -491,7 +528,7 @@ impl TileFramePlan {
                 0,
             )
         } else if target_level.index != render_level.index {
-            visible_tiles(
+            planning_budget.visible_tiles(
                 rect,
                 target_level,
                 generation,
@@ -500,7 +537,7 @@ impl TileFramePlan {
                 0,
             )
         } else {
-            visible_tiles(
+            planning_budget.visible_tiles(
                 rect,
                 render_level,
                 generation,
@@ -515,7 +552,7 @@ impl TileFramePlan {
         let held_visible = held_level
             .and_then(|index| level_by_index(summary, index))
             .map(|level| {
-                visible_tiles(
+                planning_budget.visible_tiles(
                     rect,
                     level,
                     generation,
@@ -534,7 +571,7 @@ impl TileFramePlan {
             .iter()
             .map(|level| TileLayer {
                 level: level.index,
-                tiles: visible_tiles(
+                tiles: planning_budget.visible_tiles(
                     rect,
                     level,
                     generation,
@@ -551,7 +588,7 @@ impl TileFramePlan {
                 .iter()
                 .map(|level| TileLayer {
                     level: level.index,
-                    tiles: visible_tiles(
+                    tiles: planning_budget.visible_tiles(
                         rect,
                         level,
                         generation,
@@ -863,6 +900,61 @@ mod tests {
         assert_eq!(plan.overview.len(), 1);
         assert_eq!(plan.overview[0].key.level, LevelIndex::from_u32(1));
         assert!(plan.pinned.contains(&plan.overview[0].key));
+    }
+
+    #[test]
+    fn frame_plan_applies_one_budget_across_all_fallback_levels() {
+        let mut summary = summary();
+        summary.canvas_dimensions = (20_000, 20_000);
+        summary.levels = (0..32)
+            .map(|index| LevelInfo {
+                index: LevelIndex::from_u32(index),
+                width: 20_000,
+                height: 20_000,
+                downsample: f64::from(index + 1),
+                tile_layout: LevelTileLayout::Regular {
+                    tile_width: 1,
+                    tile_height: 1,
+                    tiles_across: 20_000,
+                    tiles_down: 20_000,
+                },
+            })
+            .collect();
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(20_000.0, 20_000.0));
+        let view = CameraView {
+            center_base: vec2(10_000.0, 10_000.0),
+            zoom: 1.0,
+        };
+
+        let plan = TileFramePlan::build(
+            &summary,
+            rect,
+            1,
+            Arc::from(Vec::<VisibleTile>::new()),
+            CameraFrame {
+                rendered: view,
+                target: view,
+                animating: false,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        let planned_references = plan.render_visible.len()
+            + plan.prefetch.len()
+            + plan.held_visible.len()
+            + plan
+                .fallback_visible_layers
+                .iter()
+                .map(|layer| layer.tiles.len())
+                .sum::<usize>()
+            + plan
+                .fallback_prefetch_layers
+                .iter()
+                .map(|layer| layer.tiles.len())
+                .sum::<usize>();
+
+        assert!(planned_references <= MAX_PLANNED_TILES + 1);
     }
 
     #[test]

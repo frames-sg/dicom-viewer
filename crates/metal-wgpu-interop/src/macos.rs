@@ -18,12 +18,46 @@ pub enum MetalWgpuInteropError {
     EmptyAllocation,
     #[error("resident Metal allocation is too large for this platform")]
     AllocationTooLarge,
+    #[error(
+        "resident Metal allocation is {allocation_len} bytes, exceeding renderer limits (buffer {max_buffer_size}, storage binding {max_storage_buffer_binding_size})"
+    )]
+    WgpuBufferLimit {
+        allocation_len: u64,
+        max_buffer_size: u64,
+        max_storage_buffer_binding_size: u64,
+    },
     #[error("resident image addressing exceeds the renderer shader's 32-bit range")]
     ShaderAddressTooLarge,
     #[error("failed to retain the renderer Metal device")]
     DeviceRetainFailed,
     #[error("failed to retain the resident Metal allocation")]
     BufferRetainFailed,
+}
+
+/// Return the size of the allocation retained by a resident image.
+pub fn resident_allocation_len(image: &ResidentMetalImage) -> Result<usize, MetalWgpuInteropError> {
+    // SAFETY: Reading the immutable allocation length does not access its
+    // contents, create an alias, or expose the raw handle.
+    let allocation_len = unsafe { image.raw_buffer() }.length();
+    if allocation_len == 0 {
+        return Err(MetalWgpuInteropError::EmptyAllocation);
+    }
+    usize::try_from(allocation_len).map_err(|_| MetalWgpuInteropError::AllocationTooLarge)
+}
+
+fn validate_wgpu_buffer_limits(
+    allocation_len: u64,
+    max_buffer_size: u64,
+    max_storage_buffer_binding_size: u64,
+) -> Result<(), MetalWgpuInteropError> {
+    if allocation_len > max_buffer_size || allocation_len > max_storage_buffer_binding_size {
+        return Err(MetalWgpuInteropError::WgpuBufferLimit {
+            allocation_len,
+            max_buffer_size,
+            max_storage_buffer_binding_size,
+        });
+    }
+    Ok(())
 }
 
 /// The exact Metal device backing a wgpu renderer.
@@ -87,6 +121,12 @@ impl MetalWgpuBridge {
         image: &ResidentMetalImage,
     ) -> Result<ImportedMetalBuffer, MetalWgpuInteropError> {
         let metadata = ValidatedImage::new(image, &self.metal_device)?;
+        let limits = self.device.limits();
+        validate_wgpu_buffer_limits(
+            metadata.allocation_len,
+            limits.max_buffer_size,
+            limits.max_storage_buffer_binding_size,
+        )?;
 
         // SAFETY: `ResidentMetalImage` promises an immutable, completed
         // allocation. We retain but never mutate or expose its raw handle.
@@ -296,6 +336,13 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn rejects_allocations_larger_than_wgpu_buffer_or_binding_limits() {
+        assert!(validate_wgpu_buffer_limits(512, 512, 512).is_ok());
+        assert!(validate_wgpu_buffer_limits(513, 512, 1_024).is_err());
+        assert!(validate_wgpu_buffer_limits(513, 1_024, 512).is_err());
+    }
+
     fn test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         descriptor.backends = wgpu::Backends::METAL;
@@ -357,6 +404,24 @@ mod tests {
         assert_eq!(imported.decoded_byte_len(), 8);
         assert_eq!(imported.buffer().size(), 8);
         assert_eq!(&mapped[..6], &bytes[..6]);
+    }
+
+    #[test]
+    fn resident_allocation_accounting_charges_the_full_shared_buffer() {
+        let Some((device, _queue)) = test_device() else {
+            return;
+        };
+        let bridge = MetalWgpuBridge::new(&device).unwrap();
+        let metal_buffer = bridge
+            .metal_device()
+            .new_buffer(64, MTLResourceOptions::StorageModeShared);
+        let layout = MetalImageLayout::new(16, (1, 1), 4, PixelFormat::Rgb8).unwrap();
+        // SAFETY: This fresh test allocation has no pending writer or aliases.
+        let image =
+            unsafe { ResidentMetalImage::from_completed_buffer(metal_buffer, layout) }.unwrap();
+
+        assert_eq!(image.byte_len(), 4);
+        assert_eq!(resident_allocation_len(&image).unwrap(), 64);
     }
 
     #[test]

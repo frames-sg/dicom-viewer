@@ -180,10 +180,13 @@ impl DecodedTile {
                 tile.rgba.len()
             }
             #[cfg(target_os = "macos")]
-            Self::Metal(tile) => tile
-                .resident_image()
-                .map_err(|error| format!("invalid decoded Metal tile: {error}"))?
-                .byte_len(),
+            Self::Metal(tile) => {
+                let image = tile
+                    .resident_image()
+                    .map_err(|error| format!("invalid decoded Metal tile: {error}"))?;
+                metal_wgpu_interop::resident_allocation_len(image)
+                    .map_err(|error| format!("invalid decoded Metal allocation: {error}"))?
+            }
         };
         let upload_peak_bytes = decoded_bytes
             .checked_add(texture_bytes)
@@ -235,7 +238,7 @@ impl TileRenderer {
         max_ready_bytes: usize,
     ) -> Self {
         let stats = PipelineStats::from_environment();
-        let loader = TileLoader::new(stats.is_enabled());
+        let loader = TileLoader::new(stats.is_enabled(), max_ready_bytes);
         let mut store = TileStore::with_eviction_diagnostics(max_ready_bytes, stats.is_enabled());
         if let Some(error) = loader.startup_error.clone() {
             store.record_failure(error);
@@ -380,14 +383,17 @@ impl TileRenderer {
         ordered.sort_by_key(|(key, (lane, distance2))| (*lane, *distance2, *key));
         let mut requests = Vec::with_capacity(ordered.len());
         for (key, (lane, distance2)) in ordered {
-            let texture_bytes = study
+            let upload_peak_bytes = study
                 .summary()
                 .levels
                 .iter()
                 .find(|level| level.index == key.level)
                 .ok_or_else(|| format!("level {} is not renderable", key.level))
-                .and_then(|level| planned_texture_bytes(level, key.coord));
-            if self.store.reject_texture_preflight(key, texture_bytes) {
+                .and_then(|level| planned_upload_peak_bytes(level, key.coord));
+            if self
+                .store
+                .reject_upload_peak_preflight(key, upload_peak_bytes)
+            {
                 continue;
             }
             let read_mode = match self.store.queue_for_demand(key) {
@@ -447,7 +453,7 @@ impl TileRenderer {
                     let keys = results.iter().map(|result| result.key).collect::<Vec<_>>();
                     let record_for_active_study =
                         loader_batch_belongs_to_generation(request.generation, &keys);
-                    let current_keys = self.loader.acknowledge_finished(batch_id, &keys);
+                    let current_keys = self.loader.current_keys_for_batch(batch_id, &keys);
                     let mut obsolete_results = 0;
                     for result in results {
                         if stage_loader_result_if_current(
@@ -463,6 +469,7 @@ impl TileRenderer {
                             }
                         }
                     }
+                    self.loader.acknowledge_finished(batch_id, &keys);
                     if record_for_active_study {
                         self.stats.record_dicom_index_diagnostics(
                             DicomIndexDiagnosticSource::Read,
@@ -597,6 +604,19 @@ fn planned_texture_bytes(level: &LevelInfo, coord: TileCoord) -> Result<usize, S
         .ok_or_else(|| {
             format!(
                 "tile {},{} on level {} overflows final RGBA texture bytes",
+                coord.col(),
+                coord.row(),
+                level.index
+            )
+        })
+}
+
+fn planned_upload_peak_bytes(level: &LevelInfo, coord: TileCoord) -> Result<usize, String> {
+    planned_texture_bytes(level, coord)?
+        .checked_mul(2)
+        .ok_or_else(|| {
+            format!(
+                "tile {},{} on level {} overflows decoded-source plus RGBA texture bytes",
                 coord.col(),
                 coord.row(),
                 level.index

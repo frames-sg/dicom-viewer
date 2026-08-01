@@ -8,9 +8,7 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
-use dicom_viewer_core::{
-    DicomIndexDiagnostic, ReadCancellationToken, ReadControl, ReadDiagnostic, ViewerStudy,
-};
+use dicom_viewer_core::{DicomIndexDiagnostic, ReadCancellationToken, ReadControl, ViewerStudy};
 
 use super::{
     DecodedTile, DemandEpoch, QueueLane, TileFailure, TileKey, TileLoadOutcome, TileLoadResult,
@@ -88,6 +86,8 @@ struct LoaderState {
     demand_epoch: DemandEpoch,
     last_foreground_lane: Option<QueueLane>,
     max_batch_size: usize,
+    max_in_flight_decoded_bytes: usize,
+    in_flight_decoded_bytes: usize,
     interactive_batch_size: usize,
     metrics_enabled: bool,
     cancellations: u64,
@@ -95,7 +95,7 @@ struct LoaderState {
 }
 
 impl LoaderState {
-    fn new(metrics_enabled: bool) -> Self {
+    fn new(metrics_enabled: bool, max_in_flight_decoded_bytes: usize) -> Self {
         Self {
             jobs: BinaryHeap::new(),
             queued: HashMap::new(),
@@ -105,6 +105,8 @@ impl LoaderState {
             demand_epoch: DemandEpoch::INITIAL,
             last_foreground_lane: None,
             max_batch_size: TILE_DECODE_BATCH_SIZE,
+            max_in_flight_decoded_bytes: max_in_flight_decoded_bytes.max(1),
+            in_flight_decoded_bytes: 0,
             interactive_batch_size: configured_interactive_batch_size(
                 std::env::var("DICOM_VIEWER_INTERACTIVE_BATCH_SIZE")
                     .ok()
@@ -119,7 +121,7 @@ impl LoaderState {
 
 impl Default for LoaderState {
     fn default() -> Self {
-        Self::new(false)
+        Self::new(false, usize::MAX)
     }
 }
 
@@ -127,6 +129,7 @@ struct InFlightBatch {
     demand_epoch: DemandEpoch,
     lane: QueueLane,
     keys: Vec<TileKey>,
+    reserved_decoded_bytes: usize,
     token: ReadCancellationToken,
 }
 
@@ -251,18 +254,29 @@ impl Ord for TileJob {
 }
 
 impl TileLoader {
-    pub(super) fn new(metrics_enabled: bool) -> Self {
-        Self::with_worker_count_and_metrics(default_worker_count(), metrics_enabled)
+    pub(super) fn new(metrics_enabled: bool, max_in_flight_decoded_bytes: usize) -> Self {
+        Self::with_worker_count_and_metrics(
+            default_worker_count(),
+            metrics_enabled,
+            max_in_flight_decoded_bytes,
+        )
     }
 
     #[cfg(test)]
     fn with_worker_count(worker_count: usize) -> Self {
-        Self::with_worker_count_and_metrics(worker_count, false)
+        Self::with_worker_count_and_metrics(worker_count, false, usize::MAX)
     }
 
-    fn with_worker_count_and_metrics(worker_count: usize, metrics_enabled: bool) -> Self {
+    fn with_worker_count_and_metrics(
+        worker_count: usize,
+        metrics_enabled: bool,
+        max_in_flight_decoded_bytes: usize,
+    ) -> Self {
         let shared = Arc::new(LoaderShared {
-            state: Mutex::new(LoaderState::new(metrics_enabled)),
+            state: Mutex::new(LoaderState::new(
+                metrics_enabled,
+                max_in_flight_decoded_bytes,
+            )),
             available: Condvar::new(),
         });
         let (sender, receiver) = mpsc::sync_channel(worker_count.saturating_mul(2).max(1));
@@ -358,7 +372,6 @@ impl TileLoader {
         state.jobs.clear();
         state.queued.clear();
         state.decoding.clear();
-        state.in_flight.clear();
         state.last_foreground_lane = None;
     }
 
@@ -378,6 +391,14 @@ impl TileLoader {
 
     pub(super) fn acknowledge_finished(&self, batch_id: u64, keys: &[TileKey]) -> Vec<TileKey> {
         finish_batch(&self.shared, batch_id, keys)
+    }
+
+    pub(super) fn current_keys_for_batch(&self, batch_id: u64, keys: &[TileKey]) -> Vec<TileKey> {
+        let state = lock_state(&self.shared);
+        keys.iter()
+            .filter(|key| state.decoding.get(key) == Some(&batch_id))
+            .copied()
+            .collect()
     }
 
     pub(super) fn stats(&self) -> TileLoaderStats {
@@ -628,6 +649,16 @@ fn wait_for_batch(shared: &LoaderShared) -> Option<TileBatch> {
             let demand_epoch = state.demand_epoch;
             let lane = jobs[0].priority.lane;
             let keys = jobs.iter().map(|job| job.key).collect::<Vec<_>>();
+            let reserved_decoded_bytes = jobs
+                .iter()
+                .map(decoded_byte_reservation)
+                .try_fold(0_usize, usize::checked_add)
+                .expect("admitted tile decode reservations must fit in usize");
+            state.in_flight_decoded_bytes = state
+                .in_flight_decoded_bytes
+                .checked_add(reserved_decoded_bytes)
+                .expect("in-flight tile decode reservations must fit in usize");
+            debug_assert!(state.in_flight_decoded_bytes <= state.max_in_flight_decoded_bytes);
             state
                 .decoding
                 .extend(keys.iter().copied().map(|key| (key, id)));
@@ -638,13 +669,11 @@ fn wait_for_batch(shared: &LoaderShared) -> Option<TileBatch> {
             let mut control = ReadControl::new(token.clone());
             if let Some(diagnostics) = &index_diagnostics {
                 let captured = Arc::clone(diagnostics);
-                control = control.with_diagnostic_sink(Arc::new(move |event| {
-                    if let ReadDiagnostic::DicomIndex(diagnostic) = event {
-                        captured
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .push(diagnostic);
-                    }
+                control = control.with_diagnostic_sink(Arc::new(move |diagnostic| {
+                    captured
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(diagnostic);
                 }));
             }
             state.in_flight.insert(
@@ -653,6 +682,7 @@ fn wait_for_batch(shared: &LoaderShared) -> Option<TileBatch> {
                     demand_epoch,
                     lane,
                     keys,
+                    reserved_decoded_bytes,
                     token,
                 },
             );
@@ -686,16 +716,50 @@ fn take_index_diagnostics(
 }
 
 fn pop_next_batch(state: &mut LoaderState) -> Option<Vec<TileJob>> {
+    let available_bytes = state
+        .max_in_flight_decoded_bytes
+        .saturating_sub(state.in_flight_decoded_bytes);
+    if available_bytes == 0 {
+        return None;
+    }
     let lane = choose_next_lane(state)?;
-    let first = pop_next_valid_job_for_lane(state, lane)?;
+    let first = pop_next_valid_job_for_lane(state, lane, available_bytes)?;
+    let mut reserved_bytes = decoded_byte_reservation(&first);
     let mut jobs = vec![first];
     while jobs.len() < state.max_batch_size {
-        let Some(job) = pop_next_compatible_job(state, &jobs[0]) else {
+        let remaining_bytes = available_bytes.saturating_sub(reserved_bytes);
+        let Some(job) = pop_next_compatible_job(state, &jobs[0], remaining_bytes) else {
             break;
         };
+        reserved_bytes = reserved_bytes
+            .checked_add(decoded_byte_reservation(&job))
+            .expect("admitted tile decode reservations must fit in usize");
         jobs.push(job);
     }
     Some(jobs)
+}
+
+fn decoded_byte_reservation(job: &TileJob) -> usize {
+    let Some(level) = job
+        .study
+        .summary()
+        .levels
+        .iter()
+        .find(|level| level.index == job.key.level)
+    else {
+        return usize::MAX;
+    };
+    let (width, height) = level.tile_layout.display_tile_size();
+    if width == 0 || height == 0 {
+        return usize::MAX;
+    }
+    super::planned_upload_peak_bytes(level, job.key.coord).unwrap_or_else(|_| {
+        usize::try_from(width)
+            .ok()
+            .and_then(|width| width.checked_mul(height as usize))
+            .and_then(|pixels| pixels.checked_mul(8))
+            .unwrap_or(usize::MAX)
+    })
 }
 
 fn choose_next_lane(state: &LoaderState) -> Option<QueueLane> {
@@ -723,13 +787,17 @@ fn choose_next_lane(state: &LoaderState) -> Option<QueueLane> {
     state.queued.values().map(|job| job.priority.lane).min()
 }
 
-fn pop_next_valid_job_for_lane(state: &mut LoaderState, lane: QueueLane) -> Option<TileJob> {
+fn pop_next_valid_job_for_lane(
+    state: &mut LoaderState,
+    lane: QueueLane,
+    available_bytes: usize,
+) -> Option<TileJob> {
     let mut deferred = Vec::new();
     while let Some(Reverse(job)) = state.jobs.pop() {
         if !is_current_job(state, &job) {
             continue;
         }
-        if job.priority.lane == lane {
+        if job.priority.lane == lane && decoded_byte_reservation(&job) <= available_bytes {
             state.queued.remove(&job.key);
             state.jobs.extend(deferred.into_iter().map(Reverse));
             return Some(job);
@@ -740,13 +808,17 @@ fn pop_next_valid_job_for_lane(state: &mut LoaderState, lane: QueueLane) -> Opti
     None
 }
 
-fn pop_next_compatible_job(state: &mut LoaderState, first: &TileJob) -> Option<TileJob> {
+fn pop_next_compatible_job(
+    state: &mut LoaderState,
+    first: &TileJob,
+    available_bytes: usize,
+) -> Option<TileJob> {
     let mut deferred = Vec::new();
     while let Some(Reverse(job)) = state.jobs.pop() {
         if !is_current_job(state, &job) {
             continue;
         }
-        if can_batch(first, &job) {
+        if can_batch(first, &job) && decoded_byte_reservation(&job) <= available_bytes {
             state.queued.remove(&job.key);
             state.jobs.extend(deferred.into_iter().map(Reverse));
             return Some(job);
@@ -1011,7 +1083,11 @@ fn cancelled_tiles(keys: Vec<TileKey>) -> Vec<TileLoadResult> {
 
 fn finish_batch(shared: &LoaderShared, batch_id: u64, keys: &[TileKey]) -> Vec<TileKey> {
     let mut state = lock_state(shared);
-    state.in_flight.remove(&batch_id);
+    if let Some(batch) = state.in_flight.remove(&batch_id) {
+        state.in_flight_decoded_bytes = state
+            .in_flight_decoded_bytes
+            .saturating_sub(batch.reserved_decoded_bytes);
+    }
     let mut current_keys = Vec::with_capacity(keys.len());
     for key in keys {
         if state.decoding.get(key) == Some(&batch_id) {
@@ -1073,12 +1149,26 @@ mod tests {
     use std::time::Duration;
 
     use dicom_viewer_core::{
-        DicomIndexDiagnostic, DicomIndexMapping, DicomIndexOutcome, LevelIndex, ReadDiagnostic,
-        TileCoord,
+        DicomIndexDiagnostic, DicomIndexMapping, DicomIndexOutcome, LevelIndex, TileCoord,
     };
 
     use super::super::QueueLane;
     use super::*;
+
+    // `j2k-test-support` is not published; generate the one fixture shape these
+    // tests need through the crates.io `j2k-native` encoder.
+    fn htj2k_rgb8_fixture(width: u32, height: u32) -> Vec<u8> {
+        let pixels = (0u32..width * height * 3)
+            .map(|index| ((index * 13 + index / 3) & 0xff) as u8)
+            .collect::<Vec<_>>();
+        let options = j2k_native::EncodeOptions {
+            reversible: true,
+            num_decomposition_levels: 1,
+            ..j2k_native::EncodeOptions::default()
+        };
+        j2k_native::encode_htj2k(&pixels, width, height, 3, 8, false, &options)
+            .expect("encode HTJ2K fixture")
+    }
 
     #[test]
     fn worker_count_override_supports_the_benchmark_matrix_without_changing_defaults() {
@@ -1185,7 +1275,7 @@ mod tests {
     fn study() -> Arc<ViewerStudy> {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("slide.j2k");
-        std::fs::write(&path, j2k_test_support::htj2k_rgb8_fixture(16, 16)).unwrap();
+        std::fs::write(&path, htj2k_rgb8_fixture(16, 16)).unwrap();
         Arc::new(ViewerStudy::open_path(path).unwrap())
     }
 
@@ -1268,6 +1358,43 @@ mod tests {
         assert_eq!(batch.len(), 8);
         assert_eq!(batch[0].key, key(0));
         assert_eq!(batch[7].key, key(7));
+    }
+
+    #[test]
+    fn decoded_byte_budget_caps_each_batch_and_all_concurrent_batches() {
+        let shared_study = study();
+        let tile_bytes = 16 * 16 * 8;
+        let mut state = LoaderState {
+            max_in_flight_decoded_bytes: tile_bytes * 2,
+            ..LoaderState::default()
+        };
+        for col in 0..8 {
+            let tile = key(col);
+            let tile_priority = priority(QueueLane::Visible, u128::from(col), col);
+            state.queued.insert(
+                tile,
+                QueuedJob {
+                    priority: tile_priority,
+                    read_mode: TileReadMode::Preferred,
+                    enqueued_at: None,
+                },
+            );
+            state.jobs.push(Reverse(TileJob {
+                key: tile,
+                priority: tile_priority,
+                study: Arc::clone(&shared_study),
+                read_mode: TileReadMode::Preferred,
+                enqueued_at: None,
+            }));
+        }
+
+        let first = pop_next_batch(&mut state).unwrap();
+        assert_eq!(first.len(), 2);
+        state.in_flight_decoded_bytes = tile_bytes * first.len();
+        assert!(pop_next_batch(&mut state).is_none());
+
+        state.in_flight_decoded_bytes = 0;
+        assert_eq!(pop_next_batch(&mut state).unwrap().len(), 2);
     }
 
     #[test]
@@ -1419,6 +1546,7 @@ mod tests {
                     demand_epoch: DemandEpoch(3),
                     lane: QueueLane::Visible,
                     keys: vec![key(0)],
+                    reserved_decoded_bytes: 0,
                     token: token.clone(),
                 },
             );
@@ -1965,11 +2093,17 @@ mod tests {
             ),
             TileLoaderMessage::Started { .. } => panic!("worker sent two Started messages"),
         };
-        assert!(lock_state(&loader.shared).decoding.contains_key(&tile));
+        {
+            let state = lock_state(&loader.shared);
+            assert!(state.decoding.contains_key(&tile));
+            assert!(state.in_flight_decoded_bytes > 0);
+        }
 
         loader.acknowledge_finished(batch_id, &keys);
 
-        assert!(!lock_state(&loader.shared).decoding.contains_key(&tile));
+        let state = lock_state(&loader.shared);
+        assert!(!state.decoding.contains_key(&tile));
+        assert_eq!(state.in_flight_decoded_bytes, 0);
     }
 
     #[test]
@@ -1990,7 +2124,7 @@ mod tests {
 
     #[test]
     fn enabled_metrics_capture_enqueue_timestamps() {
-        let loader = TileLoader::with_worker_count_and_metrics(0, true);
+        let loader = TileLoader::with_worker_count_and_metrics(0, true, usize::MAX);
         let shared_study = study();
         loader.enqueue_or_reprioritize_batch(vec![request(
             &shared_study,
@@ -2043,7 +2177,7 @@ mod tests {
             std::time::Duration::from_millis(9),
         );
         for (metrics_enabled, expected) in [(false, Vec::new()), (true, vec![diagnostic])] {
-            let loader = TileLoader::with_worker_count_and_metrics(0, metrics_enabled);
+            let loader = TileLoader::with_worker_count_and_metrics(0, metrics_enabled, usize::MAX);
             let shared_study = study();
             loader.enqueue_or_reprioritize_batch(vec![request(
                 &shared_study,
@@ -2052,9 +2186,7 @@ mod tests {
                 0,
             )]);
             let batch = wait_for_batch(&loader.shared).expect("queued tile should form a batch");
-            batch
-                .control
-                .record_diagnostic(ReadDiagnostic::DicomIndex(diagnostic));
+            batch.control.record_diagnostic(diagnostic);
 
             assert_eq!(take_index_diagnostics(&batch.index_diagnostics), expected);
             finish_batch(&loader.shared, batch.id, &[key(0)]);

@@ -11,6 +11,7 @@ use super::tile::{TileKey, VisibleTile};
 // enumeration bounded for hostile geometry while allowing the scheduler to
 // observe, diagnose, and deterministically trim visible-only overflow after
 // canonical deduplication.
+#[cfg(test)]
 const MAX_VISIBLE_TILES_PER_QUERY: usize = 8_193;
 
 pub(super) fn level_by_index(summary: &StudySummary, index: LevelIndex) -> Option<&LevelInfo> {
@@ -108,12 +109,11 @@ pub(super) fn choose_display_level_index(
     }
 }
 
-pub(super) fn clamp_center_axis(center: f32, visible: f32, slide: f32) -> f32 {
-    if visible >= slide {
-        slide * 0.5
-    } else {
-        center.clamp(visible * 0.5, slide - visible * 0.5)
-    }
+pub(super) fn clamp_center_axis(center: f32, slide: f32) -> f32 {
+    // The camera center is the user's focal point. Keep it on the slide while
+    // allowing the viewport to show canvas beyond an edge, so zooming cannot
+    // move that focus merely because the visible span changed.
+    center.clamp(0.0, slide)
 }
 
 pub(super) fn screen_to_base(
@@ -125,6 +125,7 @@ pub(super) fn screen_to_base(
     center_base + (screen - rect.center()) / zoom.max(MIN_ZOOM)
 }
 
+#[cfg(test)]
 pub(super) fn visible_tiles(
     rect: Rect,
     level: &LevelInfo,
@@ -133,6 +134,29 @@ pub(super) fn visible_tiles(
     zoom: f32,
     margin: i64,
 ) -> Vec<VisibleTile> {
+    visible_tiles_with_limit(
+        rect,
+        level,
+        generation,
+        center_base,
+        zoom,
+        margin,
+        MAX_VISIBLE_TILES_PER_QUERY,
+    )
+}
+
+pub(super) fn visible_tiles_with_limit(
+    rect: Rect,
+    level: &LevelInfo,
+    generation: u64,
+    center_base: Vec2,
+    zoom: f32,
+    margin: i64,
+    limit: usize,
+) -> Vec<VisibleTile> {
+    if limit == 0 {
+        return Vec::new();
+    }
     let Some((cols, rows)) = level.tile_layout.grid_size() else {
         return Vec::new();
     };
@@ -171,17 +195,11 @@ pub(super) fn visible_tiles(
     let span_rows = end_row.saturating_sub(start_row);
     let overflow = span_cols
         .checked_mul(span_rows)
-        .is_none_or(|count| count > MAX_VISIBLE_TILES_PER_QUERY as u64);
+        .is_none_or(|count| count > limit as u64);
 
     let candidates = if overflow {
         nearest_coordinates_in_bounds(
-            start_col,
-            end_col,
-            start_row,
-            end_row,
-            center_col,
-            center_row,
-            MAX_VISIBLE_TILES_PER_QUERY,
+            start_col, end_col, start_row, end_row, center_col, center_row, limit,
         )
     } else {
         let mut coordinates =
@@ -205,7 +223,7 @@ pub(super) fn visible_tiles(
         })
         .collect::<Vec<_>>();
     tiles.sort_by_key(|tile| (tile.distance2, tile.key.coord.row(), tile.key.coord.col()));
-    tiles.truncate(MAX_VISIBLE_TILES_PER_QUERY);
+    tiles.truncate(limit);
     tiles
 }
 

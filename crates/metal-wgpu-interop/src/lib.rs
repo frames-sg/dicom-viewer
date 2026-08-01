@@ -13,4 +13,6 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub use j2k_metal_support::ResidentMetalImage;
 #[cfg(target_os = "macos")]
-pub use macos::{ImportedMetalBuffer, MetalWgpuBridge, MetalWgpuInteropError};
+pub use macos::{
+    resident_allocation_len, ImportedMetalBuffer, MetalWgpuBridge, MetalWgpuInteropError,
+};

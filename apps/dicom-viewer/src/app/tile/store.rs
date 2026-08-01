@@ -165,21 +165,21 @@ impl TileStore {
         ));
     }
 
-    pub(super) fn reject_texture_preflight(
+    pub(super) fn reject_upload_peak_preflight(
         &mut self,
         key: TileKey,
-        texture_bytes: Result<usize, String>,
+        upload_peak_bytes: Result<usize, String>,
     ) -> bool {
         if matches!(self.entries.get(&key), Some(TileState::Failed)) {
             return true;
         }
-        match texture_bytes {
-            Ok(texture_bytes) if texture_bytes <= self.max_resident_bytes => false,
-            Ok(texture_bytes) => {
+        match upload_peak_bytes {
+            Ok(upload_peak_bytes) if upload_peak_bytes <= self.max_resident_bytes => false,
+            Ok(upload_peak_bytes) => {
                 self.record_terminal_failure(
                     key,
                     format!(
-                        "final RGBA texture requires {texture_bytes} bytes, exceeding the {}-byte viewer ceiling",
+                        "decoded-source plus RGBA upload peak requires {upload_peak_bytes} bytes, exceeding the {}-byte viewer ceiling",
                         self.max_resident_bytes
                     ),
                 );
@@ -1229,18 +1229,18 @@ mod tests {
     }
 
     #[test]
-    fn impossible_texture_is_rejected_once_before_decode() {
+    fn impossible_upload_peak_is_rejected_once_before_decode() {
         let mut store = TileStore::new(8);
         let exact = key(1, 0);
         let oversized = key(1, 1);
 
-        assert!(!store.reject_texture_preflight(exact, Ok(8)));
+        assert!(!store.reject_upload_peak_preflight(exact, Ok(8)));
         assert_eq!(
             store.queue_for_demand(exact),
             TileDemandStatus::Queue(TileReadMode::Preferred)
         );
-        assert!(store.reject_texture_preflight(oversized, Ok(9)));
-        assert!(store.reject_texture_preflight(oversized, Ok(9)));
+        assert!(store.reject_upload_peak_preflight(oversized, Ok(9)));
+        assert!(store.reject_upload_peak_preflight(oversized, Ok(9)));
 
         assert_eq!(store.queue_for_demand(oversized), TileDemandStatus::Failed);
         assert_eq!(store.tile_failure().map(|failure| failure.count), Some(1));
