@@ -29,6 +29,16 @@ fn htj2k_rgb8_fixture(width: u32, height: u32) -> Vec<u8> {
         .expect("encode HTJ2K fixture")
 }
 
+fn expect_cpu_render_tile(tile: RenderTile, message: &str) -> RgbaTile {
+    #[cfg(not(target_os = "macos"))]
+    let _ = message;
+    match tile {
+        RenderTile::Cpu(tile) => tile,
+        #[cfg(target_os = "macos")]
+        RenderTile::Metal(_) => panic!("{message}"),
+    }
+}
+
 #[test]
 fn viewer_error_reports_typed_cancellation() {
     assert!(ViewerError::Wsi(wsi_rs::WsiError::Cancelled).is_cancelled());
@@ -216,9 +226,8 @@ fn controlled_and_uncontrolled_batches_share_cpu_conversion_policy() {
     ] {
         assert_eq!(tiles.len(), rgba.len());
         for (actual, expected) in tiles.into_iter().zip(&rgba) {
-            let RenderTile::Cpu(actual) = actual else {
-                panic!("CPU-only viewer options returned a device tile");
-            };
+            let actual =
+                expect_cpu_render_tile(actual, "CPU-only viewer options returned a device tile");
             assert_eq!(
                 (actual.width, actual.height),
                 (expected.width, expected.height)
@@ -262,9 +271,10 @@ fn whole_level_batch_fallback_shares_control_and_conversion_policy() {
             .read_tiles_for_render_controlled(&requests, &control)
             .unwrap(),
     ] {
-        let RenderTile::Cpu(actual) = tiles.pop().unwrap() else {
-            panic!("whole-level fallback returned a device tile");
-        };
+        let actual = expect_cpu_render_tile(
+            tiles.pop().unwrap(),
+            "whole-level fallback returned a device tile",
+        );
         assert_eq!(
             (actual.width, actual.height),
             (expected.width, expected.height)
@@ -519,9 +529,7 @@ fn render_tile_api_preserves_cpu_output_and_request_order() {
 
     assert_eq!(tiles.len(), requests.len());
     for tile in tiles {
-        let RenderTile::Cpu(tile) = tile else {
-            panic!("CPU-only viewer options returned a device tile");
-        };
+        let tile = expect_cpu_render_tile(tile, "CPU-only viewer options returned a device tile");
         assert_eq!((tile.width, tile.height), (32, 24));
         assert_eq!(tile.rgba.len(), 32 * 24 * 4);
     }
@@ -617,9 +625,10 @@ fn cuda_viewer_download_matches_strict_cpu_for_synthetic_dicom_htj2k() {
             }
             Err(error) => panic!("required CUDA viewer decode/download failed: {error}"),
         };
-    let RenderTile::Cpu(actual) = actual else {
-        panic!("CUDA renderer boundary must return downloaded CPU pixels to wgpu");
-    };
+    let actual = expect_cpu_render_tile(
+        actual,
+        "CUDA renderer boundary must return downloaded CPU pixels to wgpu",
+    );
 
     assert_eq!(
         (actual.width, actual.height),

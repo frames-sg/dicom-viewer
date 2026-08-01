@@ -69,6 +69,8 @@ pub(crate) fn tile_output_config(
     TileOutputPreference,
     TileOutputPreference,
 ) {
+    #[cfg(not(any(target_os = "macos", feature = "cuda")))]
+    let _ = options;
     // Compatibility reads and ordered device-failure retries must never
     // select the same device backend that just failed its download boundary.
     let cpu = TileOutputPreference::cpu_only();

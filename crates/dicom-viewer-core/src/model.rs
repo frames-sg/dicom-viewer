@@ -204,6 +204,7 @@ impl ViewerOpenOptions {
         self
     }
 
+    #[cfg(any(target_os = "macos", feature = "cuda"))]
     pub(crate) const fn requests_cpu_only(&self) -> bool {
         matches!(self.requested_tile_output, RequestedTileOutput::CpuOnly)
     }
