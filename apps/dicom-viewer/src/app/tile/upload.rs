@@ -14,6 +14,7 @@ use super::DecodedTile;
 // Keep the renderer copy bound aligned with the process-wide ICC proof cache.
 const RENDERER_COLOR_LUT_CACHE_CAPACITY: usize = 16;
 
+#[cfg(target_os = "macos")]
 const RGB_TO_RGBA_SHADER: &str = r#"
 struct TileLayout {
     width: u32,
@@ -194,7 +195,9 @@ impl Drop for RegisteredTileTexture {
 
 pub(super) struct WgpuTileUploader {
     context: Arc<WgpuContext>,
+    #[cfg(target_os = "macos")]
     conversion_layout: wgpu::BindGroupLayout,
+    #[cfg(target_os = "macos")]
     conversion_pipeline: wgpu::ComputePipeline,
     #[cfg(target_os = "macos")]
     color_lut_sampler: wgpu::Sampler,
@@ -229,6 +232,7 @@ pub(super) trait TileUploadSink {
 
 enum PreparedBudgetedUpload {
     Registered(RegisteredTileTexture),
+    #[cfg(target_os = "macos")]
     Prepared(PreparedTexture),
     Failed(TileUploadError),
     Deferred(DecodedTile),
@@ -242,7 +246,9 @@ enum OwnedUploadInput {
 
 impl WgpuTileUploader {
     pub(super) fn new(state: egui_wgpu::RenderState) -> Self {
+        #[cfg(target_os = "macos")]
         let conversion_layout = conversion_layout(&state.device);
+        #[cfg(target_os = "macos")]
         let conversion_pipeline = conversion_pipeline(&state.device, &conversion_layout);
         #[cfg(target_os = "macos")]
         let color_lut_sampler = state.device.create_sampler(&wgpu::SamplerDescriptor {
@@ -268,7 +274,9 @@ impl WgpuTileUploader {
             };
         Self {
             context: Arc::new(WgpuContext { state }),
+            #[cfg(target_os = "macos")]
             conversion_layout,
+            #[cfg(target_os = "macos")]
             conversion_pipeline,
             #[cfg(target_os = "macos")]
             color_lut_sampler,
@@ -436,6 +444,7 @@ impl WgpuTileUploader {
                 PreparedBudgetedUpload::Registered(texture) => {
                     BudgetedUploadOutcome::Ready(texture)
                 }
+                #[cfg(target_os = "macos")]
                 PreparedBudgetedUpload::Prepared(texture) => {
                     BudgetedUploadOutcome::Ready(self.register(texture))
                 }
@@ -810,6 +819,7 @@ fn create_rgba_texture(
     })
 }
 
+#[cfg(target_os = "macos")]
 fn conversion_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("DICOM viewer RGB8 conversion layout"),
@@ -864,6 +874,7 @@ fn conversion_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     })
 }
 
+#[cfg(target_os = "macos")]
 fn conversion_pipeline(
     device: &wgpu::Device,
     bind_group_layout: &wgpu::BindGroupLayout,
@@ -889,11 +900,11 @@ fn conversion_pipeline(
 
 #[cfg(test)]
 pub(super) fn render_state() -> Option<egui_wgpu::RenderState> {
-    let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
-    #[cfg(target_os = "macos")]
-    {
-        descriptor.backends = wgpu::Backends::METAL;
-    }
+    let descriptor = wgpu::InstanceDescriptor {
+        #[cfg(target_os = "macos")]
+        backends: wgpu::Backends::METAL,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    };
     let instance = wgpu::Instance::new(descriptor);
     let adapter =
         pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
