@@ -28,6 +28,29 @@ pub enum ViewerError {
     Wsi(#[from] wsi_rs::WsiError),
 }
 
+impl ViewerError {
+    /// Returns whether this operation ended because its controlled read was cancelled.
+    #[must_use]
+    pub const fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Wsi(wsi_rs::WsiError::Cancelled))
+    }
+
+    /// Returns whether a renderer-facing CUDA tile failed at the checked host-download boundary.
+    #[must_use]
+    pub fn is_cuda_download_failure(&self) -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            return matches!(
+                self,
+                Self::Wsi(wsi_rs::WsiError::Codec { codec, .. })
+                    if matches!(*codec, "cuda-jpeg-download" | "cuda-j2k-download")
+            );
+        }
+        #[cfg(not(feature = "cuda"))]
+        false
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LevelIndex(u32);
 
@@ -101,6 +124,7 @@ pub struct ViewerStudy {
     pub(crate) render_tile_output: TileOutputPreference,
     pub(crate) cpu_tile_output: TileOutputPreference,
     pub(crate) selected_view: SelectedView,
+    pub(crate) color_management: crate::color::ColorManagement,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +137,7 @@ enum RequestedTileOutput {
 #[derive(Clone)]
 pub struct ViewerOpenOptions {
     requested_tile_output: RequestedTileOutput,
+    cache_budgets: ViewerCacheBudgets,
     #[cfg(target_os = "macos")]
     metal_device: Option<metal::Device>,
 }
@@ -121,6 +146,7 @@ impl std::fmt::Debug for ViewerOpenOptions {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut debug = formatter.debug_struct("ViewerOpenOptions");
         debug.field("requested_tile_output", &self.requested_tile_output);
+        debug.field("cache_budgets", &self.cache_budgets);
         #[cfg(target_os = "macos")]
         debug.field("has_metal_device", &self.metal_device.is_some());
         debug.finish()
@@ -143,6 +169,7 @@ impl ViewerOpenOptions {
     pub const fn auto() -> Self {
         Self {
             requested_tile_output: RequestedTileOutput::Auto,
+            cache_budgets: ViewerCacheBudgets::balanced(),
             #[cfg(target_os = "macos")]
             metal_device: None,
         }
@@ -153,9 +180,21 @@ impl ViewerOpenOptions {
     pub const fn cpu_only() -> Self {
         Self {
             requested_tile_output: RequestedTileOutput::CpuOnly,
+            cache_budgets: ViewerCacheBudgets::balanced(),
             #[cfg(target_os = "macos")]
             metal_device: None,
         }
+    }
+
+    #[must_use]
+    pub const fn with_cache_budgets(mut self, cache_budgets: ViewerCacheBudgets) -> Self {
+        self.cache_budgets = cache_budgets;
+        self
+    }
+
+    #[must_use]
+    pub const fn cache_budgets(&self) -> ViewerCacheBudgets {
+        self.cache_budgets
     }
 
     #[cfg(target_os = "macos")]
@@ -165,6 +204,7 @@ impl ViewerOpenOptions {
         self
     }
 
+    #[cfg(any(target_os = "macos", feature = "cuda"))]
     pub(crate) const fn requests_cpu_only(&self) -> bool {
         matches!(self.requested_tile_output, RequestedTileOutput::CpuOnly)
     }
@@ -172,6 +212,48 @@ impl ViewerOpenOptions {
     #[cfg(target_os = "macos")]
     pub(crate) fn metal_device(&self) -> Option<&metal::Device> {
         self.metal_device.as_ref()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ViewerCacheBudgets {
+    pub viewer_tile_bytes: u64,
+    pub shared_tile_bytes: u64,
+    pub display_tile_bytes: u64,
+}
+
+impl ViewerCacheBudgets {
+    #[must_use]
+    pub const fn new(
+        viewer_tile_bytes: u64,
+        shared_tile_bytes: u64,
+        display_tile_bytes: u64,
+    ) -> Self {
+        Self {
+            viewer_tile_bytes,
+            shared_tile_bytes,
+            display_tile_bytes,
+        }
+    }
+
+    #[must_use]
+    pub const fn balanced() -> Self {
+        Self::new(256 * 1024 * 1024, 128 * 1024 * 1024, 32 * 1024 * 1024)
+    }
+
+    #[must_use]
+    pub const fn large() -> Self {
+        Self::new(512 * 1024 * 1024, 256 * 1024 * 1024, 64 * 1024 * 1024)
+    }
+
+    pub fn from_environment() -> Result<Self> {
+        crate::tile_output::default_cache_budgets()
+    }
+}
+
+impl Default for ViewerCacheBudgets {
+    fn default() -> Self {
+        Self::balanced()
     }
 }
 
@@ -196,11 +278,76 @@ pub struct StudySummary {
     pub tile_decode_backend: TileDecodeBackend,
     pub file_count: usize,
     pub dicom_instance_count: usize,
+    /// Canonical base-coordinate extent derived from every valid source level.
+    pub canvas_dimensions: (u64, u64),
     pub levels: Vec<LevelInfo>,
     pub instances: Vec<DicomInstanceSummary>,
     pub warnings: Vec<String>,
     pub mpp: Option<(f64, f64)>,
     pub objective_power: Option<f64>,
+    pub color_management: ColorManagementSummary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorManagementStatus {
+    Unprofiled,
+    Applied,
+    MalformedProfile,
+    LutValidationFailed,
+}
+
+impl std::fmt::Display for ColorManagementStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Unprofiled => "unprofiled",
+            Self::Applied => "applied",
+            Self::MalformedProfile => "malformed profile",
+            Self::LutValidationFailed => "LUT validation failed",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorManagementMode {
+    Identity,
+    CpuLittleCms,
+    MetalLut65,
+    CpuLutValidationFallback,
+    UncorrectedMalformedProfile,
+}
+
+impl std::fmt::Display for ColorManagementMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Identity => "identity",
+            Self::CpuLittleCms => "LittleCMS → sRGB",
+            Self::MetalLut65 => "Metal 65³ LUT → sRGB",
+            Self::CpuLutValidationFallback => "CPU LittleCMS fallback",
+            Self::UncorrectedMalformedProfile => "uncorrected",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColorManagementSummary {
+    pub status: ColorManagementStatus,
+    pub sha256: Option<String>,
+    pub byte_size: Option<usize>,
+    pub provenance: Option<String>,
+    pub applied_mode: ColorManagementMode,
+}
+
+impl ColorManagementSummary {
+    #[must_use]
+    pub const fn unprofiled() -> Self {
+        Self {
+            status: ColorManagementStatus::Unprofiled,
+            sha256: None,
+            byte_size: None,
+            provenance: None,
+            applied_mode: ColorManagementMode::Identity,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,6 +414,9 @@ pub struct DicomInstanceSummary {
     pub total_pixel_matrix_rows: Option<u32>,
     pub total_pixel_matrix_columns: Option<u32>,
     pub number_of_frames: Option<u32>,
+    pub optical_path_count: Option<u32>,
+    pub focal_plane_count: Option<u32>,
+    pub concatenation_instance_count: Option<u32>,
     pub pixel_spacing: Option<(f64, f64)>,
     pub dimension_organization_type: Option<String>,
     pub samples_per_pixel: Option<u32>,
@@ -299,13 +449,77 @@ pub enum RenderTile {
 #[derive(Debug)]
 pub struct MetalRenderTile {
     tile: wsi_rs::output::metal::MetalDeviceTile,
+    color_lut: Option<std::sync::Arc<ColorLut3d>>,
+}
+
+#[derive(Debug)]
+pub struct ColorLut3d {
+    edge: u32,
+    rgba: Vec<u8>,
+    profile_sha256: String,
+}
+
+impl ColorLut3d {
+    pub(crate) fn new(edge: u32, rgba: Vec<u8>, profile_sha256: String) -> Self {
+        Self {
+            edge,
+            rgba,
+            profile_sha256,
+        }
+    }
+
+    /// Build a validated RGBA8 three-dimensional color lookup table.
+    ///
+    /// Values are ordered with red varying fastest, then green, then blue.
+    pub fn from_rgba8(edge: u32, rgba: Vec<u8>, profile_sha256: impl Into<String>) -> Result<Self> {
+        let expected_len = usize::try_from(edge)
+            .ok()
+            .and_then(|edge| edge.checked_pow(3))
+            .and_then(|voxels| voxels.checked_mul(4))
+            .ok_or_else(|| ViewerError::InvalidInput("color LUT dimensions overflow".into()))?;
+        if edge < 2 || rgba.len() != expected_len {
+            return Err(ViewerError::InvalidInput(format!(
+                "color LUT edge {edge} requires {expected_len} RGBA bytes, got {}",
+                rgba.len()
+            )));
+        }
+        Ok(Self::new(edge, rgba, profile_sha256.into()))
+    }
+
+    #[must_use]
+    pub const fn edge(&self) -> u32 {
+        self.edge
+    }
+
+    #[must_use]
+    pub fn rgba(&self) -> &[u8] {
+        &self.rgba
+    }
+
+    #[must_use]
+    pub fn profile_sha256(&self) -> &str {
+        &self.profile_sha256
+    }
 }
 
 #[cfg(target_os = "macos")]
 impl MetalRenderTile {
     pub(crate) fn new(tile: wsi_rs::output::metal::MetalDeviceTile) -> Result<Self> {
         tile.validated_resident_image()?;
-        Ok(Self { tile })
+        Ok(Self {
+            tile,
+            color_lut: None,
+        })
+    }
+
+    pub(crate) fn with_color_lut(mut self, color_lut: Option<std::sync::Arc<ColorLut3d>>) -> Self {
+        self.color_lut = color_lut;
+        self
+    }
+
+    #[must_use]
+    pub fn color_lut(&self) -> Option<&ColorLut3d> {
+        self.color_lut.as_deref()
     }
 
     #[must_use]

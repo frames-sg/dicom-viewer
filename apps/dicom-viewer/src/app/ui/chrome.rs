@@ -5,6 +5,7 @@ use eframe::egui::{
 
 use dicom_viewer_core::StudySummary;
 
+use super::super::annotation::AnnotationMode;
 use super::super::theme;
 
 #[derive(Debug, Default)]
@@ -15,15 +16,26 @@ pub(in crate::app) struct ToolbarActions {
     pub(in crate::app) zoom_out: bool,
     pub(in crate::app) zoom_in: bool,
     pub(in crate::app) measure_clicked: bool,
+    pub(in crate::app) annotate_clicked: bool,
+    pub(in crate::app) annotation_mode: Option<AnnotationMode>,
+    pub(in crate::app) close_polygon: bool,
+    pub(in crate::app) undo_annotation: bool,
+    pub(in crate::app) export_annotations: bool,
 }
 
-pub(in crate::app) fn show_toolbar(
-    ui: &mut egui::Ui,
-    has_study: bool,
-    show_facts: &mut bool,
-    measurement_active: &mut bool,
-    smooth_camera: &mut bool,
-) -> ToolbarActions {
+pub(in crate::app) struct ToolbarState<'a> {
+    pub(in crate::app) has_study: bool,
+    pub(in crate::app) show_facts: &'a mut bool,
+    pub(in crate::app) measurement_active: &'a mut bool,
+    pub(in crate::app) annotation_active: &'a mut bool,
+    pub(in crate::app) annotation_mode: AnnotationMode,
+    pub(in crate::app) has_annotation_work: bool,
+    pub(in crate::app) has_open_polygon: bool,
+    pub(in crate::app) has_exportable_annotations: bool,
+    pub(in crate::app) smooth_camera: &'a mut bool,
+}
+
+pub(in crate::app) fn show_toolbar(ui: &mut egui::Ui, state: ToolbarState<'_>) -> ToolbarActions {
     let mut actions = ToolbarActions::default();
     Panel::top("toolbar")
         .exact_size(46.0)
@@ -35,16 +47,48 @@ pub(in crate::app) fn show_toolbar(
                 actions.open_file = ui.button(RichText::new("Open file").size(13.0)).clicked();
                 actions.open_folder = ui.button(RichText::new("Open folder").size(13.0)).clicked();
                 rule(ui);
-                ui.toggle_value(show_facts, RichText::new("Info").size(13.0));
-                if has_study {
+                ui.toggle_value(state.show_facts, RichText::new("Info").size(13.0));
+                if state.has_study {
                     rule(ui);
                     actions.fit = ui.button(RichText::new("Fit").size(13.0)).clicked();
                     actions.zoom_out = ui.button(RichText::new("\u{2212}").size(13.0)).clicked();
                     actions.zoom_in = ui.button(RichText::new("+").size(13.0)).clicked();
                     actions.measure_clicked = ui
-                        .toggle_value(measurement_active, RichText::new("Measure").size(13.0))
+                        .toggle_value(
+                            state.measurement_active,
+                            RichText::new("Measure").size(13.0),
+                        )
                         .clicked();
-                    ui.toggle_value(smooth_camera, RichText::new("Smooth").size(13.0));
+                    actions.annotate_clicked = ui
+                        .toggle_value(
+                            state.annotation_active,
+                            RichText::new("Annotate").size(13.0),
+                        )
+                        .clicked();
+                    if *state.annotation_active {
+                        actions.annotation_mode = [AnnotationMode::Tumor, AnnotationMode::Hole]
+                            .into_iter()
+                            .find(|mode| {
+                                ui.selectable_label(
+                                    state.annotation_mode == *mode,
+                                    RichText::new(mode.label()).size(12.0),
+                                )
+                                .clicked()
+                            });
+                        actions.close_polygon = ui
+                            .add_enabled(state.has_open_polygon, egui::Button::new("Close"))
+                            .clicked();
+                        actions.undo_annotation = ui
+                            .add_enabled(state.has_annotation_work, egui::Button::new("Undo"))
+                            .clicked();
+                        actions.export_annotations = ui
+                            .add_enabled(
+                                state.has_exportable_annotations,
+                                egui::Button::new("Save GeoJSON"),
+                            )
+                            .clicked();
+                    }
+                    ui.toggle_value(state.smooth_camera, RichText::new("Smooth").size(13.0));
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     privacy_badge(ui);
@@ -139,7 +183,7 @@ pub(in crate::app) fn privacy_badge(ui: &mut egui::Ui) {
             ui.spacing_mut().item_spacing.x = 6.0;
             ui.label(RichText::new("\u{25CF}").color(theme::GREEN).size(9.0));
             ui.label(
-                RichText::new("LOCAL ONLY")
+                RichText::new("RESEARCH · LOCAL")
                     .color(theme::TEXT_MUTED)
                     .size(11.0),
             );

@@ -13,15 +13,20 @@ cuda = ["wsi-rs/cuda"]
 [dependencies]
 dicom-core = { workspace = true }
 dicom-dictionary-std = { workspace = true }
+dicom-encoding = { workspace = true }
 dicom-object = { workspace = true }
+dicom-parser = { workspace = true }
+dicom-transfer-syntax-registry = { workspace = true }
 wsi-rs = { workspace = true }
 thiserror = { workspace = true }
+lcms2 = { workspace = true }
+sha2 = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-j2k-metal-support = { path = "../../../j2k/crates/j2k-metal-support", version = "=0.7.4" }
+j2k-metal-support = { workspace = true }
 metal = { workspace = true }
 wsi-rs = { workspace = true, features = ["metal"] }
 
 [dev-dependencies]
-j2k-test-support = { workspace = true }
+j2k-native = { workspace = true }
 tempfile = { workspace = true }

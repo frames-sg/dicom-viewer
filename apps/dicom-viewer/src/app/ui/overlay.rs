@@ -119,23 +119,28 @@ pub(in crate::app) fn paint_empty_state(painter: &egui::Painter, rect: Rect, ope
     }
 }
 
+pub(in crate::app) struct OverlayInfo<'a> {
+    pub(in crate::app) summary: &'a StudySummary,
+    pub(in crate::app) zoom: f32,
+    pub(in crate::app) frame_rate: Option<FrameRateInfo>,
+    pub(in crate::app) hover_base: Option<Vec2>,
+    pub(in crate::app) tile_failure: Option<&'a TileFailureInfo>,
+    pub(in crate::app) debug_stats: Option<&'a str>,
+}
+
 pub(in crate::app) fn draw_canvas_overlays(
     painter: &egui::Painter,
     rect: Rect,
-    summary: &StudySummary,
-    zoom: f32,
-    frame_rate: Option<FrameRateInfo>,
-    hover_base: Option<Vec2>,
-    tile_failure: Option<&TileFailureInfo>,
+    info: OverlayInfo<'_>,
 ) {
     let font = FontId::monospace(12.0);
     let mut parts: Vec<(String, Color32)> = Vec::new();
-    parts.push((fmt_zoom(zoom), theme::CYAN));
-    if let Some(frame_rate) = frame_rate {
+    parts.push((fmt_zoom(info.zoom), theme::CYAN));
+    if let Some(frame_rate) = info.frame_rate {
         parts.push((format!("{:.0} fps", frame_rate.fps), fps_color(frame_rate)));
     }
-    if let Some(base) = hover_base {
-        if base_contains_point(summary, base) {
+    if let Some(base) = info.hover_base {
+        if base_contains_point(info.summary, base) {
             parts.push((
                 format!("{}, {}", base.x as i64, base.y as i64),
                 theme::TEXT_MUTED,
@@ -173,10 +178,43 @@ pub(in crate::app) fn draw_canvas_overlays(
         x += galley.size().x + gap;
     }
 
-    draw_scale_bar(painter, rect, summary, zoom);
-    if let Some(failure) = tile_failure {
+    draw_scale_bar(painter, rect, info.summary, info.zoom);
+    if should_draw_tile_failure(info.tile_failure.is_some(), info.debug_stats.is_some()) {
+        let failure = info
+            .tile_failure
+            .expect("failure presence was checked before drawing diagnostics");
         draw_tile_failure_badge(painter, rect, failure);
     }
+    if let Some(debug_stats) = info.debug_stats {
+        draw_debug_stats(painter, rect, debug_stats);
+    }
+}
+
+const fn should_draw_tile_failure(failure_present: bool, diagnostics_enabled: bool) -> bool {
+    failure_present && diagnostics_enabled
+}
+
+fn draw_debug_stats(painter: &egui::Painter, rect: Rect, text: &str) {
+    let font = FontId::monospace(10.5);
+    let galley = painter.layout(
+        text.to_string(),
+        font,
+        theme::TEXT_MUTED,
+        rect.width().mul_add(0.85, -24.0).max(120.0),
+    );
+    let pad = vec2(9.0, 6.0);
+    let panel = Rect::from_min_size(
+        rect.left_top() + vec2(12.0, 50.0),
+        galley.size() + pad * 2.0,
+    );
+    painter.rect(
+        panel,
+        CornerRadius::same(5),
+        Color32::from_rgba_unmultiplied(15, 17, 20, 226),
+        Stroke::new(1.0, theme::HAIRLINE),
+        StrokeKind::Inside,
+    );
+    painter.galley(panel.left_top() + pad, galley, theme::TEXT_MUTED);
 }
 
 fn draw_tile_failure_badge(painter: &egui::Painter, rect: Rect, failure: &TileFailureInfo) {
@@ -297,5 +335,17 @@ fn fmt_zoom(zoom: f32) -> String {
         format!("{percent:.1}%")
     } else {
         format!("{percent:.2}%")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_draw_tile_failure;
+
+    #[test]
+    fn tile_failure_details_are_visible_only_with_diagnostics_enabled() {
+        assert!(!should_draw_tile_failure(true, false));
+        assert!(should_draw_tile_failure(true, true));
+        assert!(!should_draw_tile_failure(false, true));
     }
 }

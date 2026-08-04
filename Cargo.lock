@@ -903,10 +903,12 @@ version = "0.1.0"
 dependencies = [
  "dicom-viewer-core",
  "eframe",
- "j2k-test-support",
+ "j2k-native",
+ "metal",
  "metal-wgpu-interop",
  "pollster",
  "rfd",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
 ]
@@ -917,10 +919,15 @@ version = "0.1.0"
 dependencies = [
  "dicom-core",
  "dicom-dictionary-std",
+ "dicom-encoding",
  "dicom-object",
+ "dicom-parser",
+ "dicom-transfer-syntax-registry",
  "j2k-metal-support",
- "j2k-test-support",
+ "j2k-native",
+ "lcms2",
  "metal",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
  "wsi-rs",
@@ -994,6 +1001,12 @@ name = "dpi"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
+
+[[package]]
+name = "dunce"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "ecolor"
@@ -1285,11 +1298,10 @@ dependencies = [
 
 [[package]]
 name = "event-listener"
-version = "5.4.1"
+version = "5.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e13b66accf52311f30a0db42147dadea9850cb48cd070028831ae5f5d4b856ab"
+checksum = "5a23add41df1562121a9393cb065eab5146a1242410f23a644851e90cfd669d2"
 dependencies = [
- "concurrent-queue",
  "parking",
  "pin-project-lite",
 ]
@@ -1886,7 +1898,9 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "j2k"
-version = "0.7.4"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b5bc22ba9073645d832a8eb3984d8b8c13b6f9821ba8f24a20958815ecb7395"
 dependencies = [
  "j2k-codec-math",
  "j2k-core",
@@ -1897,18 +1911,24 @@ dependencies = [
 
 [[package]]
 name = "j2k-codec-math"
-version = "0.7.4"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca5b8676b744cbf133e9ec8b682b00d182c957d366c294d07dddab105123652b"
 
 [[package]]
 name = "j2k-core"
-version = "0.7.4"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b48b583d7ea9ac7774c34fde989eba75f6b183aff8515f7b01f97dd066808265"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "j2k-cuda"
-version = "0.7.4"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "163a5bbbcbf6501ffbca46f6089315c10a3f019b8e7932d0905fc0d9f9ca6eb8"
 dependencies = [
  "j2k",
  "j2k-core",
@@ -1920,7 +1940,9 @@ dependencies = [
 
 [[package]]
 name = "j2k-cuda-runtime"
-version = "0.7.4"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cedec6294460748cc618305eec531ff426902dd7ace9f30d72f3f7aa189caf4a"
 dependencies = [
  "j2k-codec-math",
  "j2k-core",
@@ -1930,7 +1952,9 @@ dependencies = [
 
 [[package]]
 name = "j2k-jpeg"
-version = "0.7.4"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f7ad08da307540fcd0263339fc6834a847388ee044bdde20a250a68e52fab86"
 dependencies = [
  "j2k-codec-math",
  "j2k-core",
@@ -1942,7 +1966,9 @@ dependencies = [
 
 [[package]]
 name = "j2k-jpeg-cuda"
-version = "0.7.4"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9618a86daddd53a05cd5944a73b1c1b89eaf22f42c2126064d1e902fd2174fc4"
 dependencies = [
  "j2k-core",
  "j2k-cuda-runtime",
@@ -1953,7 +1979,9 @@ dependencies = [
 
 [[package]]
 name = "j2k-jpeg-metal"
-version = "0.7.4"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "358cefaa02f77c02533d4eaf29ccef6468bd7ae45c07f55c391b5bf35e872086"
 dependencies = [
  "j2k-core",
  "j2k-jpeg",
@@ -1965,7 +1993,9 @@ dependencies = [
 
 [[package]]
 name = "j2k-metal"
-version = "0.7.4"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "25f2fd10af96cfdc30b7ed5cac56476e7470b4d5b8f720ad10b20dea697bcf44"
 dependencies = [
  "cc",
  "j2k",
@@ -1982,7 +2012,9 @@ dependencies = [
 
 [[package]]
 name = "j2k-metal-support"
-version = "0.7.4"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9cfacb655fcc69310d8f6242f4d99d57bb072386149a4369c3ebd2630b9cc6dc"
 dependencies = [
  "j2k-core",
  "log",
@@ -1991,7 +2023,9 @@ dependencies = [
 
 [[package]]
 name = "j2k-native"
-version = "0.7.4"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92d595fb394b6ea0be92c479ede6b26c53a0f2aea590fe4c9e94fd9a00740e8e"
 dependencies = [
  "fearless_simd 0.4.1",
  "j2k-codec-math",
@@ -2003,18 +2037,15 @@ dependencies = [
 
 [[package]]
 name = "j2k-profile"
-version = "0.7.4"
-
-[[package]]
-name = "j2k-test-support"
-version = "0.7.4"
-dependencies = [
- "j2k-native",
-]
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5502d854a91b1719981936bf363a9e1bd46d44f6bac5510c2e509394e1a98b9f"
 
 [[package]]
 name = "j2k-tilecodec"
-version = "0.7.4"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd7f4779267301f9db85581bd11070ddd2911e34a0f8a430ca18aa41dd975a47"
 dependencies = [
  "flate2",
  "j2k-core",
@@ -2025,7 +2056,9 @@ dependencies = [
 
 [[package]]
 name = "j2k-types"
-version = "0.7.4"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a62d9fc57af46c1226b040a8fcd28269762af84b123f987e6af72c336406e647"
 
 [[package]]
 name = "jni"
@@ -2140,6 +2173,29 @@ name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
+
+[[package]]
+name = "lcms2"
+version = "6.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b75877b724685dd49310bdbadbf973fc69b1d01992a6d4a861b928fc3943f87b"
+dependencies = [
+ "bytemuck",
+ "foreign-types",
+ "lcms2-sys",
+]
+
+[[package]]
+name = "lcms2-sys"
+version = "4.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "264db0b78119c5a37d78bb41fb355daab29b3b29430b53cd92e3da51f0ab06cc"
+dependencies = [
+ "cc",
+ "dunce",
+ "libc",
+ "pkg-config",
+]
 
 [[package]]
 name = "leb128fmt"
@@ -4753,7 +4809,9 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "wsi-rs"
-version = "0.5.0"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0118b54cd6fe19b48d9170c1a54a089599e61442f076eff6a6da05d0f3891a98"
 dependencies = [
  "base64",
  "byteorder",

@@ -23,25 +23,9 @@ jobs:
 
     steps:
       - name: Checkout dicom-viewer
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: dicom-viewer
-          persist-credentials: false
-
-      - name: Checkout wsi-rs
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          repository: frames-sg/wsi-rs
-          ref: v0.5.0
-          path: wsi-rs
-          persist-credentials: false
-
-      - name: Checkout j2k
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          repository: frames-sg/j2k
-          ref: v0.7.4
-          path: j2k
           persist-credentials: false
 
       - name: Install Linux GUI dependencies
@@ -68,6 +52,7 @@ jobs:
 
       - name: Verify locked dependency graph
         working-directory: dicom-viewer
+        shell: bash
         run: |
           cargo metadata --locked --format-version 1 > /dev/null
           git diff --exit-code -- Cargo.lock
@@ -83,6 +68,13 @@ jobs:
         env:
           RUSTFLAGS: -D warnings
         run: cargo test --workspace --all-targets --locked
+
+      - name: Check CUDA feature compilation
+        if: runner.os == 'Linux'
+        working-directory: dicom-viewer
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo check --workspace --all-targets --locked --features cuda
 
       - name: Test default macOS Metal tile output
         if: runner.os == 'macOS'
@@ -103,25 +95,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout dicom-viewer
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: dicom-viewer
-          persist-credentials: false
-
-      - name: Checkout wsi-rs
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          repository: frames-sg/wsi-rs
-          ref: v0.5.0
-          path: wsi-rs
-          persist-credentials: false
-
-      - name: Checkout j2k
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          repository: frames-sg/j2k
-          ref: v0.7.4
-          path: j2k
           persist-credentials: false
 
       - name: Install Rust

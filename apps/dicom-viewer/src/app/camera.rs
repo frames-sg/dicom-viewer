@@ -5,21 +5,20 @@ use super::viewport::{base_size, clamp_center_axis};
 
 pub(super) const MIN_ZOOM: f32 = 0.000_001;
 pub(super) const MAX_ZOOM: f32 = 64.0;
+const MIN_FIT_ZOOM_FACTOR: f32 = 0.9;
 const CAMERA_SMOOTHING_RESPONSE: f32 = 22.0;
 const CAMERA_SMOOTHING_SNAP_PX: f32 = 0.25;
 const CAMERA_SMOOTHING_SNAP_ZOOM: f32 = 0.0005;
 const WHEEL_ZOOM_SENSITIVITY: f32 = 0.0015;
 
-pub(super) fn clamp_camera_view(view: &mut CameraView, rect: Rect, summary: &StudySummary) {
-    view.zoom = view.zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+fn clamp_camera_view_to_min(view: &mut CameraView, summary: &StudySummary, minimum_zoom: f32) {
+    view.zoom = view.zoom.clamp(minimum_zoom, MAX_ZOOM);
     let Some(size) = base_size(summary) else {
         return;
     };
-    let visible_w = rect.width() / view.zoom.max(MIN_ZOOM);
-    let visible_h = rect.height() / view.zoom.max(MIN_ZOOM);
 
-    view.center_base.x = clamp_center_axis(view.center_base.x, visible_w, size.x);
-    view.center_base.y = clamp_center_axis(view.center_base.y, visible_h, size.y);
+    view.center_base.x = clamp_center_axis(view.center_base.x, size.x);
+    view.center_base.y = clamp_center_axis(view.center_base.y, size.y);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -35,6 +34,13 @@ impl Default for CameraView {
             zoom: 1.0,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct CameraFrame {
+    pub(super) rendered: CameraView,
+    pub(super) target: CameraView,
+    pub(super) animating: bool,
 }
 
 #[derive(Debug)]
@@ -83,13 +89,27 @@ impl CameraMotion {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct CameraState {
     target: CameraView,
     motion: CameraMotion,
     fit_pending: bool,
     fit_mode: bool,
     last_canvas_size: Option<Vec2>,
+    minimum_zoom: f32,
+}
+
+impl Default for CameraState {
+    fn default() -> Self {
+        Self {
+            target: CameraView::default(),
+            motion: CameraMotion::default(),
+            fit_pending: false,
+            fit_mode: false,
+            last_canvas_size: None,
+            minimum_zoom: MIN_ZOOM,
+        }
+    }
 }
 
 impl CameraState {
@@ -98,6 +118,7 @@ impl CameraState {
         self.fit_pending = false;
         self.fit_mode = false;
         self.last_canvas_size = None;
+        self.minimum_zoom = MIN_ZOOM;
         self.motion.clear();
     }
 
@@ -121,6 +142,7 @@ impl CameraState {
     }
 
     pub(super) fn prepare_canvas(&mut self, rect: Rect, summary: &StudySummary) {
+        self.minimum_zoom = minimum_zoom_for_rect(rect, summary);
         let canvas_size = rect.size();
         let resized = self
             .last_canvas_size
@@ -129,7 +151,7 @@ impl CameraState {
         if self.fit_pending || (self.fit_mode && resized) {
             self.fit_to_rect(rect, summary);
         }
-        clamp_camera_view(&mut self.target, rect, summary);
+        clamp_camera_view_to_min(&mut self.target, summary, self.minimum_zoom);
     }
 
     pub(super) fn target_view(&self) -> CameraView {
@@ -138,14 +160,23 @@ impl CameraState {
 
     pub(super) fn render_view(
         &mut self,
-        rect: Rect,
+        _rect: Rect,
         summary: &StudySummary,
         dt: f32,
     ) -> (CameraView, bool) {
-        clamp_camera_view(&mut self.target, rect, summary);
+        clamp_camera_view_to_min(&mut self.target, summary, self.minimum_zoom);
         let (mut rendered, animating) = self.motion.render_view(self.target, dt);
-        clamp_camera_view(&mut rendered, rect, summary);
+        clamp_camera_view_to_min(&mut rendered, summary, self.minimum_zoom);
         (rendered, animating)
+    }
+
+    pub(super) fn frame(&mut self, rect: Rect, summary: &StudySummary, dt: f32) -> CameraFrame {
+        let (rendered, animating) = self.render_view(rect, summary, dt);
+        CameraFrame {
+            rendered,
+            target: self.target,
+            animating,
+        }
     }
 
     pub(super) fn pan_by(&mut self, delta_screen: Vec2) {
@@ -156,9 +187,17 @@ impl CameraState {
         self.target.center_base -= delta_screen / self.target.zoom.max(MIN_ZOOM);
     }
 
+    pub(super) fn pan_by_rendered(&mut self, delta_screen: Vec2, rendered: CameraView) {
+        if delta_screen == Vec2::ZERO {
+            return;
+        }
+        self.leave_fit_mode();
+        self.target.center_base -= delta_screen / rendered.zoom.max(MIN_ZOOM);
+    }
+
     pub(super) fn zoom_around(&mut self, rect: Rect, pointer: egui::Pos2, factor: f32) {
         let old_zoom = self.target.zoom;
-        let new_zoom = (old_zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+        let new_zoom = (old_zoom * factor).clamp(self.minimum_zoom, MAX_ZOOM);
         if (new_zoom - old_zoom).abs() < f32::EPSILON {
             return;
         }
@@ -169,6 +208,25 @@ impl CameraState {
         let base_under_pointer = old_top_left + pointer_canvas / old_zoom;
         let new_top_left = base_under_pointer - pointer_canvas / new_zoom;
         self.target.center_base = new_top_left + rect.size() / (2.0 * new_zoom);
+        self.target.zoom = new_zoom;
+    }
+
+    pub(super) fn zoom_around_rendered(
+        &mut self,
+        rect: Rect,
+        pointer: egui::Pos2,
+        factor: f32,
+        rendered: CameraView,
+    ) {
+        let new_zoom = (self.target.zoom * factor).clamp(self.minimum_zoom, MAX_ZOOM);
+        if (new_zoom - self.target.zoom).abs() < f32::EPSILON {
+            return;
+        }
+
+        self.leave_fit_mode();
+        let base_under_pointer =
+            rendered.center_base + (pointer - rect.center()) / rendered.zoom.max(MIN_ZOOM);
+        self.target.center_base = base_under_pointer - (pointer - rect.center()) / new_zoom;
         self.target.zoom = new_zoom;
     }
 
@@ -231,9 +289,7 @@ impl CameraState {
         let Some(size) = base_size(summary) else {
             return;
         };
-        self.target.zoom = (rect.width() / size.x)
-            .min(rect.height() / size.y)
-            .clamp(MIN_ZOOM, MAX_ZOOM);
+        self.target.zoom = fit_zoom(rect, size);
         self.target.center_base = size * 0.5;
         self.fit_pending = false;
         self.fit_mode = true;
@@ -243,6 +299,18 @@ impl CameraState {
     fn leave_fit_mode(&mut self) {
         self.fit_mode = false;
     }
+}
+
+fn fit_zoom(rect: Rect, size: Vec2) -> f32 {
+    (rect.width() / size.x)
+        .min(rect.height() / size.y)
+        .clamp(MIN_ZOOM, MAX_ZOOM)
+}
+
+fn minimum_zoom_for_rect(rect: Rect, summary: &StudySummary) -> f32 {
+    base_size(summary)
+        .map(|size| (fit_zoom(rect, size) * MIN_FIT_ZOOM_FACTOR).clamp(MIN_ZOOM, MAX_ZOOM))
+        .unwrap_or(MIN_ZOOM)
 }
 
 fn camera_smoothing_alpha(dt: f32) -> f32 {

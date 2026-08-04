@@ -14,15 +14,17 @@ cuda = ["dicom-viewer-core/cuda"]
 dicom-viewer-core = { version = "=0.1.0", path = "../../crates/dicom-viewer-core" }
 eframe = { workspace = true }
 rfd = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
 thiserror = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+metal = { workspace = true }
 metal-wgpu-interop = { version = "=0.1.0", path = "../../crates/metal-wgpu-interop" }
 
 [dev-dependencies]
-j2k-test-support = { workspace = true }
+j2k-native = { workspace = true }
 pollster = { workspace = true }
-tempfile = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 metal-wgpu-interop = { version = "=0.1.0", path = "../../crates/metal-wgpu-interop", features = ["test-support"] }

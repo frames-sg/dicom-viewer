@@ -1,13 +1,15 @@
 use std::path::PathBuf;
-use std::sync::{mpsc::TryRecvError, Arc};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use dicom_viewer_core::{StudySummary, TileDecodeBackend, ViewerStudy};
 use eframe::egui::{self, Frame, Rect, Sense};
 
+mod annotation;
 mod camera;
 mod canvas;
 mod format;
+mod level_warmer;
 mod measurement;
 mod open_job;
 mod theme;
@@ -15,18 +17,21 @@ mod tile;
 mod ui;
 mod viewport;
 
+use annotation::{draw_annotation_overlay, AnnotationState};
 use camera::{wheel_zoom_factor, CameraState, CameraView};
 #[cfg(test)]
 use camera::{CameraMotion, MAX_ZOOM, MIN_ZOOM};
-use canvas::{CanvasCamera, SlideCanvas};
+use canvas::SlideCanvas;
 use measurement::{
     clamp_base_point, draw_measurement_overlay, measurement_ready_status, MeasurementInteraction,
     MeasurementState,
 };
-use open_job::OpenJob;
-use ui::chrome::{show_status_bar, show_toolbar};
+use open_job::{OpenPoll, OpenQueue};
+use ui::chrome::{show_status_bar, show_toolbar, ToolbarState};
 use ui::facts::show_facts_sidebar;
-use ui::overlay::{draw_canvas_overlays, paint_canvas_background, paint_empty_state, FrameStats};
+use ui::overlay::{
+    draw_canvas_overlays, paint_canvas_background, paint_empty_state, FrameStats, OverlayInfo,
+};
 use viewport::{base_contains_point, screen_to_base};
 #[cfg(test)]
 use viewport::{choose_render_level, visible_tiles};
@@ -42,12 +47,13 @@ const MAX_LOADER_MESSAGES_PER_FRAME: usize = 128;
 const LOADER_MESSAGE_BUDGET: Duration = Duration::from_millis(2);
 const MAX_VISIBLE_UPLOADS_PER_FRAME: usize = 24;
 const VISIBLE_UPLOAD_BUDGET: Duration = Duration::from_millis(6);
+const MAX_TRANSITION_UPLOADS_PER_FRAME: usize = 2;
 const MAX_PREFETCH_UPLOADS_PER_FRAME: usize = 4;
 const PREFETCH_UPLOAD_BUDGET: Duration = Duration::from_millis(1);
 
 pub struct DicomViewerApp {
     study: Option<Arc<ViewerStudy>>,
-    open_job: Option<OpenJob>,
+    open_queue: OpenQueue,
     active_generation: u64,
     next_generation: u64,
     status: String,
@@ -56,6 +62,8 @@ pub struct DicomViewerApp {
     camera: CameraState,
     show_facts_panel: bool,
     measurement: MeasurementState,
+    annotations: AnnotationState,
+    active_path: Option<PathBuf>,
     reported_cpu_fallbacks: usize,
 }
 
@@ -73,7 +81,7 @@ impl DicomViewerApp {
         );
         let mut app = Self {
             study: None,
-            open_job: None,
+            open_queue: OpenQueue::default(),
             active_generation: 0,
             next_generation: 1,
             status: initial_status,
@@ -82,6 +90,8 @@ impl DicomViewerApp {
             camera: CameraState::default(),
             show_facts_panel: false,
             measurement: MeasurementState::default(),
+            annotations: AnnotationState::default(),
+            active_path: None,
             reported_cpu_fallbacks: 0,
         };
         if let Some(path) = initial_path {
@@ -91,6 +101,12 @@ impl DicomViewerApp {
     }
 
     fn start_open_path(&mut self, path: PathBuf, ctx: &egui::Context) {
+        if !self.confirm_discard_annotations(
+            "Opening another slide will discard the annotations that have not been saved.",
+        ) {
+            self.status = "Open cancelled; annotations were kept.".to_string();
+            return;
+        }
         let options = match self.canvas.viewer_open_options() {
             Ok(options) => options,
             Err(error) => {
@@ -105,11 +121,16 @@ impl DicomViewerApp {
         self.canvas.clear();
         self.camera.clear_for_open();
         self.measurement.reset();
+        self.annotations.reset();
+        self.active_path = None;
         self.reported_cpu_fallbacks = 0;
         self.status = format!("Opening {}...", path.display());
 
-        match OpenJob::spawn(path.clone(), generation, ctx, options) {
-            Ok(job) => self.open_job = Some(job),
+        match self
+            .open_queue
+            .submit(path.clone(), generation, ctx, options)
+        {
+            Ok(()) => {}
             Err(err) => {
                 self.status = format!(
                     "Failed to open {}: could not start open worker: {err}",
@@ -121,13 +142,9 @@ impl DicomViewerApp {
     }
 
     fn poll_open_job(&mut self, ctx: &egui::Context) {
-        let Some(job) = &self.open_job else {
-            return;
-        };
-        match job.receiver.try_recv() {
-            Ok(result) => {
+        match self.open_queue.poll(ctx) {
+            Ok(Some(OpenPoll::Result(result))) => {
                 let current_generation = self.active_generation;
-                self.open_job = None;
                 if result.generation != current_generation {
                     return;
                 }
@@ -136,6 +153,7 @@ impl DicomViewerApp {
                         let tile_decode_backend = study.summary().tile_decode_backend;
                         self.camera.reset_for_study(study.summary());
                         self.study = Some(Arc::new(study));
+                        self.active_path = Some(result.path.clone());
                         self.canvas.clear();
                         let path_label = match tile_decode_backend {
                             TileDecodeBackend::Cpu => "CPU → wgpu",
@@ -145,18 +163,18 @@ impl DicomViewerApp {
                         self.status = format!("Opened {}. {path_label}.", result.path.display());
                     }
                     Err(err) => {
+                        self.active_path = None;
                         self.status = format!("Failed to open {}: {err}", result.path.display());
                     }
                 }
                 ctx.request_repaint();
             }
-            Err(TryRecvError::Empty) => {
-                // Don't spin — poll_open_job is called every frame from logic().
-            }
-            Err(TryRecvError::Disconnected) => {
-                let path = job.path.clone();
-                self.open_job = None;
+            Ok(Some(OpenPoll::Disconnected(path))) => {
                 self.status = format!("Failed to open {}: open worker exited", path.display());
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.status = format!("Failed to start pending open worker: {error}");
             }
         }
     }
@@ -193,6 +211,17 @@ impl DicomViewerApp {
                 break;
             }
         }
+    }
+
+    fn confirm_discard_annotations(&self, description: &str) -> bool {
+        !self.annotations.has_unsaved_work()
+            || rfd::MessageDialog::new()
+                .set_title("Discard unsaved annotations?")
+                .set_description(description)
+                .set_level(rfd::MessageLevel::Warning)
+                .set_buttons(rfd::MessageButtons::YesNo)
+                .show()
+                == rfd::MessageDialogResult::Yes
     }
 
     fn handle_measure_tool_clicked(&mut self, summary: Option<&StudySummary>, had_points: bool) {
@@ -271,28 +300,126 @@ impl DicomViewerApp {
 
         interaction
     }
+
+    fn handle_annotation_interaction(
+        &mut self,
+        response: &egui::Response,
+        rect: Rect,
+        summary: &StudySummary,
+        view: CameraView,
+    ) -> bool {
+        if !self.annotations.active {
+            return false;
+        }
+
+        if response.double_clicked() {
+            match self.annotations.close_current() {
+                Ok(()) => {
+                    self.status = format!("{} polygon closed.", self.annotations.mode.label());
+                }
+                Err(error) => self.status = error.to_string(),
+            }
+            response.request_focus();
+            return true;
+        }
+
+        if response.clicked() {
+            if let Some(pointer) = response.interact_pointer_pos() {
+                let point = screen_to_base(rect, pointer, view.center_base, view.zoom);
+                if base_contains_point(summary, point) {
+                    self.annotations.add_vertex(point);
+                    self.status = format!(
+                        "{} vertex added; double-click or use Close to finish.",
+                        self.annotations.mode.label()
+                    );
+                    response.request_focus();
+                }
+            }
+            return true;
+        }
+        false
+    }
+
+    fn close_annotation_polygon(&mut self) {
+        match self.annotations.close_current() {
+            Ok(()) => {
+                self.status = format!("{} polygon closed.", self.annotations.mode.label());
+            }
+            Err(error) => self.status = error.to_string(),
+        }
+    }
+
+    fn export_annotations(&mut self) {
+        let default_name = self
+            .active_path
+            .as_deref()
+            .and_then(|path| path.file_stem())
+            .and_then(|stem| stem.to_str())
+            .map_or_else(
+                || "viable_tumor.geojson".to_string(),
+                |stem| format!("{stem}_viable_tumor.geojson"),
+            );
+        let mut dialog = rfd::FileDialog::new()
+            .add_filter("GeoJSON", &["geojson"])
+            .set_file_name(&default_name);
+        if let Some(parent) = self.active_path.as_deref().and_then(|path| path.parent()) {
+            dialog = dialog.set_directory(parent);
+        }
+        let Some(path) = dialog.save_file() else {
+            return;
+        };
+        match self.annotations.save_geojson(&path) {
+            Ok(()) => {
+                self.annotations.mark_saved();
+                self.status = format!(
+                    "Saved {} viable-tumor fragment(s) to {}.",
+                    self.annotations.completed_tumor_count(),
+                    path.display()
+                );
+            }
+            Err(error) => self.status = error.to_string(),
+        }
+    }
 }
 
 impl eframe::App for DicomViewerApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if ctx.input(|input| input.viewport().close_requested())
+            && !self.confirm_discard_annotations(
+                "Closing the viewer will discard the annotations that have not been saved.",
+            )
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.status = "Close cancelled; annotations were kept.".to_string();
+        }
         self.handle_dropped_files(ctx);
         self.poll_open_job(ctx);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let app_ui_started = self.canvas.debug_stats_enabled().then(Instant::now);
         let (stable_dt, predicted_dt) = ui.input(|input| (input.stable_dt, input.predicted_dt));
         self.frame_stats.record(stable_dt, predicted_dt);
 
-        let study = self.study.clone();
-        let opening = self.open_job.is_some();
+        let has_study = self.study.is_some();
 
         let had_measurement = self.measurement.has_points();
+        let annotation_mode = self.annotations.mode;
+        let has_open_polygon = self.annotations.has_current_vertices();
+        let has_exportable_annotations = self.annotations.completed_tumor_count() > 0;
         let actions = show_toolbar(
             ui,
-            study.is_some(),
-            &mut self.show_facts_panel,
-            &mut self.measurement.active,
-            self.camera.smoothing_enabled_mut(),
+            ToolbarState {
+                has_study,
+                show_facts: &mut self.show_facts_panel,
+                measurement_active: &mut self.measurement.active,
+                annotation_active: &mut self.annotations.active,
+                annotation_mode,
+                has_annotation_work: has_open_polygon || has_exportable_annotations,
+                has_open_polygon,
+                has_exportable_annotations,
+                smooth_camera: self.camera.smoothing_enabled_mut(),
+            },
         );
         if actions.open_file {
             self.pick_file(ui.ctx());
@@ -300,11 +427,48 @@ impl eframe::App for DicomViewerApp {
         if actions.open_folder {
             self.pick_folder(ui.ctx());
         }
+        // Opening replaces the active study and generation. Refresh the frame
+        // snapshot after the modal picker returns so this frame cannot submit
+        // work for the previous study under the replacement generation.
+        let study = self.study.clone();
+        let opening = self.open_queue.is_opening();
         if actions.measure_clicked {
+            if self.measurement.active {
+                self.annotations.active = false;
+            }
             self.handle_measure_tool_clicked(
                 study.as_ref().map(|study| study.summary()),
                 had_measurement,
             );
+        }
+        if actions.annotate_clicked {
+            if self.annotations.active {
+                self.measurement.active = false;
+                self.status =
+                    "Annotation active; click vertices and double-click or use Close.".to_string();
+            } else {
+                self.status = "Annotation paused.".to_string();
+            }
+        }
+        if let Some(mode) = actions.annotation_mode {
+            let discarded = self.annotations.set_mode(mode);
+            self.status = if discarded {
+                format!(
+                    "{} mode active; unfinished polygon discarded.",
+                    mode.label()
+                )
+            } else {
+                format!("{} mode active.", mode.label())
+            };
+        }
+        if actions.close_polygon {
+            self.close_annotation_polygon();
+        }
+        if actions.undo_annotation && self.annotations.undo() {
+            self.status = "Last annotation step undone.".to_string();
+        }
+        if actions.export_annotations {
+            self.export_annotations();
         }
         show_status_bar(
             ui,
@@ -315,6 +479,7 @@ impl eframe::App for DicomViewerApp {
         show_facts_sidebar(
             ui,
             self.show_facts_panel,
+            self.active_generation,
             study.as_ref().map(|study| study.summary()),
         );
 
@@ -338,32 +503,60 @@ impl eframe::App for DicomViewerApp {
                 };
 
                 if actions.fit {
+                    self.canvas.record_zoom_input();
                     self.camera.request_fit();
                 }
                 self.camera.prepare_canvas(rect, study.summary());
                 if actions.zoom_out {
+                    self.canvas.record_zoom_input();
                     self.camera.zoom_about_center(rect, 0.8);
                 }
                 if actions.zoom_in {
+                    self.canvas.record_zoom_input();
                     self.camera.zoom_about_center(rect, 1.25);
                 }
 
-                let measurement_view = self.camera.target_view();
+                let accepts_keys =
+                    (response.hovered() || response.has_focus()) && !ui.ctx().text_edit_focused();
+                let zoom_before_keys = self.camera.target_view().zoom;
+                if self.camera.handle_keys(ui, rect, accepts_keys) {
+                    if (self.camera.target_view().zoom - zoom_before_keys).abs() > f32::EPSILON {
+                        self.canvas.record_zoom_input();
+                    }
+                    ui.ctx().request_repaint();
+                }
+
+                let camera_frame = self.camera.frame(rect, study.summary(), stable_dt);
+                if camera_frame.animating {
+                    ui.ctx().request_repaint();
+                }
                 let measurement_interaction = self.handle_measurement_interaction(
                     ui,
                     &response,
                     rect,
                     study.summary(),
-                    measurement_view,
+                    camera_frame.rendered,
+                );
+                let annotation_click_consumed = self.handle_annotation_interaction(
+                    &response,
+                    rect,
+                    study.summary(),
+                    camera_frame.rendered,
                 );
 
                 if response.dragged() && !measurement_interaction.drag_consumed {
-                    self.camera.pan_by(response.drag_delta());
+                    self.camera
+                        .pan_by_rendered(response.drag_delta(), camera_frame.rendered);
                     ui.ctx().request_repaint();
                 }
-                if response.double_clicked() && !measurement_interaction.click_consumed {
+                if response.double_clicked()
+                    && !measurement_interaction.click_consumed
+                    && !annotation_click_consumed
+                {
                     let pointer = response.interact_pointer_pos().unwrap_or(rect.center());
-                    self.camera.zoom_around(rect, pointer, 2.0);
+                    self.canvas.record_zoom_input();
+                    self.camera
+                        .zoom_around_rendered(rect, pointer, 2.0, camera_frame.rendered);
                     ui.ctx().request_repaint();
                 }
 
@@ -373,8 +566,13 @@ impl eframe::App for DicomViewerApp {
                         let pointer = ui
                             .input(|input| input.pointer.hover_pos())
                             .unwrap_or(rect.center());
-                        self.camera
-                            .zoom_around(rect, pointer, wheel_zoom_factor(scroll_y));
+                        self.canvas.record_zoom_input();
+                        self.camera.zoom_around_rendered(
+                            rect,
+                            pointer,
+                            wheel_zoom_factor(scroll_y),
+                            camera_frame.rendered,
+                        );
                         ui.ctx().request_repaint();
                     }
                     let pinch = ui.input(|input| input.zoom_delta());
@@ -382,7 +580,13 @@ impl eframe::App for DicomViewerApp {
                         let pointer = ui
                             .input(|input| input.pointer.hover_pos())
                             .unwrap_or(rect.center());
-                        self.camera.zoom_around(rect, pointer, pinch);
+                        self.canvas.record_zoom_input();
+                        self.camera.zoom_around_rendered(
+                            rect,
+                            pointer,
+                            pinch,
+                            camera_frame.rendered,
+                        );
                         ui.ctx().request_repaint();
                     }
                     if ui.input(|input| input.pointer.any_down()) {
@@ -390,50 +594,45 @@ impl eframe::App for DicomViewerApp {
                     }
                 }
 
-                let accepts_keys =
-                    (response.hovered() || response.has_focus()) && !ui.ctx().text_edit_focused();
-                if self.camera.handle_keys(ui, rect, accepts_keys) {
-                    ui.ctx().request_repaint();
-                }
-                let (render_view, animating_camera) =
-                    self.camera.render_view(rect, study.summary(), stable_dt);
-                let target_view = self.camera.target_view();
-                if animating_camera {
-                    ui.ctx().request_repaint();
-                }
                 self.canvas.paint(
                     ui.ctx(),
                     &painter,
                     rect,
                     &study,
                     self.active_generation,
-                    CanvasCamera {
-                        rendered: render_view,
-                        target: target_view,
-                        camera_animating: animating_camera,
-                    },
+                    camera_frame,
                 );
                 if let Some((count, reason)) = self.canvas.cpu_fallback() {
                     if count > self.reported_cpu_fallbacks {
                         self.reported_cpu_fallbacks = count;
                         self.status = format!(
-                            "Metal preferred → wgpu; CPU fallback used for {count} tile(s): {reason}"
+                            "{} preferred → wgpu; CPU fallback used for {count} tile(s): {reason}",
+                            study.summary().tile_decode_backend
                         );
                     }
                 }
 
-                let hover_base = response
-                    .hover_pos()
-                    .map(|p| screen_to_base(rect, p, render_view.center_base, render_view.zoom));
+                let hover_base = response.hover_pos().map(|p| {
+                    screen_to_base(
+                        rect,
+                        p,
+                        camera_frame.rendered.center_base,
+                        camera_frame.rendered.zoom,
+                    )
+                });
                 let tile_failure = self.canvas.tile_failure();
+                let debug_stats = self.canvas.debug_stats_text();
                 draw_canvas_overlays(
                     &painter,
                     rect,
-                    study.summary(),
-                    render_view.zoom,
-                    self.frame_stats.info(),
-                    hover_base,
-                    tile_failure,
+                    OverlayInfo {
+                        summary: study.summary(),
+                        zoom: camera_frame.rendered.zoom,
+                        frame_rate: self.frame_stats.info(),
+                        hover_base,
+                        tile_failure,
+                        debug_stats: debug_stats.as_deref(),
+                    },
                 );
                 draw_measurement_overlay(
                     &painter,
@@ -441,10 +640,20 @@ impl eframe::App for DicomViewerApp {
                     study.summary(),
                     &self.measurement,
                     hover_base,
-                    render_view.center_base,
-                    render_view.zoom,
+                    camera_frame.rendered.center_base,
+                    camera_frame.rendered.zoom,
+                );
+                draw_annotation_overlay(
+                    &painter,
+                    rect,
+                    &self.annotations,
+                    hover_base.filter(|point| base_contains_point(study.summary(), *point)),
+                    camera_frame.rendered,
                 );
             });
+        if let Some(started) = app_ui_started {
+            self.canvas.record_app_ui_cpu_time(started.elapsed());
+        }
     }
 }
 

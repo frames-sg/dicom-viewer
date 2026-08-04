@@ -2,12 +2,14 @@
 
 mod app;
 
+const APP_TITLE: &str = "WSI Viewer — Research Use Only";
+
 fn main() -> eframe::Result<()> {
     let initial_path = std::env::args_os().nth(1).map(std::path::PathBuf::from);
     let options = native_options();
 
     eframe::run_native(
-        "WSI Viewer",
+        APP_TITLE,
         options,
         Box::new(|cc| Ok(Box::new(app::DicomViewerApp::new(cc, initial_path)))),
     )
@@ -25,7 +27,7 @@ fn native_options() -> eframe::NativeOptions {
 
     eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("WSI Viewer")
+            .with_title(APP_TITLE)
             .with_inner_size([1320.0, 880.0])
             .with_min_inner_size([900.0, 640.0]),
         renderer: eframe::Renderer::Wgpu,
@@ -65,6 +67,12 @@ mod tests {
             panic!("viewer should create its platform wgpu device");
         };
         assert_eq!(setup.instance_descriptor.backends, platform_wgpu_backends());
+    }
+
+    #[test]
+    fn native_viewer_is_explicitly_labeled_for_research_use() {
+        assert!(APP_TITLE.contains("Research Use Only"));
+        assert_eq!(native_options().viewport.title.as_deref(), Some(APP_TITLE));
     }
 
     #[test]
