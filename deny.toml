@@ -43,3 +43,7 @@ highlight = "all"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = [
+    "https://github.com/frames-sg/j2k.git",
+    "https://github.com/frames-sg/wsi-rs.git",
+]
