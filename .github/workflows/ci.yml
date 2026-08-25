@@ -32,7 +32,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: frames-sg/wsi-dicom-annotations
-          ref: b74b2a9ac311800b52400e0635a760186b259cc5
+          ref: 6533211fb7cdda0ceafca9430c4618d822a61c70
           path: wsi-dicom-annotations
           persist-credentials: false
 
@@ -112,7 +112,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: frames-sg/wsi-dicom-annotations
-          ref: b74b2a9ac311800b52400e0635a760186b259cc5
+          ref: 6533211fb7cdda0ceafca9430c4618d822a61c70
           path: wsi-dicom-annotations
           persist-credentials: false
 
