@@ -5,7 +5,6 @@ use eframe::egui::{
 
 use dicom_viewer_core::StudySummary;
 
-use super::super::annotation::AnnotationMode;
 use super::super::theme;
 
 #[derive(Debug, Default)]
@@ -15,23 +14,21 @@ pub(in crate::app) struct ToolbarActions {
     pub(in crate::app) fit: bool,
     pub(in crate::app) zoom_out: bool,
     pub(in crate::app) zoom_in: bool,
-    pub(in crate::app) measure_clicked: bool,
-    pub(in crate::app) annotate_clicked: bool,
-    pub(in crate::app) annotation_mode: Option<AnnotationMode>,
-    pub(in crate::app) close_polygon: bool,
-    pub(in crate::app) undo_annotation: bool,
-    pub(in crate::app) export_annotations: bool,
+    pub(in crate::app) import: bool,
+    pub(in crate::app) export: bool,
+    pub(in crate::app) undo: bool,
+    pub(in crate::app) redo: bool,
+    pub(in crate::app) cancel_export: bool,
 }
 
 pub(in crate::app) struct ToolbarState<'a> {
     pub(in crate::app) has_study: bool,
     pub(in crate::app) show_facts: &'a mut bool,
-    pub(in crate::app) measurement_active: &'a mut bool,
-    pub(in crate::app) annotation_active: &'a mut bool,
-    pub(in crate::app) annotation_mode: AnnotationMode,
-    pub(in crate::app) has_annotation_work: bool,
-    pub(in crate::app) has_open_polygon: bool,
-    pub(in crate::app) has_exportable_annotations: bool,
+    pub(in crate::app) can_undo: bool,
+    pub(in crate::app) can_redo: bool,
+    pub(in crate::app) autosave_status: &'a str,
+    pub(in crate::app) export_running: bool,
+    pub(in crate::app) export_cancel_requested: bool,
     pub(in crate::app) smooth_camera: &'a mut bool,
 }
 
@@ -44,54 +41,59 @@ pub(in crate::app) fn show_toolbar(ui: &mut egui::Ui, state: ToolbarState<'_>) -
             ui.horizontal_centered(|ui| {
                 wordmark(ui);
                 rule(ui);
-                actions.open_file = ui.button(RichText::new("Open file").size(13.0)).clicked();
-                actions.open_folder = ui.button(RichText::new("Open folder").size(13.0)).clicked();
+                ui.menu_button(RichText::new("Open").size(13.0), |ui| {
+                    if ui.button("Open file…").clicked() {
+                        actions.open_file = true;
+                        ui.close();
+                    }
+                    if ui.button("Open DICOM folder…").clicked() {
+                        actions.open_folder = true;
+                        ui.close();
+                    }
+                });
                 rule(ui);
                 ui.toggle_value(state.show_facts, RichText::new("Info").size(13.0));
                 if state.has_study {
                     rule(ui);
+                    actions.import = ui.button(RichText::new("Import").size(13.0)).clicked();
+                    if state.export_running {
+                        actions.cancel_export = ui
+                            .add_enabled(
+                                !state.export_cancel_requested,
+                                egui::Button::new(if state.export_cancel_requested {
+                                    "Cancelling…"
+                                } else {
+                                    "Cancel Export"
+                                }),
+                            )
+                            .clicked();
+                    } else {
+                        actions.export = ui.button(RichText::new("Export").size(13.0)).clicked();
+                    }
+                    rule(ui);
+                    actions.undo = ui
+                        .add_enabled(state.can_undo, egui::Button::new("Undo"))
+                        .clicked();
+                    actions.redo = ui
+                        .add_enabled(state.can_redo, egui::Button::new("Redo"))
+                        .clicked();
+                    rule(ui);
                     actions.fit = ui.button(RichText::new("Fit").size(13.0)).clicked();
                     actions.zoom_out = ui.button(RichText::new("\u{2212}").size(13.0)).clicked();
                     actions.zoom_in = ui.button(RichText::new("+").size(13.0)).clicked();
-                    actions.measure_clicked = ui
-                        .toggle_value(
-                            state.measurement_active,
-                            RichText::new("Measure").size(13.0),
-                        )
-                        .clicked();
-                    actions.annotate_clicked = ui
-                        .toggle_value(
-                            state.annotation_active,
-                            RichText::new("Annotate").size(13.0),
-                        )
-                        .clicked();
-                    if *state.annotation_active {
-                        actions.annotation_mode = [AnnotationMode::Tumor, AnnotationMode::Hole]
-                            .into_iter()
-                            .find(|mode| {
-                                ui.selectable_label(
-                                    state.annotation_mode == *mode,
-                                    RichText::new(mode.label()).size(12.0),
-                                )
-                                .clicked()
-                            });
-                        actions.close_polygon = ui
-                            .add_enabled(state.has_open_polygon, egui::Button::new("Close"))
-                            .clicked();
-                        actions.undo_annotation = ui
-                            .add_enabled(state.has_annotation_work, egui::Button::new("Undo"))
-                            .clicked();
-                        actions.export_annotations = ui
-                            .add_enabled(
-                                state.has_exportable_annotations,
-                                egui::Button::new("Save GeoJSON"),
-                            )
-                            .clicked();
-                    }
-                    ui.toggle_value(state.smooth_camera, RichText::new("Smooth").size(13.0));
+                    ui.menu_button("View", |ui| {
+                        ui.checkbox(state.smooth_camera, "Smooth navigation");
+                    });
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     privacy_badge(ui);
+                    if state.has_study {
+                        ui.label(
+                            RichText::new(state.autosave_status)
+                                .size(11.0)
+                                .color(theme::TEXT_MUTED),
+                        );
+                    }
                 });
             });
         });
@@ -199,4 +201,56 @@ pub(in crate::app) fn status_glyph(ui: &mut egui::Ui, opening: bool, has_study: 
         ("\u{25CB}", theme::TEXT_DIM)
     };
     ui.label(RichText::new(glyph).color(color).size(11.0));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::tests::{run_ui, summary};
+
+    #[test]
+    fn toolbar_and_status_bar_render_each_availability_state_without_actions() {
+        let mut show_facts = false;
+        let mut smooth_camera = true;
+        let output = run_ui(|ui| {
+            let actions = show_toolbar(
+                ui,
+                ToolbarState {
+                    has_study: false,
+                    show_facts: &mut show_facts,
+                    can_undo: false,
+                    can_redo: false,
+                    autosave_status: "Not saved",
+                    export_running: false,
+                    export_cancel_requested: false,
+                    smooth_camera: &mut smooth_camera,
+                },
+            );
+            assert!(!actions.open_file);
+            assert!(!actions.open_folder);
+            show_status_bar(ui, "Open a slide", false, None);
+        });
+        assert!(!output.shapes.is_empty());
+
+        let study = summary();
+        let output = run_ui(|ui| {
+            let actions = show_toolbar(
+                ui,
+                ToolbarState {
+                    has_study: true,
+                    show_facts: &mut show_facts,
+                    can_undo: true,
+                    can_redo: true,
+                    autosave_status: "Saved",
+                    export_running: false,
+                    export_cancel_requested: false,
+                    smooth_camera: &mut smooth_camera,
+                },
+            );
+            assert!(!actions.undo);
+            assert!(!actions.redo);
+            show_status_bar(ui, "Opening", true, Some(&study));
+        });
+        assert!(!output.shapes.is_empty());
+    }
 }

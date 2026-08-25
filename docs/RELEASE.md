@@ -24,11 +24,11 @@ runtime validation must pass when those backends are included in a release.
 
 ## Reproducible source gate
 
-The locked graph must resolve exact `wsi-rs` 0.5.2 and J2K 0.8.0 releases from
-crates.io, including registry checksums in `Cargo.lock`. CI and packaging must
-build without sibling codec checkouts or local-only source overrides. Run
-`cargo metadata --locked --format-version 1` from a clean checkout and confirm
-that it leaves `Cargo.lock` unchanged.
+The locked graph must resolve `wsi-rs` 0.6.0 at revision `b940ea94` and J2K
+0.10.0 at revision `57b6af89` from their upstream Git repositories. CI and
+packaging must build without sibling codec checkouts or local-only source
+overrides. Run `cargo metadata --locked --format-version 1` from a clean
+checkout and confirm that it leaves `Cargo.lock` unchanged.
 
 ## Interactive performance gate
 

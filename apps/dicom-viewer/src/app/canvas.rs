@@ -15,7 +15,7 @@ use super::level_warmer::{LevelWarmer, LevelWarmerEvent};
 use super::theme;
 use super::tile::{
     DicomIndexDiagnosticSource, FrameTileDemand, LevelPreparationStatus, TileFailureInfo,
-    TilePollRequest, TileRenderer, VisibleTile,
+    TileFootprint, TilePollRequest, TileRenderer, VisibleTile,
 };
 #[cfg(test)]
 use super::viewport::visible_tiles;
@@ -639,18 +639,12 @@ fn overview_tiles(summary: &StudySummary, generation: u64) -> Vec<VisibleTile> {
     let Some((cols, rows)) = level.tile_layout.grid_size() else {
         return Vec::new();
     };
-    let (tile_width, tile_height) = level.tile_layout.display_tile_size();
     let mut remaining = OVERVIEW_PIN_BYTES;
     let mut tiles = Vec::new();
     for (distance2, row, col) in nearest_grid_coordinates(cols, rows, MAX_PLANNED_TILES) {
-        let x = col.saturating_mul(u64::from(tile_width));
-        let y = row.saturating_mul(u64::from(tile_height));
-        let width = level.width.saturating_sub(x).min(u64::from(tile_width));
-        let height = level.height.saturating_sub(y).min(u64::from(tile_height));
-        let bytes = width
-            .checked_mul(height)
-            .and_then(|pixels| pixels.checked_mul(4))
-            .and_then(|bytes| usize::try_from(bytes).ok())
+        let coord = dicom_viewer_core::TileCoord::new(col, row);
+        let bytes = TileFootprint::for_level_tile(level, coord)
+            .map(TileFootprint::final_texture_bytes)
             .unwrap_or(usize::MAX);
         if bytes <= remaining {
             remaining -= bytes;
@@ -658,7 +652,7 @@ fn overview_tiles(summary: &StudySummary, generation: u64) -> Vec<VisibleTile> {
                 key: super::tile::TileKey {
                     generation,
                     level: level.index,
-                    coord: dicom_viewer_core::TileCoord::new(col, row),
+                    coord,
                 },
                 distance2,
             });
@@ -734,10 +728,8 @@ pub(super) fn fallback_levels<'a>(
         let is_held = held_level.is_some_and(|held| held.index == level.index);
         let is_coarser = level.downsample > render_level.downsample;
         let (width, height) = level.tile_layout.display_tile_size();
-        let is_bounded_fallback = u64::from(width)
-            .checked_mul(u64::from(height))
-            .and_then(|pixels| pixels.checked_mul(4))
-            .is_some_and(|bytes| bytes <= MAX_FALLBACK_TILE_BYTES);
+        let is_bounded_fallback = TileFootprint::rgba_texture_bytes(width, height)
+            .is_ok_and(|bytes| bytes as u64 <= MAX_FALLBACK_TILE_BYTES);
         if (is_held || (is_coarser && is_bounded_fallback)) && seen.insert(level.index) {
             levels.push(level);
         }

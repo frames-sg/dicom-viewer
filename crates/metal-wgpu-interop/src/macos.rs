@@ -1,8 +1,9 @@
-use foreign_types::{ForeignType, ForeignTypeRef};
 use j2k_core::PixelFormat;
 use j2k_metal_support::ResidentMetalImage;
-use objc2::{rc::Retained, runtime::ProtocolObject};
-use objc2_metal::MTLBuffer;
+use objc2::{rc::Retained, runtime::ProtocolObject, Message};
+use objc2_metal::{MTLBuffer, MTLDevice, MTLResource};
+
+type MetalDevice = Retained<ProtocolObject<dyn MTLDevice>>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MetalWgpuInteropError {
@@ -28,10 +29,8 @@ pub enum MetalWgpuInteropError {
     },
     #[error("resident image addressing exceeds the renderer shader's 32-bit range")]
     ShaderAddressTooLarge,
-    #[error("failed to retain the renderer Metal device")]
-    DeviceRetainFailed,
-    #[error("failed to retain the resident Metal allocation")]
-    BufferRetainFailed,
+    #[error("Metal support operation failed: {0}")]
+    MetalSupport(#[from] j2k_metal_support::MetalSupportError),
 }
 
 /// Return the size of the allocation retained by a resident image.
@@ -42,7 +41,7 @@ pub fn resident_allocation_len(image: &ResidentMetalImage) -> Result<usize, Meta
     if allocation_len == 0 {
         return Err(MetalWgpuInteropError::EmptyAllocation);
     }
-    usize::try_from(allocation_len).map_err(|_| MetalWgpuInteropError::AllocationTooLarge)
+    Ok(allocation_len)
 }
 
 fn validate_wgpu_buffer_limits(
@@ -63,12 +62,12 @@ fn validate_wgpu_buffer_limits(
 /// The exact Metal device backing a wgpu renderer.
 ///
 /// Construction validates the wgpu backend and retains the underlying
-/// Objective-C device. The exposed `metal::Device` is therefore the only
+/// Objective-C device. The exposed retained device is therefore the only
 /// device callers should supply to a Metal decoder session.
 #[derive(Clone)]
 pub struct MetalWgpuBridge {
     device: wgpu::Device,
-    metal_device: metal::Device,
+    metal_device: MetalDevice,
     registry_id: u64,
 }
 
@@ -88,12 +87,8 @@ impl MetalWgpuBridge {
         // retained Objective-C device. No HAL object is destroyed or mutated.
         let hal = unsafe { device.as_hal::<wgpu_hal::api::Metal>() }
             .ok_or(MetalWgpuInteropError::NotMetalBackend)?;
-        let retained = hal.raw_device().clone();
-        let raw = Retained::into_raw(retained);
-        // SAFETY: `raw` is the same Objective-C MTLDevice pointer and carries
-        // the +1 retain transferred from `Retained::into_raw`.
-        let metal_device = unsafe { metal::Device::from_ptr(raw.cast()) };
-        let registry_id = metal_device.registry_id();
+        let metal_device = hal.raw_device().clone();
+        let registry_id = metal_device.registryID();
         Ok(Self {
             device: device.clone(),
             metal_device,
@@ -102,7 +97,7 @@ impl MetalWgpuBridge {
     }
 
     #[must_use]
-    pub fn metal_device(&self) -> metal::Device {
+    pub fn metal_device(&self) -> MetalDevice {
         self.metal_device.clone()
     }
 
@@ -129,14 +124,8 @@ impl MetalWgpuBridge {
         )?;
 
         // SAFETY: `ResidentMetalImage` promises an immutable, completed
-        // allocation. We retain but never mutate or expose its raw handle.
-        let metal_buffer = unsafe { image.raw_buffer() }.clone();
-        let raw = metal_buffer.into_ptr();
-        let objc_raw = raw.cast::<ProtocolObject<dyn MTLBuffer>>();
-        // SAFETY: `ForeignType::into_ptr` transferred one owned retain and the
-        // pointed object implements MTLBuffer. Ownership moves into `Retained`.
-        let retained = unsafe { Retained::from_raw(objc_raw) }
-            .ok_or(MetalWgpuInteropError::BufferRetainFailed)?;
+        // allocation. Retaining it does not expose a writable alias.
+        let retained = unsafe { image.raw_buffer() }.retain();
         // SAFETY: The buffer belongs to this exact HAL device, is initialized,
         // immutable, nonempty, and the descriptor below exactly matches its
         // allocation size and permitted read-only uses.
@@ -177,16 +166,12 @@ impl MetalWgpuBridge {
         pitch_bytes: usize,
     ) -> Result<ResidentMetalImage, MetalWgpuInteropError> {
         use j2k_metal_support::MetalImageLayout;
-        use metal::MTLResourceOptions;
 
         if bytes.is_empty() {
             return Err(MetalWgpuInteropError::EmptyAllocation);
         }
-        let buffer = self.metal_device.new_buffer_with_data(
-            bytes.as_ptr().cast(),
-            bytes.len() as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        let buffer =
+            j2k_metal_support::checked_shared_buffer_with_bytes(&self.metal_device, bytes)?;
         let layout = MetalImageLayout::new(byte_offset, dimensions, pitch_bytes, PixelFormat::Rgb8)
             .map_err(|_| {
                 MetalWgpuInteropError::InvalidLayout("invalid RGB8 test fixture layout")
@@ -248,9 +233,9 @@ struct ValidatedImage {
 impl ValidatedImage {
     fn new(
         image: &ResidentMetalImage,
-        expected_device: &metal::DeviceRef,
+        expected_device: &ProtocolObject<dyn MTLDevice>,
     ) -> Result<Self, MetalWgpuInteropError> {
-        let expected_registry_id = expected_device.registry_id();
+        let expected_registry_id = expected_device.registryID();
         if image.device_registry_id() != expected_registry_id {
             return Err(MetalWgpuInteropError::DeviceMismatch {
                 expected: expected_registry_id,
@@ -260,10 +245,10 @@ impl ValidatedImage {
         // SAFETY: Device identity is read without exposing or retaining the
         // immutable allocation handle outside this audited boundary.
         let allocation_device = unsafe { image.raw_buffer() }.device();
-        if allocation_device.as_ptr() != expected_device.as_ptr() {
+        if !std::ptr::eq(&*allocation_device, expected_device) {
             return Err(MetalWgpuInteropError::DeviceMismatch {
                 expected: expected_registry_id,
-                actual: allocation_device.registry_id(),
+                actual: allocation_device.registryID(),
             });
         }
         if image.pixel_format() != PixelFormat::Rgb8 {
@@ -296,7 +281,8 @@ impl ValidatedImage {
             .map_err(|_| MetalWgpuInteropError::AllocationTooLarge)?;
         // SAFETY: Reading the allocation length does not access contents or
         // create a mutable alias. The raw handle remains private to this crate.
-        let allocation_len = unsafe { image.raw_buffer() }.length();
+        let allocation_len = u64::try_from(unsafe { image.raw_buffer() }.length())
+            .map_err(|_| MetalWgpuInteropError::AllocationTooLarge)?;
         if allocation_len == 0 {
             return Err(MetalWgpuInteropError::EmptyAllocation);
         }
@@ -332,7 +318,6 @@ mod tests {
     use std::sync::mpsc;
 
     use j2k_metal_support::MetalImageLayout;
-    use metal::MTLResourceOptions;
 
     use super::*;
 
@@ -360,11 +345,9 @@ mod tests {
         };
         let bridge = MetalWgpuBridge::new(&device).unwrap();
         let bytes = [1_u8, 2, 3, 4, 5, 6, 0, 0];
-        let metal_buffer = bridge.metal_device().new_buffer_with_data(
-            bytes.as_ptr().cast(),
-            bytes.len() as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        let metal_device = bridge.metal_device();
+        let metal_buffer =
+            j2k_metal_support::checked_shared_buffer_with_bytes(&metal_device, &bytes).unwrap();
         let layout = MetalImageLayout::new(0, (2, 1), 8, PixelFormat::Rgb8).unwrap();
         // SAFETY: The shared test buffer has completed CPU initialization and
         // no mutable aliases survive this call.
@@ -397,7 +380,7 @@ mod tests {
 
         assert_eq!(
             bridge.device_registry_id(),
-            bridge.metal_device().registry_id()
+            bridge.metal_device().registryID()
         );
         assert_eq!(imported.dimensions(), (2, 1));
         assert_eq!(imported.pitch_bytes(), 8);
@@ -412,9 +395,8 @@ mod tests {
             return;
         };
         let bridge = MetalWgpuBridge::new(&device).unwrap();
-        let metal_buffer = bridge
-            .metal_device()
-            .new_buffer(64, MTLResourceOptions::StorageModeShared);
+        let metal_device = bridge.metal_device();
+        let metal_buffer = j2k_metal_support::checked_shared_buffer(&metal_device, 64).unwrap();
         let layout = MetalImageLayout::new(16, (1, 1), 4, PixelFormat::Rgb8).unwrap();
         // SAFETY: This fresh test allocation has no pending writer or aliases.
         let image =
@@ -430,9 +412,8 @@ mod tests {
             return;
         };
         let bridge = MetalWgpuBridge::new(&device).unwrap();
-        let metal_buffer = bridge
-            .metal_device()
-            .new_buffer(4, MTLResourceOptions::StorageModeShared);
+        let metal_device = bridge.metal_device();
+        let metal_buffer = j2k_metal_support::checked_shared_buffer(&metal_device, 4).unwrap();
         let layout = MetalImageLayout::new(0, (1, 1), 4, PixelFormat::Rgba8).unwrap();
         // SAFETY: This fresh test allocation has no pending writer or aliases.
         let image =

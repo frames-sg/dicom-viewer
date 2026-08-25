@@ -11,10 +11,8 @@ default = []
 test-support = []
 
 [target.'cfg(target_os = "macos")'.dependencies]
-foreign-types = { workspace = true }
 j2k-core = { workspace = true }
 j2k-metal-support = { workspace = true }
-metal = { workspace = true }
 objc2 = { workspace = true }
 objc2-metal = { workspace = true }
 thiserror = { workspace = true }

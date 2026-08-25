@@ -1,7 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
 
-use dicom_viewer_core::{LevelIndex, LevelInfo, StudySummary, TileCoord};
+use dicom_viewer_core::{LevelIndex, LevelInfo, Point2, StudySummary, TileCoord};
 use eframe::egui::{vec2, Rect, Vec2};
 
 use super::camera::MIN_ZOOM;
@@ -123,6 +123,41 @@ pub(super) fn screen_to_base(
     zoom: f32,
 ) -> Vec2 {
     center_base + (screen - rect.center()) / zoom.max(MIN_ZOOM)
+}
+
+pub(super) fn visible_base_bounds(rect: Rect, center_base: Vec2, zoom: f32) -> [f64; 4] {
+    let zoom = zoom.max(MIN_ZOOM);
+    let min = center_base + (rect.min - rect.center()) / zoom;
+    let max = center_base + (rect.max - rect.center()) / zoom;
+    [
+        f64::from(min.x),
+        f64::from(min.y),
+        f64::from(max.x),
+        f64::from(max.y),
+    ]
+}
+
+pub(super) fn bounds_intersect(left: [f64; 4], right: [f64; 4]) -> bool {
+    left[0] <= right[2] && left[2] >= right[0] && left[1] <= right[3] && left[3] >= right[1]
+}
+
+pub(super) fn point_bounds(points: &[Point2]) -> [f64; 4] {
+    points.iter().fold(
+        [
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        ],
+        |[min_x, min_y, max_x, max_y], point| {
+            [
+                min_x.min(point.x),
+                min_y.min(point.y),
+                max_x.max(point.x),
+                max_y.max(point.y),
+            ]
+        },
+    )
 }
 
 #[cfg(test)]

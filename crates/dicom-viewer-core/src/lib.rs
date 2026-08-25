@@ -12,11 +12,47 @@ pub use wsi_rs::{
     ReadDiagnosticSink,
 };
 
+mod annotations;
 mod color;
 mod inspection;
 mod model;
+mod statistics;
 mod tile_output;
 
+#[cfg(test)]
+mod annotation_test_support;
+#[cfg(test)]
+mod workspace_export_tests;
+#[cfg(test)]
+mod workspace_tests;
+
+pub use annotations::{
+    annotation_class_concept_key, annotation_object_kind, dicom_cielab_to_srgb, discover_sidecars,
+    frames_viewer_producer, polygon_boundaries_intersect, polygon_contains_point,
+    polygon_self_intersects, polygon_signed_area, srgb_to_dicom_cielab, AlgorithmIdentification,
+    AnnotationClass, AnnotationClassConceptKey, AnnotationClassGeometry, AnnotationDocument,
+    AnnotationGeometry, AnnotationGraphicType, AnnotationGroup, AnnotationMeasurement,
+    AnnotationObjectKind, AnnotationScheme, BinaryMaskRun, BinarySegmentationFrame,
+    CompositeSegmentGeometry, ControlledFindingSite, CoordinateGraphic, DiagnosticDisposition,
+    DiagnosticSeverity, DicomAnnotationContext, DicomBundlePublication, DicomCode,
+    DicomCodeValueKind, DicomPublicationError, DicomSinglePublication, ExternalLayerKind,
+    ExternalLayerReference, ExternalPromotionSource, FractionalMaskRun,
+    FractionalSegmentationFrame, GenerationType, InteroperabilityDiagnostic, LayerPresentation,
+    LinearMeasurementSpec, MeasurementReportSemantics, ParametricMapDocument,
+    ParametricMapInstance, ParametricMapPartPlan, ParametricMapPlan, ParametricMapPreview,
+    PathologyAnnotationSet, PathologyCoordinateSpace, PathologyDicomDocuments,
+    PathologyDicomTarget, PathologyDocumentWriteError, PathologyGeometryKind, PathologyPreview,
+    PathologyPreviewFeature, PathologyPreviewGeometry, PathologyPreviewPolygon, Point2, Point3,
+    PolygonComponent, RasterChannelSelection, RasterInputFormat, RasterProfile, SegmentEditOutcome,
+    SegmentOperation, SegmentationDocument, SegmentationKind, SegmentationLayer,
+    SegmentationPrimitive, SegmentationPrimitiveGeometry, SegmentationSegment,
+    SegmentationSegmentFinding, SidecarKind, SidecarMetadata, SourceFrameContext,
+    SpatialCoordinates, StructuredReportDocument, StructuredReportMeasurement,
+    StructuredReportMeasurementGroup, StructuredReportQualitativeEvaluation,
+    StructuredReportReferenceKind, TrackingIdentity, VectorFinding, VectorFindingGeometry,
+    VectorLayer, VectorSegmentationPolicy, WorkspaceDocument, WorkspaceGeoJsonExport,
+    WorkspaceLinearMeasurement, WorkspaceObjectProvenance, WorkspacePresentation,
+};
 use inspection::{inspect_input, summarize_slide};
 #[cfg(target_os = "macos")]
 pub use model::MetalRenderTile;
@@ -24,12 +60,50 @@ pub use model::{
     ColorLut3d, ColorManagementMode, ColorManagementStatus, ColorManagementSummary,
     DicomInstanceSummary, LevelIndex, LevelInfo, LevelTileLayout, RenderTile, Result, RgbaTile,
     SourceKind, StudySummary, TileCoord, TileDecodeBackend, ViewerCacheBudgets, ViewerError,
-    ViewerOpenOptions, ViewerStudy, DEFAULT_DISPLAY_TILE_SIZE,
+    ViewerOpenOptions, ViewerSourceIdentity, ViewerStudy, DEFAULT_DISPLAY_TILE_SIZE,
 };
+pub use statistics::nearest_rank_percentile;
 use tile_output::{
     default_viewer_open_options, render_tile_from_pixels, rgba_tile_from_cpu_tile,
     rgba_tile_from_pixels, tile_output_config,
 };
+pub use wsi_dicom_annotations::{Error as AnnotationError, Result as AnnotationResult};
+
+fn annotation_context_and_sidecars(
+    summary: &mut StudySummary,
+) -> (Option<DicomAnnotationContext>, Vec<SidecarMetadata>) {
+    let source = summary
+        .instances
+        .iter()
+        .max_by_key(|instance| {
+            u64::from(instance.total_pixel_matrix_columns.unwrap_or(0))
+                .saturating_mul(u64::from(instance.total_pixel_matrix_rows.unwrap_or(0)))
+        })
+        .map(|instance| instance.path.clone());
+    let Some(source) = source else {
+        return (None, Vec::new());
+    };
+    let context = match DicomAnnotationContext::from_source(&source) {
+        Ok(context) => context,
+        Err(error) => {
+            summary.warnings.push(format!(
+                "DICOM annotation export unavailable for {}: {error}",
+                source.display()
+            ));
+            return (None, Vec::new());
+        }
+    };
+    let sidecars = match discover_sidecars(&context) {
+        Ok(sidecars) => sidecars,
+        Err(error) => {
+            summary.warnings.push(format!(
+                "could not discover DICOM annotation sidecars: {error}"
+            ));
+            Vec::new()
+        }
+    };
+    (Some(context), sidecars)
+}
 
 #[derive(Clone, Copy)]
 enum BatchReadPolicy<'a> {
@@ -98,6 +172,7 @@ impl ViewerStudy {
         let slide = Slide::open_with_options(path, slide_options)?;
         let (mut summary, selected_view) =
             summarize_slide(path, &slide, input, tile_decode_backend)?;
+        let (annotation_context, sidecars) = annotation_context_and_sidecars(&mut summary);
         let color =
             color::ColorManagement::build(slide.dataset(), selected_view, tile_decode_backend);
         if color.force_cpu {
@@ -110,6 +185,8 @@ impl ViewerStudy {
         Ok(Self {
             slide,
             summary,
+            annotation_context,
+            sidecars,
             render_tile_output,
             cpu_tile_output,
             selected_view,
@@ -120,6 +197,36 @@ impl ViewerStudy {
     #[must_use]
     pub fn summary(&self) -> &StudySummary {
         &self.summary
+    }
+
+    /// Returns a stable, path-free identity for the selected scene and plane.
+    #[must_use]
+    pub fn source_identity(&self) -> ViewerSourceIdentity {
+        let plane = self.selected_view.plane.get();
+        ViewerSourceIdentity::new(
+            self.slide.dataset().id.get(),
+            self.selected_view.scene.get(),
+            self.selected_view.series.get(),
+            plane.z,
+            plane.c,
+            plane.t,
+            self.summary.canvas_dimensions,
+        )
+    }
+
+    /// DICOM source identity and slide geometry needed to create ANN/SEG sidecars.
+    ///
+    /// Non-DICOM WSI inputs and DICOM sources without the required reference
+    /// attributes return `None` while remaining viewable.
+    #[must_use]
+    pub fn annotation_context(&self) -> Option<&DicomAnnotationContext> {
+        self.annotation_context.as_ref()
+    }
+
+    /// Matching ANN/SEG files discovered beside the source through metadata-only reads.
+    #[must_use]
+    pub fn sidecars(&self) -> &[SidecarMetadata] {
+        &self.sidecars
     }
 
     /// Prepares source metadata needed to read one pyramid level without decoding pixels.

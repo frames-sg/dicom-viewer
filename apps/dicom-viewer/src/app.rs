@@ -1,45 +1,64 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use dicom_viewer_core::{StudySummary, TileDecodeBackend, ViewerStudy};
-use eframe::egui::{self, Frame, Rect, Sense};
+use dicom_viewer_core::{TileDecodeBackend, ViewerStudy};
+use eframe::egui::{self, Frame, Sense};
 
-mod annotation;
+mod annotation_actions;
+mod annotation_job;
+mod background_worker;
+mod bounded_input;
 mod camera;
 mod canvas;
+mod export_job;
 mod format;
 mod level_warmer;
-mod measurement;
 mod open_job;
+mod pathology;
+mod pathology_actions;
+mod raster;
+mod raster_actions;
+mod report;
+mod report_actions;
 mod theme;
 mod tile;
 mod ui;
 mod viewport;
+mod workspace;
+mod workspace_actions;
+mod workspace_dialogs;
+mod workspace_interaction;
 
-use annotation::{draw_annotation_overlay, AnnotationState};
-use camera::{wheel_zoom_factor, CameraState, CameraView};
+use annotation_job::AnnotationLoadResult;
+use background_worker::BackgroundWorker;
+use camera::{wheel_zoom_factor, CameraState};
 #[cfg(test)]
-use camera::{CameraMotion, MAX_ZOOM, MIN_ZOOM};
+use camera::{CameraMotion, CameraView, MAX_ZOOM, MIN_ZOOM};
 use canvas::SlideCanvas;
-use measurement::{
-    clamp_base_point, draw_measurement_overlay, measurement_ready_status, MeasurementInteraction,
-    MeasurementState,
-};
+use export_job::WorkspaceExportJob;
 use open_job::{OpenPoll, OpenQueue};
+use pathology::PathologyState;
+use raster::RasterState;
+use report::ReportState;
 use ui::chrome::{show_status_bar, show_toolbar, ToolbarState};
 use ui::facts::show_facts_sidebar;
 use ui::overlay::{
     draw_canvas_overlays, paint_canvas_background, paint_empty_state, FrameStats, OverlayInfo,
 };
-use viewport::{base_contains_point, screen_to_base};
+use ui::pathology_workspace::{show_pathology_workspace_panel, show_tool_rail};
+use viewport::screen_to_base;
 #[cfg(test)]
 use viewport::{choose_render_level, visible_tiles};
+use workspace::{
+    draw_external_layer_overlays, draw_workspace_overlay, AutosaveStatus, RestoredWorkspace,
+    RevisionStore, SchemeLibrary, WorkspaceAutosave, WorkspaceRuntime, WorkspaceSaveRequest,
+};
 
 #[cfg(test)]
-use dicom_viewer_core::{LevelIndex, LevelInfo, SourceKind};
+use dicom_viewer_core::{LevelIndex, LevelInfo, SourceKind, StudySummary};
 #[cfg(test)]
-use eframe::egui::{pos2, vec2};
+use eframe::egui::{pos2, vec2, Rect};
 #[cfg(test)]
 use ui::overlay::{fps_color, FrameRateInfo};
 
@@ -61,13 +80,173 @@ pub struct DicomViewerApp {
     frame_stats: FrameStats,
     camera: CameraState,
     show_facts_panel: bool,
-    measurement: MeasurementState,
-    annotations: AnnotationState,
+    pathology: PathologyState,
+    report: ReportState,
+    raster: RasterState,
+    annotation_load_job: Option<BackgroundWorker<AnnotationLoadResult>>,
+    workspace_export_job: Option<WorkspaceExportJob>,
     active_path: Option<PathBuf>,
     reported_cpu_fallbacks: usize,
+    workspace: Option<WorkspaceRuntime>,
+    revision_store: Option<RevisionStore>,
+    autosave: Option<WorkspaceAutosave>,
+    pending_restore: Option<RestoredWorkspace>,
+    scheme_library: SchemeLibrary,
+    show_import_wizard: bool,
+    show_export_wizard: bool,
+    show_scheme_settings: bool,
+    show_storage_settings: bool,
+    pending_scheme_migration: Option<workspace_dialogs::PendingSchemeMigration>,
+    seg_rasterize_vectors: bool,
+    last_queued_workspace_revision: Option<u64>,
+    last_queued_draft: Option<workspace::DraftInteraction>,
 }
 
 impl DicomViewerApp {
+    fn dicom_source_directory(&self) -> Option<&Path> {
+        self.study
+            .as_ref()
+            .and_then(|study| study.annotation_context())
+            .and_then(|context| context.source_path().parent())
+    }
+
+    fn initialize_workspace(&mut self) {
+        let Some(study) = &self.study else {
+            return;
+        };
+        let source_identity = study.source_identity();
+        let discovered_sidecars = study.sidecars().to_vec();
+        let mut runtime = match WorkspaceRuntime::new(
+            source_identity.clone(),
+            dicom_viewer_core::AnnotationScheme::general_pathology_v1(),
+        ) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                self.status = format!("Could not initialize pathology workspace: {error}");
+                return;
+            }
+        };
+        if let Err(error) = reconcile_discovered_sidecar_stubs(&mut runtime, &discovered_sidecars) {
+            self.status = format!("Could not register discovered pathology sidecars: {error}");
+        }
+        self.workspace = Some(runtime);
+        self.pending_restore = self
+            .revision_store
+            .as_ref()
+            .and_then(|store| store.restore_latest(&source_identity).ok().flatten());
+        self.autosave = self
+            .revision_store
+            .clone()
+            .and_then(|store| WorkspaceAutosave::new(store, &source_identity).ok());
+        self.last_queued_workspace_revision = Some(0);
+        self.last_queued_draft = None;
+        if let Some(restored) = &self.pending_restore {
+            self.status = format!(
+                "Saved pathology workspace found: {} object(s). Restore is recommended.",
+                restored.document().object_count()
+            );
+        }
+    }
+
+    fn restore_saved_workspace(&mut self) {
+        let Some(restored) = self.pending_restore.take() else {
+            return;
+        };
+        match WorkspaceRuntime::from_document(restored.document().clone()) {
+            Ok(mut runtime) => {
+                let discovered_sidecars = self
+                    .study
+                    .as_ref()
+                    .map(|study| study.sidecars().to_vec())
+                    .unwrap_or_default();
+                if let Err(error) =
+                    reconcile_discovered_sidecar_stubs(&mut runtime, &discovered_sidecars)
+                {
+                    self.status =
+                        format!("Restored the workspace but could not register sidecars: {error}");
+                    self.pending_restore = Some(restored);
+                    return;
+                }
+                if let Some(draft) = restored.draft().cloned() {
+                    runtime.set_draft(draft);
+                }
+                self.last_queued_workspace_revision = Some(runtime.document().revision());
+                self.last_queued_draft = runtime.draft().cloned();
+                self.workspace = Some(runtime);
+                self.status = format!(
+                    "Restored pathology workspace revision {} with {} object(s).",
+                    restored.revision(),
+                    restored.document().object_count()
+                );
+            }
+            Err(error) => {
+                self.status = format!("Could not restore saved pathology workspace: {error}")
+            }
+        }
+    }
+
+    fn start_fresh_workspace(&mut self) {
+        let Some(restored) = self.pending_restore.take() else {
+            return;
+        };
+        if let Some(store) = &self.revision_store {
+            match store.archive_current(restored.document().source_identity()) {
+                Ok(_) => {
+                    self.status =
+                        "Started fresh; previous workspace revisions are archived for 30 days."
+                            .into();
+                }
+                Err(error) => {
+                    self.status = format!("Could not archive saved workspace: {error}");
+                    self.pending_restore = Some(restored);
+                }
+            }
+        }
+    }
+
+    fn queue_workspace_autosave(&mut self) {
+        let Some(runtime) = &self.workspace else {
+            return;
+        };
+        if runtime.handle_drag_active() || runtime.brush_stroke().is_some() {
+            return;
+        }
+        let revision = runtime.document().revision();
+        let draft = runtime.draft().cloned();
+        if self.last_queued_workspace_revision == Some(revision) && self.last_queued_draft == draft
+        {
+            return;
+        }
+        if let Some(autosave) = &mut self.autosave {
+            autosave.queue(
+                WorkspaceSaveRequest::new(runtime.document_snapshot(), draft.clone()),
+                Instant::now(),
+            );
+            self.last_queued_workspace_revision = Some(revision);
+            self.last_queued_draft = draft;
+        }
+    }
+
+    fn poll_workspace_autosave(&mut self) {
+        if let Some(autosave) = &mut self.autosave {
+            autosave.poll(Instant::now());
+            if let AutosaveStatus::Failed(error) = autosave.status() {
+                self.status = format!("Workspace autosave failed: {error}");
+            }
+        }
+    }
+
+    fn autosave_label(&self) -> String {
+        match self.autosave.as_ref().map(WorkspaceAutosave::status) {
+            Some(AutosaveStatus::Clean) => "Autosave ready".into(),
+            Some(AutosaveStatus::Pending) => "Unsaved changes".into(),
+            Some(AutosaveStatus::Saving) => "Saving…".into(),
+            Some(AutosaveStatus::Saved { .. }) => "Saved".into(),
+            Some(AutosaveStatus::Failed(_)) => "Save failed".into(),
+            None => "Autosave unavailable".into(),
+        }
+    }
+
     pub fn new(cc: &eframe::CreationContext<'_>, initial_path: Option<PathBuf>) -> Self {
         theme::install_visuals(&cc.egui_ctx);
         let render_state = cc
@@ -75,10 +254,25 @@ impl DicomViewerApp {
             .clone()
             .expect("DICOM viewer requires the configured wgpu renderer");
         let canvas = SlideCanvas::new(render_state);
-        let initial_status = canvas.backend_warning().map_or_else(
+        let mut initial_status = canvas.backend_warning().map_or_else(
             || "Open a WSI file or DICOM folder.".to_string(),
             |warning| format!("Metal interop unavailable; using CPU → wgpu: {warning}"),
         );
+        let revision_store = RevisionStore::application_default().ok();
+        let scheme_library =
+            revision_store
+                .as_ref()
+                .map_or_else(SchemeLibrary::with_builtins, |store| {
+                    match SchemeLibrary::load_or_builtins(store.root().to_path_buf()) {
+                        Ok(library) => library,
+                        Err(error) => {
+                            initial_status = format!(
+                        "{initial_status} Annotation scheme library could not be loaded: {error}"
+                    );
+                            SchemeLibrary::with_builtins()
+                        }
+                    }
+                });
         let mut app = Self {
             study: None,
             open_queue: OpenQueue::default(),
@@ -89,10 +283,26 @@ impl DicomViewerApp {
             frame_stats: FrameStats::default(),
             camera: CameraState::default(),
             show_facts_panel: false,
-            measurement: MeasurementState::default(),
-            annotations: AnnotationState::default(),
+            pathology: PathologyState::default(),
+            report: ReportState::default(),
+            raster: RasterState::default(),
+            annotation_load_job: None,
+            workspace_export_job: None,
             active_path: None,
             reported_cpu_fallbacks: 0,
+            workspace: None,
+            revision_store,
+            autosave: None,
+            pending_restore: None,
+            scheme_library,
+            show_import_wizard: false,
+            show_export_wizard: false,
+            show_scheme_settings: false,
+            show_storage_settings: false,
+            pending_scheme_migration: None,
+            seg_rasterize_vectors: false,
+            last_queued_workspace_revision: None,
+            last_queued_draft: None,
         };
         if let Some(path) = initial_path {
             app.start_open_path(path, &cc.egui_ctx);
@@ -101,11 +311,50 @@ impl DicomViewerApp {
     }
 
     fn start_open_path(&mut self, path: PathBuf, ctx: &egui::Context) {
-        if !self.confirm_discard_annotations(
-            "Opening another slide will discard the annotations that have not been saved.",
-        ) {
-            self.status = "Open cancelled; annotations were kept.".to_string();
-            return;
+        if self
+            .workspace
+            .as_ref()
+            .is_some_and(|runtime| runtime.draft().is_some())
+        {
+            let decision = rfd::MessageDialog::new()
+                .set_title("Unfinished polygon")
+                .set_description(
+                    "Finish or discard the unfinished polygon before opening another slide. Resume keeps this slide open.",
+                )
+                .set_level(rfd::MessageLevel::Warning)
+                .set_buttons(rfd::MessageButtons::YesNoCancelCustom(
+                    "Finish".into(),
+                    "Discard".into(),
+                    "Resume".into(),
+                ))
+                .show();
+            match decision {
+                rfd::MessageDialogResult::Custom(label) if label == "Finish" => {
+                    if let Some(runtime) = &mut self.workspace {
+                        if let Err(error) = runtime.finish_draft() {
+                            self.status = error.to_string();
+                            return;
+                        }
+                    }
+                }
+                rfd::MessageDialogResult::Custom(label) if label == "Discard" => {
+                    if let Some(runtime) = &mut self.workspace {
+                        runtime.discard_draft();
+                    }
+                }
+                _ => {
+                    self.status = "Open cancelled; polygon draft resumed.".into();
+                    return;
+                }
+            }
+        }
+        self.queue_workspace_autosave();
+        if let Some(autosave) = &mut self.autosave {
+            if let Err(error) = autosave.flush() {
+                self.status =
+                    format!("Open cancelled because the workspace could not be saved: {error}");
+                return;
+            }
         }
         let options = match self.canvas.viewer_open_options() {
             Ok(options) => options,
@@ -120,10 +369,24 @@ impl DicomViewerApp {
         self.study = None;
         self.canvas.clear();
         self.camera.clear_for_open();
-        self.measurement.reset();
-        self.annotations.reset();
+        self.pathology.clear();
+        self.report.clear();
+        self.raster.clear();
+        self.annotation_load_job = None;
+        if let Some(job) = &self.workspace_export_job {
+            job.cancel();
+        }
+        self.workspace_export_job = None;
         self.active_path = None;
         self.reported_cpu_fallbacks = 0;
+        self.workspace = None;
+        self.autosave = None;
+        self.pending_restore = None;
+        self.pending_scheme_migration = None;
+        self.show_import_wizard = false;
+        self.show_export_wizard = false;
+        self.last_queued_workspace_revision = None;
+        self.last_queued_draft = None;
         self.status = format!("Opening {}...", path.display());
 
         match self
@@ -153,6 +416,7 @@ impl DicomViewerApp {
                         let tile_decode_backend = study.summary().tile_decode_backend;
                         self.camera.reset_for_study(study.summary());
                         self.study = Some(Arc::new(study));
+                        self.initialize_workspace();
                         self.active_path = Some(result.path.clone());
                         self.canvas.clear();
                         let path_label = match tile_decode_backend {
@@ -212,188 +476,79 @@ impl DicomViewerApp {
             }
         }
     }
+}
 
-    fn confirm_discard_annotations(&self, description: &str) -> bool {
-        !self.annotations.has_unsaved_work()
-            || rfd::MessageDialog::new()
-                .set_title("Discard unsaved annotations?")
-                .set_description(description)
-                .set_level(rfd::MessageLevel::Warning)
-                .set_buttons(rfd::MessageButtons::YesNo)
-                .show()
-                == rfd::MessageDialogResult::Yes
-    }
-
-    fn handle_measure_tool_clicked(&mut self, summary: Option<&StudySummary>, had_points: bool) {
-        if had_points {
-            self.measurement.clear_points();
-            self.measurement.active = true;
-            self.status = measurement_ready_status(summary);
-        } else if self.measurement.active {
-            self.measurement.clear_points();
-            self.status = measurement_ready_status(summary);
-        } else {
-            self.measurement.clear_points();
-            self.status = "Measurement cleared.".to_string();
-        }
-    }
-
-    fn handle_measurement_interaction(
-        &mut self,
-        ui: &egui::Ui,
-        response: &egui::Response,
-        rect: Rect,
-        summary: &StudySummary,
-        view: CameraView,
-    ) -> MeasurementInteraction {
-        let mut interaction = MeasurementInteraction::default();
-        if !self.measurement.active {
-            self.measurement.dragging = None;
-            return interaction;
-        }
-
-        let primary_down = ui.input(|input| input.pointer.primary_down());
-        if !primary_down {
-            self.measurement.dragging = None;
-        }
-
-        if response.drag_started() {
-            if let Some(pointer) = response.interact_pointer_pos() {
-                if let Some(index) = self.measurement.hit_test(rect, pointer, view) {
-                    self.measurement.dragging = Some(index);
-                    interaction.drag_consumed = true;
-                    response.request_focus();
-                }
+fn reconcile_discovered_sidecar_stubs(
+    runtime: &mut WorkspaceRuntime,
+    sidecars: &[dicom_viewer_core::SidecarMetadata],
+) -> dicom_viewer_core::Result<()> {
+    for sidecar in sidecars {
+        let kind = match sidecar.kind() {
+            dicom_viewer_core::SidecarKind::Annotation => {
+                dicom_viewer_core::ExternalLayerKind::DicomAnn
             }
-        }
-
-        if let Some(index) = self.measurement.dragging {
-            if let Some(pointer) = ui.input(|input| input.pointer.interact_pos()) {
-                let point = screen_to_base(rect, pointer, view.center_base, view.zoom);
-                self.measurement
-                    .set_point(index, clamp_base_point(summary, point));
-                if let Some(label) = self.measurement.distance_label(summary) {
-                    self.status = format!("Measured {label}.");
-                }
-                ui.ctx().request_repaint();
+            dicom_viewer_core::SidecarKind::BinarySegmentation
+            | dicom_viewer_core::SidecarKind::FractionalSegmentation
+            | dicom_viewer_core::SidecarKind::LabelMapSegmentation => {
+                dicom_viewer_core::ExternalLayerKind::DicomSeg
             }
-            interaction.drag_consumed = true;
-        }
-
-        if response.clicked() {
-            interaction.click_consumed = true;
-            if let Some(pointer) = response.interact_pointer_pos() {
-                if self.measurement.hit_test(rect, pointer, view).is_none() {
-                    let point = screen_to_base(rect, pointer, view.center_base, view.zoom);
-                    if base_contains_point(summary, point) {
-                        self.measurement.place_next_point(point);
-                        if let Some(label) = self.measurement.distance_label(summary) {
-                            self.status = format!("Measured {label}.");
-                        } else {
-                            self.status = "Measurement point set.".to_string();
-                        }
-                        ui.ctx().request_repaint();
-                    }
-                }
+            dicom_viewer_core::SidecarKind::StructuredReport => {
+                dicom_viewer_core::ExternalLayerKind::DicomSr
             }
-        }
-
-        interaction
-    }
-
-    fn handle_annotation_interaction(
-        &mut self,
-        response: &egui::Response,
-        rect: Rect,
-        summary: &StudySummary,
-        view: CameraView,
-    ) -> bool {
-        if !self.annotations.active {
-            return false;
-        }
-
-        if response.double_clicked() {
-            match self.annotations.close_current() {
-                Ok(()) => {
-                    self.status = format!("{} polygon closed.", self.annotations.mode.label());
-                }
-                Err(error) => self.status = error.to_string(),
-            }
-            response.request_focus();
-            return true;
-        }
-
-        if response.clicked() {
-            if let Some(pointer) = response.interact_pointer_pos() {
-                let point = screen_to_base(rect, pointer, view.center_base, view.zoom);
-                if base_contains_point(summary, point) {
-                    self.annotations.add_vertex(point);
-                    self.status = format!(
-                        "{} vertex added; double-click or use Close to finish.",
-                        self.annotations.mode.label()
-                    );
-                    response.request_focus();
-                }
-            }
-            return true;
-        }
-        false
-    }
-
-    fn close_annotation_polygon(&mut self) {
-        match self.annotations.close_current() {
-            Ok(()) => {
-                self.status = format!("{} polygon closed.", self.annotations.mode.label());
-            }
-            Err(error) => self.status = error.to_string(),
-        }
-    }
-
-    fn export_annotations(&mut self) {
-        let default_name = self
-            .active_path
-            .as_deref()
-            .and_then(|path| path.file_stem())
-            .and_then(|stem| stem.to_str())
-            .map_or_else(
-                || "viable_tumor.geojson".to_string(),
-                |stem| format!("{stem}_viable_tumor.geojson"),
-            );
-        let mut dialog = rfd::FileDialog::new()
-            .add_filter("GeoJSON", &["geojson"])
-            .set_file_name(&default_name);
-        if let Some(parent) = self.active_path.as_deref().and_then(|path| path.parent()) {
-            dialog = dialog.set_directory(parent);
-        }
-        let Some(path) = dialog.save_file() else {
-            return;
         };
-        match self.annotations.save_geojson(&path) {
-            Ok(()) => {
-                self.annotations.mark_saved();
-                self.status = format!(
-                    "Saved {} viable-tumor fragment(s) to {}.",
-                    self.annotations.completed_tumor_count(),
-                    path.display()
-                );
-            }
-            Err(error) => self.status = error.to_string(),
-        }
+        let name = sidecar
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("DICOM sidecar")
+            .to_owned();
+        runtime.ensure_discovered_external_stub(name, kind, sidecar.path().to_path_buf())?;
     }
+    Ok(())
 }
 
 impl eframe::App for DicomViewerApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if ctx.input(|input| input.viewport().close_requested())
-            && !self.confirm_discard_annotations(
-                "Closing the viewer will discard the annotations that have not been saved.",
-            )
-        {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.status = "Close cancelled; annotations were kept.".to_string();
+        self.poll_workspace_autosave();
+        if ctx.input(|input| input.viewport().close_requested()) {
+            self.queue_workspace_autosave();
+            let save_result = self.autosave.as_mut().map(WorkspaceAutosave::flush);
+            if let Some(Err(error)) = save_result {
+                let decision = rfd::MessageDialog::new()
+                    .set_title("Workspace could not be saved")
+                    .set_description(format!(
+                        "{error}\n\nRetry saving, quit without saving, or cancel close."
+                    ))
+                    .set_level(rfd::MessageLevel::Error)
+                    .set_buttons(rfd::MessageButtons::YesNoCancelCustom(
+                        "Retry".into(),
+                        "Quit Without Saving".into(),
+                        "Cancel".into(),
+                    ))
+                    .show();
+                match decision {
+                    rfd::MessageDialogResult::Custom(label) if label == "Quit Without Saving" => {}
+                    rfd::MessageDialogResult::Custom(label) if label == "Retry" => {
+                        let retry = self.autosave.as_mut().map(WorkspaceAutosave::flush);
+                        if retry.is_some_and(|result| result.is_err()) {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                            self.status = "Close cancelled; workspace save still failed.".into();
+                        }
+                    }
+                    _ => {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                        self.status = "Close cancelled; workspace kept open.".into();
+                    }
+                }
+            }
         }
         self.handle_dropped_files(ctx);
         self.poll_open_job(ctx);
+        self.poll_annotation_jobs(ctx);
+        self.poll_workspace_export_job(ctx);
+        self.poll_pathology_job();
+        self.poll_report_job();
+        self.poll_raster_job(ctx);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -403,21 +558,23 @@ impl eframe::App for DicomViewerApp {
 
         let has_study = self.study.is_some();
 
-        let had_measurement = self.measurement.has_points();
-        let annotation_mode = self.annotations.mode;
-        let has_open_polygon = self.annotations.has_current_vertices();
-        let has_exportable_annotations = self.annotations.completed_tumor_count() > 0;
+        let autosave_label = self.autosave_label();
+        let (can_undo, can_redo) = self.workspace.as_ref().map_or((false, false), |runtime| {
+            (runtime.can_undo(), runtime.can_redo())
+        });
         let actions = show_toolbar(
             ui,
             ToolbarState {
                 has_study,
                 show_facts: &mut self.show_facts_panel,
-                measurement_active: &mut self.measurement.active,
-                annotation_active: &mut self.annotations.active,
-                annotation_mode,
-                has_annotation_work: has_open_polygon || has_exportable_annotations,
-                has_open_polygon,
-                has_exportable_annotations,
+                can_undo,
+                can_redo,
+                autosave_status: &autosave_label,
+                export_running: self.workspace_export_job.is_some(),
+                export_cancel_requested: self
+                    .workspace_export_job
+                    .as_ref()
+                    .is_some_and(WorkspaceExportJob::cancellation_requested),
                 smooth_camera: self.camera.smoothing_enabled_mut(),
             },
         );
@@ -432,43 +589,23 @@ impl eframe::App for DicomViewerApp {
         // work for the previous study under the replacement generation.
         let study = self.study.clone();
         let opening = self.open_queue.is_opening();
-        if actions.measure_clicked {
-            if self.measurement.active {
-                self.annotations.active = false;
+        if actions.undo && self.workspace.as_mut().is_some_and(WorkspaceRuntime::undo) {
+            self.status = "Undid the last pathology command.".into();
+        }
+        if actions.redo && self.workspace.as_mut().is_some_and(WorkspaceRuntime::redo) {
+            self.status = "Redid the pathology command.".into();
+        }
+        if actions.import {
+            self.show_import_wizard = true;
+        }
+        if actions.export {
+            self.show_export_wizard = true;
+        }
+        if actions.cancel_export {
+            if let Some(job) = &self.workspace_export_job {
+                job.cancel();
             }
-            self.handle_measure_tool_clicked(
-                study.as_ref().map(|study| study.summary()),
-                had_measurement,
-            );
-        }
-        if actions.annotate_clicked {
-            if self.annotations.active {
-                self.measurement.active = false;
-                self.status =
-                    "Annotation active; click vertices and double-click or use Close.".to_string();
-            } else {
-                self.status = "Annotation paused.".to_string();
-            }
-        }
-        if let Some(mode) = actions.annotation_mode {
-            let discarded = self.annotations.set_mode(mode);
-            self.status = if discarded {
-                format!(
-                    "{} mode active; unfinished polygon discarded.",
-                    mode.label()
-                )
-            } else {
-                format!("{} mode active.", mode.label())
-            };
-        }
-        if actions.close_polygon {
-            self.close_annotation_polygon();
-        }
-        if actions.undo_annotation && self.annotations.undo() {
-            self.status = "Last annotation step undone.".to_string();
-        }
-        if actions.export_annotations {
-            self.export_annotations();
+            self.status = "Cancelling export; the destination will remain unchanged…".into();
         }
         show_status_bar(
             ui,
@@ -482,7 +619,14 @@ impl eframe::App for DicomViewerApp {
             self.active_generation,
             study.as_ref().map(|study| study.summary()),
         );
-
+        if let Some(runtime) = &mut self.workspace {
+            if let Some(error) = show_tool_rail(ui, runtime) {
+                self.status = error;
+            }
+            let panel_actions = show_pathology_workspace_panel(ui, runtime);
+            self.handle_pathology_workspace_actions(panel_actions, ui.ctx());
+        }
+        self.show_workspace_dialogs(ui.ctx());
         // ── Central canvas ─────────────────────────────────────────
         egui::CentralPanel::default_margins()
             .frame(Frame::NONE.fill(theme::CANVAS))
@@ -530,29 +674,21 @@ impl eframe::App for DicomViewerApp {
                 if camera_frame.animating {
                     ui.ctx().request_repaint();
                 }
-                let measurement_interaction = self.handle_measurement_interaction(
+                let workspace_interaction = self.handle_workspace_interaction(
                     ui,
                     &response,
                     rect,
                     study.summary(),
                     camera_frame.rendered,
-                );
-                let annotation_click_consumed = self.handle_annotation_interaction(
-                    &response,
-                    rect,
-                    study.summary(),
-                    camera_frame.rendered,
+                    accepts_keys,
                 );
 
-                if response.dragged() && !measurement_interaction.drag_consumed {
+                if workspace_interaction.pan_requested {
                     self.camera
                         .pan_by_rendered(response.drag_delta(), camera_frame.rendered);
                     ui.ctx().request_repaint();
                 }
-                if response.double_clicked()
-                    && !measurement_interaction.click_consumed
-                    && !annotation_click_consumed
-                {
+                if response.double_clicked() && !workspace_interaction.click_consumed {
                     let pointer = response.interact_pointer_pos().unwrap_or(rect.center());
                     self.canvas.record_zoom_input();
                     self.camera
@@ -602,6 +738,12 @@ impl eframe::App for DicomViewerApp {
                     self.active_generation,
                     camera_frame,
                 );
+                if let Some(runtime) = &mut self.workspace {
+                    if let Err(error) = runtime.refresh_spatial_index() {
+                        self.status =
+                            format!("Could not update annotation viewport index: {error}");
+                    }
+                }
                 if let Some((count, reason)) = self.canvas.cpu_fallback() {
                     if count > self.reported_cpu_fallbacks {
                         self.reported_cpu_fallbacks = count;
@@ -634,23 +776,27 @@ impl eframe::App for DicomViewerApp {
                         debug_stats: debug_stats.as_deref(),
                     },
                 );
-                draw_measurement_overlay(
-                    &painter,
-                    rect,
-                    study.summary(),
-                    &self.measurement,
-                    hover_base,
-                    camera_frame.rendered.center_base,
-                    camera_frame.rendered.zoom,
-                );
-                draw_annotation_overlay(
-                    &painter,
-                    rect,
-                    &self.annotations,
-                    hover_base.filter(|point| base_contains_point(study.summary(), *point)),
-                    camera_frame.rendered,
-                );
+                if let Some(runtime) = &self.workspace {
+                    if let Some(context) = study.annotation_context() {
+                        draw_external_layer_overlays(
+                            &painter,
+                            rect,
+                            runtime,
+                            context,
+                            camera_frame.rendered,
+                        );
+                    }
+                    draw_workspace_overlay(&painter, rect, runtime, camera_frame.rendered);
+                }
             });
+        self.queue_workspace_autosave();
+        if self
+            .autosave
+            .as_ref()
+            .is_some_and(WorkspaceAutosave::has_pending_write)
+        {
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
+        }
         if let Some(started) = app_ui_started {
             self.canvas.record_app_ui_cpu_time(started.elapsed());
         }

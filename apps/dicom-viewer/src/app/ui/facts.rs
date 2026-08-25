@@ -406,7 +406,11 @@ pub(in crate::app) fn facts_panel(
 
 #[cfg(test)]
 mod tests {
-    use super::{page_window, PageWindow, TRANSFER_SYNTAX_PAGE_SIZE};
+    use super::*;
+    use crate::app::tests::{run_ui, summary};
+    use dicom_viewer_core::{
+        ColorManagementMode, ColorManagementStatus, DicomInstanceSummary, TileDecodeBackend,
+    };
 
     #[test]
     fn page_window_bounds_per_frame_facts_work_and_clamps_stale_pages() {
@@ -437,5 +441,103 @@ mod tests {
                 end: 101,
             }
         );
+    }
+
+    #[test]
+    fn transfer_syntax_cache_is_stable_within_one_study_generation() {
+        let first = DicomInstanceSummary {
+            path: "one.dcm".into(),
+            sop_class_uid: "1.2.3".into(),
+            series_instance_uid_present: true,
+            transfer_syntax_uid: "1.2.840.10008.1.2.1".into(),
+            image_type: Vec::new(),
+            rows: None,
+            columns: None,
+            total_pixel_matrix_rows: None,
+            total_pixel_matrix_columns: None,
+            number_of_frames: None,
+            optical_path_count: None,
+            focal_plane_count: None,
+            concatenation_instance_count: None,
+            pixel_spacing: None,
+            dimension_organization_type: None,
+            samples_per_pixel: None,
+            photometric_interpretation: None,
+            planar_configuration: None,
+            bits_allocated: None,
+            bits_stored: None,
+            high_bit: None,
+            pixel_representation: None,
+        };
+        let second = DicomInstanceSummary {
+            transfer_syntax_uid: "1.2.840.10008.1.2.4.90".into(),
+            ..first.clone()
+        };
+
+        run_ui(|ui| {
+            let cached = cached_transfer_syntaxes(ui, 7, std::slice::from_ref(&first));
+            let same_generation = cached_transfer_syntaxes(ui, 7, std::slice::from_ref(&second));
+            assert!(Arc::ptr_eq(&cached, &same_generation));
+            assert_eq!(
+                same_generation.as_ref(),
+                std::slice::from_ref(&first.transfer_syntax_uid)
+            );
+
+            let replacement = cached_transfer_syntaxes(ui, 8, &[first.clone(), second.clone()]);
+            assert_eq!(replacement.len(), 2);
+            assert!(!Arc::ptr_eq(&cached, &replacement));
+        });
+    }
+
+    #[test]
+    fn facts_sidebar_renders_empty_and_complete_dicom_summaries() {
+        let hidden = run_ui(|ui| show_facts_sidebar(ui, false, 1, None));
+        assert!(hidden.shapes.is_empty());
+
+        let empty = run_ui(|ui| show_facts_sidebar(ui, true, 1, None));
+        assert!(!empty.shapes.is_empty());
+
+        let mut study = summary();
+        study.source_kind = SourceKind::Folder;
+        study.source_path = "dicom-study".into();
+        study.format_label = "VL Whole Slide Microscopy Image".into();
+        study.tile_decode_backend = TileDecodeBackend::Metal;
+        study.file_count = 2;
+        study.dicom_instance_count = 1;
+        study.mpp = Some((0.25, 0.26));
+        study.objective_power = Some(40.0);
+        study.color_management.status = ColorManagementStatus::Applied;
+        study.color_management.applied_mode = ColorManagementMode::MetalLut65;
+        study.color_management.byte_size = Some(4096);
+        study.color_management.provenance = Some("Optical Path Sequence".into());
+        study.color_management.sha256 = Some("abc123".into());
+        study.instances.push(DicomInstanceSummary {
+            path: "level-0.dcm".into(),
+            sop_class_uid: "1.2.840.10008.5.1.4.1.1.77.1.6".into(),
+            series_instance_uid_present: true,
+            transfer_syntax_uid: "1.2.840.10008.1.2.4.90".into(),
+            image_type: vec!["ORIGINAL".into(), "PRIMARY".into(), "VOLUME".into()],
+            rows: Some(512),
+            columns: Some(512),
+            total_pixel_matrix_rows: Some(4096),
+            total_pixel_matrix_columns: Some(4096),
+            number_of_frames: Some(64),
+            optical_path_count: Some(1),
+            focal_plane_count: Some(1),
+            concatenation_instance_count: Some(1),
+            pixel_spacing: Some((0.00025, 0.00026)),
+            dimension_organization_type: Some("TILED_FULL".into()),
+            samples_per_pixel: Some(3),
+            photometric_interpretation: Some("RGB".into()),
+            planar_configuration: Some(0),
+            bits_allocated: Some(8),
+            bits_stored: Some(8),
+            high_bit: Some(7),
+            pixel_representation: Some(0),
+        });
+        study.warnings = vec!["synthetic warning".into(), "second warning".into()];
+
+        let output = run_ui(|ui| show_facts_sidebar(ui, true, 9, Some(&study)));
+        assert!(output.shapes.len() > empty.shapes.len());
     }
 }

@@ -12,13 +12,18 @@ use super::{
 };
 
 mod loader;
+mod memory;
 mod stats;
 mod store;
 mod upload;
 
+#[cfg(test)]
+pub(super) use upload::render_state;
+
 const MAX_FRAME_TILE_JOBS: usize = 8_192;
 
 use loader::{QueuedTileRequest, TileLoader, TileLoaderMessage};
+pub(in crate::app) use memory::TileFootprint;
 pub(super) use stats::{DicomIndexDiagnosticSource, LevelPreparationStatus};
 use stats::{PipelineStats, PIPELINE_SCHEMA_VERSION};
 use store::{TileCoverage, TileDemandStatus, TileStore};
@@ -79,15 +84,6 @@ pub(super) enum QueueLane {
     Prefetch,
 }
 
-#[cfg(test)]
-pub(super) const fn prefetch_queue_lane(interactive: bool) -> QueueLane {
-    if interactive {
-        QueueLane::TransitionTarget
-    } else {
-        QueueLane::Prefetch
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct TilePriority {
     pub(super) lane: QueueLane,
@@ -126,13 +122,6 @@ pub(super) enum DecodedTile {
     Metal(dicom_viewer_core::MetalRenderTile),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TileMemoryCost {
-    decoded_bytes: usize,
-    texture_bytes: usize,
-    upload_peak_bytes: usize,
-}
-
 impl DecodedTile {
     fn from_render_tile(tile: RenderTile) -> std::result::Result<Self, String> {
         match tile {
@@ -156,46 +145,33 @@ impl DecodedTile {
         }
     }
 
-    fn memory_cost(&self) -> Result<TileMemoryCost, String> {
+    fn memory_cost(&self) -> Result<TileFootprint, String> {
         let (width, height) = self.dimensions();
-        let texture_bytes = usize::try_from(width)
-            .ok()
-            .and_then(|width| {
-                usize::try_from(height)
-                    .ok()
-                    .and_then(|height| width.checked_mul(height))
-            })
-            .and_then(|pixels| pixels.checked_mul(4))
-            .ok_or_else(|| {
-                format!("decoded tile dimensions {width}x{height} overflow RGBA texture bytes")
-            })?;
-        let decoded_bytes = match self {
-            Self::Cpu(tile) => {
-                if tile.rgba.len() != texture_bytes {
-                    return Err(format!(
-                        "decoded CPU tile dimensions {width}x{height} require {texture_bytes} RGBA bytes, got {}",
-                        tile.rgba.len()
-                    ));
-                }
-                tile.rgba.len()
-            }
+        let footprint = match self {
+            Self::Cpu(tile) => TileFootprint::for_cpu_rgba(width, height, tile.rgba.len())
+                .map_err(|error| error.to_string())?,
             #[cfg(target_os = "macos")]
             Self::Metal(tile) => {
                 let image = tile
                     .resident_image()
                     .map_err(|error| format!("invalid decoded Metal tile: {error}"))?;
-                metal_wgpu_interop::resident_allocation_len(image)
-                    .map_err(|error| format!("invalid decoded Metal allocation: {error}"))?
+                let decoded_source_bytes = metal_wgpu_interop::resident_allocation_len(image)
+                    .map_err(|error| format!("invalid decoded Metal allocation: {error}"))?;
+                TileFootprint::for_device_decoded(width, height, decoded_source_bytes)
+                    .map_err(|error| error.to_string())?
             }
         };
-        let upload_peak_bytes = decoded_bytes
-            .checked_add(texture_bytes)
-            .ok_or_else(|| format!("decoded tile {width}x{height} upload peak overflows usize"))?;
-        Ok(TileMemoryCost {
-            decoded_bytes,
-            texture_bytes,
-            upload_peak_bytes,
-        })
+        debug_assert_eq!(footprint.dimensions(), (width, height));
+        debug_assert_eq!(footprint.temporary_conversion_bytes(), 0);
+        debug_assert_eq!(
+            footprint.cpu_rgba_bytes(),
+            if self.is_cpu() {
+                footprint.final_texture_bytes()
+            } else {
+                0
+            }
+        );
+        Ok(footprint)
     }
 
     const fn is_cpu(&self) -> bool {
@@ -559,69 +535,10 @@ impl TileRenderer {
     }
 }
 
-fn planned_texture_bytes(level: &LevelInfo, coord: TileCoord) -> Result<usize, String> {
-    let (tile_width, tile_height) = level.tile_layout.display_tile_size();
-    let x = coord
-        .col()
-        .checked_mul(u64::from(tile_width))
-        .ok_or_else(|| {
-            format!(
-                "tile column {} overflows level {} pixel coordinates",
-                coord.col(),
-                level.index
-            )
-        })?;
-    let y = coord
-        .row()
-        .checked_mul(u64::from(tile_height))
-        .ok_or_else(|| {
-            format!(
-                "tile row {} overflows level {} pixel coordinates",
-                coord.row(),
-                level.index
-            )
-        })?;
-    if x >= level.width || y >= level.height {
-        return Err(format!(
-            "tile {},{} is outside level {} dimensions {}x{}",
-            coord.col(),
-            coord.row(),
-            level.index,
-            level.width,
-            level.height
-        ));
-    }
-    let width = level.width.saturating_sub(x).min(u64::from(tile_width));
-    let height = level.height.saturating_sub(y).min(u64::from(tile_height));
-    usize::try_from(width)
-        .ok()
-        .and_then(|width| {
-            usize::try_from(height)
-                .ok()
-                .and_then(|height| width.checked_mul(height))
-        })
-        .and_then(|pixels| pixels.checked_mul(4))
-        .ok_or_else(|| {
-            format!(
-                "tile {},{} on level {} overflows final RGBA texture bytes",
-                coord.col(),
-                coord.row(),
-                level.index
-            )
-        })
-}
-
 fn planned_upload_peak_bytes(level: &LevelInfo, coord: TileCoord) -> Result<usize, String> {
-    planned_texture_bytes(level, coord)?
-        .checked_mul(2)
-        .ok_or_else(|| {
-            format!(
-                "tile {},{} on level {} overflows decoded-source plus RGBA texture bytes",
-                coord.col(),
-                coord.row(),
-                level.index
-            )
-        })
+    TileFootprint::for_level_tile(level, coord)
+        .map(TileFootprint::peak_upload_bytes)
+        .map_err(|error| error.to_string())
 }
 
 const fn poll_requires_followup(finished_results: usize, uploaded: usize, failures: usize) -> bool {
@@ -951,3 +868,7 @@ fn loader_batch_belongs_to_generation(active_generation: u64, keys: &[TileKey]) 
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "tile/renderer_tests.rs"]
+mod renderer_tests;

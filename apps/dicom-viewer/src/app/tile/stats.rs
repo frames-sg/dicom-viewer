@@ -1,7 +1,9 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use dicom_viewer_core::{DicomIndexDiagnostic, DicomIndexMapping, DicomIndexOutcome, LevelIndex};
+use dicom_viewer_core::{
+    nearest_rank_percentile, DicomIndexDiagnostic, DicomIndexMapping, DicomIndexOutcome, LevelIndex,
+};
 
 use super::{
     loader::{TileBatchMetrics, TileLoaderStats},
@@ -970,20 +972,10 @@ fn safe_ratio(numerator: f64, denominator: f64) -> f64 {
 fn distribution(samples: &[f64]) -> Distribution {
     Distribution {
         count: samples.len(),
-        p50: percentile(samples, 0.50),
-        p95: percentile(samples, 0.95),
-        p99: percentile(samples, 0.99),
+        p50: nearest_rank_percentile(samples, 0.50),
+        p95: nearest_rank_percentile(samples, 0.95),
+        p99: nearest_rank_percentile(samples, 0.99),
     }
-}
-
-fn percentile(samples: &[f64], percentile: f64) -> f64 {
-    if samples.is_empty() {
-        return 0.0;
-    }
-    let mut sorted = samples.to_vec();
-    sorted.sort_by(f64::total_cmp);
-    let rank = (percentile.clamp(0.0, 1.0) * sorted.len() as f64).ceil() as usize;
-    sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
 }
 
 #[cfg(test)]
@@ -996,7 +988,7 @@ mod tests {
     };
 
     use super::{
-        percentile, DicomIndexDiagnosticSource, LevelPreparationStatus, PipelineStats,
+        nearest_rank_percentile, DicomIndexDiagnosticSource, LevelPreparationStatus, PipelineStats,
         PIPELINE_SCHEMA_VERSION,
     };
     use crate::app::tile::loader::{TileBatchMetrics, TileLoaderStats, TileQueueWait};
@@ -1006,10 +998,10 @@ mod tests {
     fn percentile_reports_window_distribution_without_lifetime_averaging() {
         let samples = [40.0, 10.0, 30.0, 20.0, 50.0];
 
-        assert_eq!(percentile(&samples, 0.50), 30.0);
-        assert_eq!(percentile(&samples, 0.95), 50.0);
-        assert_eq!(percentile(&samples, 0.99), 50.0);
-        assert_eq!(percentile(&[], 0.95), 0.0);
+        assert_eq!(nearest_rank_percentile(&samples, 0.50), 30.0);
+        assert_eq!(nearest_rank_percentile(&samples, 0.95), 50.0);
+        assert_eq!(nearest_rank_percentile(&samples, 0.99), 50.0);
+        assert_eq!(nearest_rank_percentile(&[], 0.95), 0.0);
     }
 
     #[test]

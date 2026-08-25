@@ -1,0 +1,5 @@
+[advisories]
+# Cargo Audit keys advisories by published package version and cannot recognize
+# the local backport. The vendored source includes the exact upstream fix and
+# regression test; see vendor/lru/SECURITY-PATCH.md.
+ignore = ["RUSTSEC-2026-0253"]

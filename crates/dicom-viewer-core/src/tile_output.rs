@@ -185,7 +185,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn auto_with_renderer_device_prefers_metal_but_keeps_cpu_compatibility_reads() {
-        let Some(device) = metal::Device::system_default() else {
+        let Ok(device) = j2k_metal_support::system_default_device() else {
             return;
         };
         let options = ViewerOpenOptions::auto().with_metal_device(device);

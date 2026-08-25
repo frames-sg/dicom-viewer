@@ -76,16 +76,6 @@ fn queue_lanes_keep_current_view_ahead_of_transition_and_prefetch() {
 }
 
 #[test]
-fn interactive_target_tiles_do_not_wait_for_zoom_to_settle() {
-    assert_eq!(prefetch_queue_lane(true), QueueLane::TransitionTarget);
-}
-
-#[test]
-fn idle_prefetch_waits_until_visible_tiles_are_ready() {
-    assert_eq!(prefetch_queue_lane(false), QueueLane::Prefetch);
-}
-
-#[test]
 fn tile_key_generation_is_the_only_stale_result_identity() {
     assert!(!is_stale_job(key(3), 3));
     assert!(is_stale_job(key(3), 4));
@@ -123,8 +113,62 @@ fn edge_tile_texture_preflight_uses_checked_final_rgba_bytes() {
         },
     };
 
-    assert_eq!(planned_texture_bytes(&level, TileCoord::new(0, 0)), Ok(16));
-    assert_eq!(planned_texture_bytes(&level, TileCoord::new(1, 0)), Ok(8));
+    assert_eq!(
+        TileFootprint::for_level_tile(&level, TileCoord::new(0, 0))
+            .map(TileFootprint::final_texture_bytes),
+        Ok(16)
+    );
+    assert_eq!(
+        TileFootprint::for_level_tile(&level, TileCoord::new(1, 0))
+            .map(TileFootprint::final_texture_bytes),
+        Ok(8)
+    );
+}
+
+#[test]
+fn tile_footprint_tracks_edge_dimensions_and_every_memory_component() {
+    let level = LevelInfo {
+        index: LevelIndex::from_u32(0),
+        width: 3,
+        height: 2,
+        downsample: 1.0,
+        tile_layout: dicom_viewer_core::LevelTileLayout::Regular {
+            tile_width: 2,
+            tile_height: 2,
+            tiles_across: 2,
+            tiles_down: 1,
+        },
+    };
+
+    let footprint = TileFootprint::for_level_tile(&level, TileCoord::new(1, 0)).unwrap();
+
+    assert_eq!(footprint.dimensions(), (1, 2));
+    assert_eq!(footprint.decoded_source_bytes(), 8);
+    assert_eq!(footprint.cpu_rgba_bytes(), 8);
+    assert_eq!(footprint.final_texture_bytes(), 8);
+    assert_eq!(footprint.temporary_conversion_bytes(), 0);
+    assert_eq!(footprint.peak_upload_bytes(), 16);
+    assert_eq!(footprint.in_flight_reservation_bytes(), 16);
+}
+
+#[test]
+fn tile_footprint_rejects_zero_dimensions_out_of_range_tiles_and_overflow() {
+    assert!(TileFootprint::for_cpu_rgba(0, 1, 0).is_err());
+    assert!(TileFootprint::rgba_texture_bytes(u32::MAX, u32::MAX).is_err());
+
+    let level = LevelInfo {
+        index: LevelIndex::from_u32(7),
+        width: 1,
+        height: 1,
+        downsample: 1.0,
+        tile_layout: dicom_viewer_core::LevelTileLayout::Regular {
+            tile_width: 1,
+            tile_height: 1,
+            tiles_across: 1,
+            tiles_down: 1,
+        },
+    };
+    assert!(TileFootprint::for_level_tile(&level, TileCoord::new(1, 0)).is_err());
 }
 
 #[test]
@@ -142,8 +186,8 @@ fn tile_texture_preflight_fails_closed_on_coordinate_arithmetic_overflow() {
         },
     };
 
-    let error = planned_texture_bytes(&level, TileCoord::new(u64::MAX, 0)).unwrap_err();
-    assert!(error.contains("overflow"), "{error}");
+    let error = TileFootprint::for_level_tile(&level, TileCoord::new(u64::MAX, 0)).unwrap_err();
+    assert!(error.to_string().contains("overflow"), "{error}");
 }
 
 #[test]

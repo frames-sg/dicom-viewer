@@ -21,10 +21,14 @@ wsi-rs = { workspace = true }
 thiserror = { workspace = true }
 lcms2 = { workspace = true }
 sha2 = { workspace = true }
+uuid = { workspace = true }
+geo = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+wsi-dicom-annotations = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 j2k-metal-support = { workspace = true }
-metal = { workspace = true }
 wsi-rs = { workspace = true, features = ["metal"] }
 
 [dev-dependencies]

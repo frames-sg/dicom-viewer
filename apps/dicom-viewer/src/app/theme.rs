@@ -83,3 +83,22 @@ pub(super) fn install_visuals(ctx: &egui::Context) {
 
     ctx.set_global_style(style);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn installed_visuals_keep_the_research_viewer_palette_and_spacing() {
+        let context = egui::Context::default();
+
+        install_visuals(&context);
+
+        let style = context.global_style();
+        assert!(style.visuals.dark_mode);
+        assert_eq!(style.visuals.panel_fill, CHROME);
+        assert_eq!(style.visuals.selection.bg_fill, AMBER_GLOW);
+        assert_eq!(style.spacing.item_spacing, vec2(8.0, 7.0));
+        assert_eq!(style.spacing.interact_size.y, 26.0);
+    }
+}

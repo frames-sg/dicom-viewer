@@ -9,8 +9,8 @@ use super::upload::{
     BudgetedUploadOutcome, RegisteredTileTexture, TileUploadError, TileUploadSink,
 };
 use super::{
-    is_stale_job, loader::TileReadMode, DecodedTile, TileFailureInfo, TileKey, TileLoadOutcome,
-    TileLoadResult, VisibleTile,
+    is_stale_job, loader::TileReadMode, DecodedTile, TileFailureInfo, TileFootprint, TileKey,
+    TileLoadOutcome, TileLoadResult, VisibleTile,
 };
 
 #[cfg(test)]
@@ -355,27 +355,27 @@ impl TileStore {
                         return false;
                     }
                 };
-                if cost.decoded_bytes > self.max_resident_bytes {
+                if cost.decoded_source_bytes() > self.max_resident_bytes {
                     self.record_terminal_failure(
                         result.key,
                         format!(
                             "decoded allocation requires {} bytes, exceeding the {}-byte viewer ceiling",
-                            cost.decoded_bytes, self.max_resident_bytes
+                            cost.decoded_source_bytes(), self.max_resident_bytes
                         ),
                     );
                     return false;
                 }
-                if cost.upload_peak_bytes > self.max_resident_bytes {
+                if cost.peak_upload_bytes() > self.max_resident_bytes {
                     self.record_terminal_failure(
                         result.key,
                         format!(
                             "upload requires {} source-plus-texture bytes, exceeding the {}-byte viewer ceiling",
-                            cost.upload_peak_bytes, self.max_resident_bytes
+                            cost.peak_upload_bytes(), self.max_resident_bytes
                         ),
                     );
                     return false;
                 }
-                let byte_len = cost.decoded_bytes;
+                let byte_len = cost.decoded_source_bytes();
                 let last_used = self.next_use_generation();
                 let read_mode = match self.entries.get(&result.key) {
                     Some(TileState::Queued { read_mode } | TileState::Decoding { read_mode }) => {
@@ -465,14 +465,14 @@ impl TileStore {
                     continue;
                 }
             };
-            if cost.decoded_bytes != byte_len {
+            if cost.decoded_source_bytes() != byte_len {
                 self.record_terminal_failure(
                     key,
                     "decoded allocation changed before upload reservation".into(),
                 );
                 continue;
             }
-            if !self.evict_to_fit(cost.upload_peak_bytes) {
+            if !self.evict_to_fit(cost.peak_upload_bytes()) {
                 self.insert_entry(
                     key,
                     TileState::Decoded {
@@ -490,9 +490,9 @@ impl TileStore {
                 key,
                 TileState::Uploading {
                     read_mode,
-                    source_byte_len: cost.decoded_bytes,
-                    texture_byte_len: cost.texture_bytes,
-                    byte_len: cost.upload_peak_bytes,
+                    source_byte_len: cost.decoded_source_bytes(),
+                    texture_byte_len: cost.final_texture_bytes(),
+                    byte_len: cost.peak_upload_bytes(),
                     last_used,
                 },
             );
@@ -549,15 +549,7 @@ impl TileStore {
             match upload {
                 BudgetedUploadOutcome::Ready(texture) => {
                     let (width, height) = texture.dimensions();
-                    let byte_len = usize::try_from(width)
-                        .ok()
-                        .and_then(|width| {
-                            usize::try_from(height)
-                                .ok()
-                                .and_then(|height| width.checked_mul(height))
-                        })
-                        .and_then(|pixels| pixels.checked_mul(4));
-                    let Some(byte_len) = byte_len else {
+                    let Ok(byte_len) = TileFootprint::rgba_texture_bytes(width, height) else {
                         self.record_terminal_failure(
                             key,
                             format!("uploaded texture dimensions {width}x{height} overflow bytes"),
@@ -594,8 +586,8 @@ impl TileStore {
                 BudgetedUploadOutcome::Deferred(tile) => {
                     let cost = match tile.memory_cost() {
                         Ok(cost)
-                            if cost.decoded_bytes == source_byte_len
-                                && cost.texture_bytes == texture_byte_len =>
+                            if cost.decoded_source_bytes() == source_byte_len
+                                && cost.final_texture_bytes() == texture_byte_len =>
                         {
                             cost
                         }
@@ -619,7 +611,7 @@ impl TileStore {
                         TileState::Decoded {
                             tile,
                             read_mode,
-                            byte_len: cost.decoded_bytes,
+                            byte_len: cost.decoded_source_bytes(),
                             last_used,
                         },
                     );

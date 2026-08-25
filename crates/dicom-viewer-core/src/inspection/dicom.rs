@@ -173,7 +173,7 @@ pub(crate) fn open_metadata_object(path: &Path) -> Result<DefaultDicomObject> {
             source,
         })?;
     OpenFileOptions::new()
-        .read_until(tags::PIXEL_DATA)
+        .read_until(tags::FLOAT_PIXEL_DATA)
         .read_preamble(ReadPreamble::Always)
         .from_reader(file)
         .map_err(|source| ViewerError::DicomRead {
@@ -371,7 +371,7 @@ fn preflight_data_set(
         })?;
         match token {
             LazyDataToken::ElementHeader(header) => {
-                if header.tag == tags::PIXEL_DATA {
+                if is_pixel_value(header.tag) {
                     return Ok(());
                 }
                 if header.len.0 > MAX_METADATA_ELEMENT_BYTES {
@@ -396,7 +396,7 @@ fn preflight_data_set(
                 }
             }
             LazyDataToken::SequenceStart { tag, .. } => {
-                if tag == tags::PIXEL_DATA {
+                if is_pixel_value(tag) {
                     return Ok(());
                 }
                 sequence_depth = sequence_depth.saturating_add(1);
@@ -434,6 +434,13 @@ fn preflight_data_set(
         ));
     }
     Ok(())
+}
+
+fn is_pixel_value(tag: Tag) -> bool {
+    matches!(
+        tag,
+        tags::FLOAT_PIXEL_DATA | tags::DOUBLE_FLOAT_PIXEL_DATA | tags::PIXEL_DATA
+    )
 }
 
 fn read_metadata_exact(
@@ -503,18 +510,6 @@ fn inspect_dicom_instance(path: &Path) -> Result<Option<(DicomInstanceSummary, O
     )))
 }
 
-fn optional_string(obj: &DefaultDicomObject, tag: Tag) -> Option<String> {
-    obj.get(tag)
-        .and_then(|element| element.to_str().ok())
-        .map(|value| value.trim_end_matches('\0').trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-fn optional_u32(obj: &DefaultDicomObject, tag: Tag) -> Option<u32> {
-    obj.get(tag)
-        .and_then(|element| element.to_int::<u32>().ok())
-}
-
 fn optional_spacing(obj: &DefaultDicomObject) -> Option<(f64, f64)> {
     let spacing = obj
         .get(tags::PIXEL_SPACING)
@@ -524,6 +519,20 @@ fn optional_spacing(obj: &DefaultDicomObject) -> Option<(f64, f64)> {
     } else {
         None
     }
+}
+
+fn optional_string(object: &DefaultDicomObject, tag: Tag) -> Option<String> {
+    object
+        .get(tag)
+        .and_then(|element| element.to_str().ok())
+        .map(|value| value.trim_end_matches('\0').trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn optional_u32(object: &DefaultDicomObject, tag: Tag) -> Option<u32> {
+    object
+        .get(tag)
+        .and_then(|element| element.to_int::<u32>().ok())
 }
 
 pub(crate) fn build_fact_warnings(
@@ -615,3 +624,7 @@ fn file_name_display(path: &Path) -> String {
         .and_then(|name| name.to_str())
         .map_or_else(|| path.display().to_string(), str::to_string)
 }
+
+#[cfg(test)]
+#[path = "dicom_tests.rs"]
+mod tests;

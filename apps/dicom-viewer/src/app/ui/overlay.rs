@@ -340,12 +340,96 @@ fn fmt_zoom(zoom: f32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::should_draw_tile_failure;
+    use super::*;
+    use crate::app::tests::{run_ui, summary};
 
     #[test]
     fn tile_failure_details_are_visible_only_with_diagnostics_enabled() {
         assert!(!should_draw_tile_failure(true, false));
         assert!(should_draw_tile_failure(true, true));
         assert!(!should_draw_tile_failure(false, true));
+    }
+
+    #[test]
+    fn frame_statistics_reject_invalid_samples_and_track_display_rate() {
+        let mut stats = FrameStats::default();
+        stats.record(0.0, f32::NAN);
+        assert!(stats.info().is_none());
+
+        stats.record(1.0 / 60.0, 1.0 / 120.0);
+        stats.record(1.0 / 30.0, 1.0 / 60.0);
+        let info = stats
+            .info()
+            .expect("valid samples should produce frame-rate info");
+        assert!(info.fps > 50.0 && info.fps < 60.0);
+        assert!(info.display_fps >= info.fps);
+    }
+
+    #[test]
+    fn overlay_paints_empty_loaded_and_diagnostic_states() {
+        let mut study = summary();
+        study.mpp = Some((0.25, 0.25));
+        let failure = TileFailureInfo {
+            count: 2,
+            latest: "decode failed after a deliberately long diagnostic message".into(),
+        };
+        let output = run_ui(|ui| {
+            let rect = ui.available_rect_before_wrap();
+            let painter = ui.painter_at(rect);
+            paint_canvas_background(&painter, rect);
+            paint_empty_state(&painter, rect, false);
+            paint_empty_state(&painter, rect, true);
+            draw_canvas_overlays(
+                &painter,
+                rect,
+                OverlayInfo {
+                    summary: &study,
+                    zoom: 0.25,
+                    frame_rate: Some(FrameRateInfo {
+                        fps: 45.0,
+                        display_fps: 60.0,
+                    }),
+                    hover_base: Some(vec2(10.0, 20.0)),
+                    tile_failure: Some(&failure),
+                    debug_stats: Some("ready=3 pending=1"),
+                },
+            );
+        });
+        assert!(output.shapes.len() > 10);
+    }
+
+    #[test]
+    fn overlay_formatting_handles_scale_and_diagnostic_boundaries() {
+        assert_eq!(truncate_text("short", 10), "short");
+        assert_eq!(truncate_text("abcdef", 3), "abc...");
+        assert_eq!(nice_round(f32::NAN), 1.0);
+        assert_eq!(nice_round(14.0), 10.0);
+        assert_eq!(nice_round(24.0), 20.0);
+        assert_eq!(nice_round(54.0), 50.0);
+        assert_eq!(nice_round(84.0), 100.0);
+        assert_eq!(fmt_zoom(1.0), "100%");
+        assert_eq!(fmt_zoom(0.05), "5.0%");
+        assert_eq!(fmt_zoom(0.005), "0.50%");
+        assert_eq!(
+            fps_color(FrameRateInfo {
+                fps: 60.0,
+                display_fps: 60.0,
+            }),
+            theme::GREEN
+        );
+        assert_eq!(
+            fps_color(FrameRateInfo {
+                fps: 50.0,
+                display_fps: 60.0,
+            }),
+            theme::WARN
+        );
+        assert_eq!(
+            fps_color(FrameRateInfo {
+                fps: 20.0,
+                display_fps: 60.0,
+            }),
+            theme::TEXT_MUTED
+        );
     }
 }

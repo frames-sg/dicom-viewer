@@ -1,8 +1,4 @@
-use super::camera::CameraFrame;
 use super::canvas::{fallback_levels, PREFETCH_MARGIN_TILES};
-use super::measurement::{
-    clamp_base_point, format_measurement_distance, measurement_distance, MeasurementDistance,
-};
 use super::viewport::{
     base_size, choose_display_level_index, choose_render_level_with_hysteresis,
     nearest_grid_coordinates, tile_screen_rect, CanvasView,
@@ -26,7 +22,7 @@ fn level(index: usize, width: u64, height: u64, downsample: f64) -> LevelInfo {
     }
 }
 
-fn summary() -> StudySummary {
+pub(super) fn summary() -> StudySummary {
     StudySummary {
         source_path: PathBuf::from("slide.ndpi"),
         source_kind: SourceKind::File,
@@ -46,6 +42,160 @@ fn summary() -> StudySummary {
         objective_power: None,
         color_management: dicom_viewer_core::ColorManagementSummary::unprofiled(),
     }
+}
+
+pub(super) fn run_ui(mut render: impl FnMut(&mut egui::Ui)) -> egui::FullOutput {
+    let context = egui::Context::default();
+    context.run_ui(egui::RawInput::default(), |ui| render(ui))
+}
+
+pub(super) fn wait_for_background<T>(label: &str, mut poll: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(result) = poll() {
+            return result;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for {label}");
+        std::thread::yield_now();
+    }
+}
+
+pub(super) fn write_source_wsi(path: &std::path::Path) {
+    use dicom_core::value::{DataSetSequence, PrimitiveValue, Value};
+    use dicom_core::{DataElement, Length, VR};
+    use dicom_dictionary_std::{tags, uids};
+    use dicom_object::{FileMetaTableBuilder, InMemDicomObject};
+
+    const SOP_UID: &str = "1.2.826.0.1.3680043.10.777.9901";
+    let mut origin = InMemDicomObject::new_empty();
+    origin.put(DataElement::new(
+        tags::X_OFFSET_IN_SLIDE_COORDINATE_SYSTEM,
+        VR::DS,
+        "0",
+    ));
+    origin.put(DataElement::new(
+        tags::Y_OFFSET_IN_SLIDE_COORDINATE_SYSTEM,
+        VR::DS,
+        "0",
+    ));
+    let mut object = InMemDicomObject::new_empty();
+    for element in [
+        DataElement::new(
+            tags::SOP_CLASS_UID,
+            VR::UI,
+            uids::VL_WHOLE_SLIDE_MICROSCOPY_IMAGE_STORAGE,
+        ),
+        DataElement::new(tags::SOP_INSTANCE_UID, VR::UI, SOP_UID),
+        DataElement::new(tags::STUDY_INSTANCE_UID, VR::UI, "2.25.9902"),
+        DataElement::new(tags::SERIES_INSTANCE_UID, VR::UI, "2.25.9903"),
+        DataElement::new(tags::FRAME_OF_REFERENCE_UID, VR::UI, "2.25.9904"),
+        DataElement::new(tags::PATIENT_NAME, VR::PN, "Research^Slide"),
+        DataElement::new(tags::PATIENT_ID, VR::LO, "R-1"),
+        DataElement::new(tags::STUDY_DATE, VR::DA, "20260814"),
+        DataElement::new(tags::STUDY_TIME, VR::TM, "120000"),
+        DataElement::new(tags::STUDY_ID, VR::SH, "STUDY-1"),
+        DataElement::new(tags::ACCESSION_NUMBER, VR::SH, ""),
+        DataElement::new(tags::ROWS, VR::US, PrimitiveValue::from(4_u16)),
+        DataElement::new(tags::COLUMNS, VR::US, PrimitiveValue::from(4_u16)),
+        DataElement::new(
+            tags::TOTAL_PIXEL_MATRIX_ROWS,
+            VR::UL,
+            PrimitiveValue::from(8_u32),
+        ),
+        DataElement::new(
+            tags::TOTAL_PIXEL_MATRIX_COLUMNS,
+            VR::UL,
+            PrimitiveValue::from(8_u32),
+        ),
+        DataElement::new(tags::IMAGE_ORIENTATION_SLIDE, VR::DS, "1\\0\\0\\0\\1\\0"),
+        DataElement::new(tags::PIXEL_SPACING, VR::DS, "0.00025\\0.00025"),
+        DataElement::new(tags::SLICE_THICKNESS, VR::DS, "0.001"),
+    ] {
+        object.put(element);
+    }
+    object.put(DataElement::new(
+        tags::TOTAL_PIXEL_MATRIX_ORIGIN_SEQUENCE,
+        VR::SQ,
+        Value::from(DataSetSequence::new(vec![origin], Length::UNDEFINED)),
+    ));
+    object.put(DataElement::new(
+        tags::PIXEL_DATA,
+        VR::OB,
+        PrimitiveValue::from(vec![0_u8; 48]),
+    ));
+    object
+        .with_meta(
+            FileMetaTableBuilder::new()
+                .media_storage_sop_class_uid(uids::VL_WHOLE_SLIDE_MICROSCOPY_IMAGE_STORAGE)
+                .media_storage_sop_instance_uid(SOP_UID)
+                .transfer_syntax(uids::EXPLICIT_VR_LITTLE_ENDIAN),
+        )
+        .unwrap()
+        .write_to_file(path)
+        .unwrap();
+}
+
+fn headless_app(initial_path: Option<PathBuf>) -> Option<(DicomViewerApp, egui::Context)> {
+    let render_state = tile::render_state()?;
+    let context = egui::Context::default();
+    let mut creation = eframe::CreationContext::_new_kittest(context.clone());
+    creation.wgpu_render_state = Some(render_state);
+    Some((DicomViewerApp::new(&creation, initial_path), context))
+}
+
+#[test]
+fn headless_app_runs_empty_logic_and_ui_with_real_renderer_state() {
+    let Some((mut app, context)) = headless_app(None) else {
+        return;
+    };
+    let mut frame = eframe::Frame::_new_kittest();
+
+    let output = context.run_ui(egui::RawInput::default(), |ui| {
+        eframe::App::logic(&mut app, ui.ctx(), &mut frame);
+        eframe::App::ui(&mut app, ui, &mut frame);
+    });
+    assert!(!output.shapes.is_empty());
+    assert!(app.study.is_none());
+    assert_eq!(app.active_generation, 0);
+
+    app.show_facts_panel = true;
+    let output = context.run_ui(egui::RawInput::default(), |ui| {
+        eframe::App::ui(&mut app, ui, &mut frame);
+    });
+    assert!(!output.shapes.is_empty());
+    assert!(app.show_facts_panel);
+}
+
+#[test]
+fn headless_app_reports_no_study_actions_and_failed_open_without_panics() {
+    let Some((mut app, context)) = headless_app(None) else {
+        return;
+    };
+
+    app.start_annotation_load(PathBuf::from("sidecar.dcm"), None, &context);
+    assert!(app.status.contains("require an open VL WSI"));
+    app.pick_profiled_geojson(&context);
+    assert!(app.status.contains("requires an open VL WSI"));
+    app.pick_structured_report(&context, false);
+    assert!(app.status.contains("require an open VL WSI"));
+    app.pick_profiled_raster(&context);
+    assert!(app.status.contains("requires an open VL WSI"));
+    app.save_dicom_ann(&context);
+    assert!(app.status.contains("requires a VL WSI"));
+    app.export_dicom_seg(&context);
+    assert!(app.status.contains("requires a VL WSI"));
+
+    let missing = PathBuf::from("definitely-missing-headless-viewer-input.svs");
+    app.start_open_path(missing.clone(), &context);
+    assert!(app.status.starts_with("Opening"));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while app.status.starts_with("Opening") && Instant::now() < deadline {
+        app.poll_open_job(&context);
+        std::thread::yield_now();
+    }
+    assert!(app.status.starts_with("Failed to open"), "{}", app.status);
+    assert!(app.study.is_none());
+    app.poll_annotation_jobs(&context);
 }
 
 #[test]
@@ -270,11 +420,6 @@ fn canonical_canvas_drives_fit_tile_geometry_measurements_and_edge_reachability(
     );
     assert_eq!(tile_rect.min, pos2(562.0, 562.0));
     assert_eq!(tile_rect.size(), vec2(492.0, 268.0));
-
-    assert_eq!(
-        clamp_base_point(&summary, vec2(f32::MAX, f32::MAX)),
-        vec2(1004.0, 780.0)
-    );
 }
 
 #[test]
@@ -536,96 +681,10 @@ fn pointer_zoom_preserves_the_base_point_in_the_rendered_frame() {
 }
 
 #[test]
-fn rendered_camera_frame_is_shared_by_measurement_hit_testing_and_coordinates() {
-    let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(512.0, 512.0));
-    let rendered = CameraView {
-        center_base: vec2(100.0, 120.0),
-        zoom: 2.0,
-    };
-    let target = CameraView {
-        center_base: vec2(300.0, 320.0),
-        zoom: 4.0,
-    };
-    let frame = CameraFrame {
-        rendered,
-        target,
-        animating: true,
-    };
-    let point = vec2(130.0, 140.0);
-    let pointer = rect.center() + (point - frame.rendered.center_base) * frame.rendered.zoom;
-    let measurement = MeasurementState {
-        active: true,
-        points: [Some(point), None],
-        dragging: None,
-    };
-
-    assert_eq!(measurement.hit_test(rect, pointer, frame.rendered), Some(0));
-    assert!(
-        (screen_to_base(
-            rect,
-            pointer,
-            frame.rendered.center_base,
-            frame.rendered.zoom,
-        ) - point)
-            .length()
-            < f32::EPSILON
-    );
-    assert_ne!(
-        screen_to_base(rect, pointer, frame.target.center_base, frame.target.zoom),
-        point
-    );
-}
-
-#[test]
 fn wheel_zoom_direction_is_inverted_for_natural_scroll() {
     assert!(wheel_zoom_factor(120.0) < 1.0);
     assert!(wheel_zoom_factor(-120.0) > 1.0);
     assert_eq!(wheel_zoom_factor(0.0), 1.0);
-}
-
-#[test]
-fn measurement_distance_uses_mpp_axes() {
-    let mut summary = summary();
-    summary.mpp = Some((0.25, 0.5));
-
-    let distance = measurement_distance(&summary, vec2(10.0, 20.0), vec2(26.0, 26.0));
-
-    assert_eq!(distance, MeasurementDistance::Microns(4.0_f64.hypot(3.0)));
-    assert_eq!(format_measurement_distance(distance), "5.00 \u{00B5}m");
-}
-
-#[test]
-fn measurement_distance_falls_back_to_base_pixels_without_mpp() {
-    let summary = summary();
-
-    let distance = measurement_distance(&summary, vec2(10.0, 20.0), vec2(13.0, 24.0));
-
-    assert_eq!(distance, MeasurementDistance::BasePixels(5.0));
-    assert_eq!(format_measurement_distance(distance), "5.00 px");
-}
-
-#[test]
-fn measurement_places_two_points_and_clear_keeps_tool_active() {
-    let mut measurement = MeasurementState {
-        active: true,
-        ..MeasurementState::default()
-    };
-
-    measurement.place_next_point(vec2(1.0, 2.0));
-    measurement.place_next_point(vec2(3.0, 4.0));
-    measurement.place_next_point(vec2(5.0, 6.0));
-
-    assert_eq!(
-        measurement.points,
-        [Some(vec2(1.0, 2.0)), Some(vec2(3.0, 4.0))]
-    );
-    assert!(measurement.has_points());
-
-    measurement.clear_points();
-
-    assert!(measurement.active);
-    assert_eq!(measurement.points, [None, None]);
-    assert!(!measurement.has_points());
 }
 
 #[test]

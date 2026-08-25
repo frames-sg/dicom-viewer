@@ -8,7 +8,7 @@ use dicom_viewer_core::ColorLut3d;
 use dicom_viewer_core::{RgbaTile, ViewerOpenOptions};
 use eframe::{egui, egui_wgpu, wgpu};
 
-use super::DecodedTile;
+use super::{DecodedTile, TileFootprint};
 
 #[cfg(target_os = "macos")]
 // Keep the renderer copy bound aligned with the process-wide ICC proof cache.
@@ -403,10 +403,8 @@ impl WgpuTileUploader {
                     }
                     DecodedTile::Cpu(tile) => {
                         let started = Instant::now();
-                        let result = prepare_and_register_cpu(
-                            || prepare_cpu_texture(&device, &queue, tile),
-                            |texture| self.register(texture),
-                        );
+                        let result = prepare_cpu_texture(&device, &queue, tile)
+                            .map(|texture| self.register(texture));
                         cpu_elapsed = cpu_elapsed.saturating_add(started.elapsed());
                         cpu_uploads = cpu_uploads.saturating_add(1);
                         match result {
@@ -696,34 +694,12 @@ fn create_color_lut_texture(
     texture
 }
 
-#[cfg(test)]
-fn upload_batch_needs_encoder(tiles: &[DecodedTile]) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        tiles
-            .iter()
-            .any(|tile| matches!(tile, DecodedTile::Metal(_)))
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = tiles;
-        false
-    }
-}
-
 struct PreparedTexture {
     texture: wgpu::Texture,
     width: u32,
     height: u32,
     #[cfg(target_os = "macos")]
     _color_lut_owner: Option<Arc<wgpu::Texture>>,
-}
-
-fn prepare_and_register_cpu<Prepared, Registered, Error>(
-    prepare: impl FnOnce() -> Result<Prepared, Error>,
-    register: impl FnOnce(Prepared) -> Registered,
-) -> Result<Registered, Error> {
-    prepare().map(register)
 }
 
 fn prepare_cpu_texture(
@@ -742,11 +718,8 @@ fn prepare_cpu_texture(
         device.limits().max_texture_dimension_2d,
     )
     .map_err(TileUploadError::InvalidCpuTile)?;
-    let expected = usize::try_from(tile.width)
-        .ok()
-        .and_then(|width| width.checked_mul(tile.height as usize))
-        .and_then(|pixels| pixels.checked_mul(4))
-        .ok_or(TileUploadError::InvalidCpuTile("RGBA byte size overflows"))?;
+    let expected = TileFootprint::rgba_texture_bytes(tile.width, tile.height)
+        .map_err(|_| TileUploadError::InvalidCpuTile("RGBA byte size overflows"))?;
     if tile.rgba.len() != expected {
         return Err(TileUploadError::InvalidCpuTile(
             "pixel byte count does not match dimensions",
@@ -899,7 +872,7 @@ fn conversion_pipeline(
 }
 
 #[cfg(test)]
-pub(super) fn render_state() -> Option<egui_wgpu::RenderState> {
+pub(in crate::app) fn render_state() -> Option<egui_wgpu::RenderState> {
     let descriptor = wgpu::InstanceDescriptor {
         #[cfg(target_os = "macos")]
         backends: wgpu::Backends::METAL,
@@ -929,7 +902,6 @@ pub(super) fn render_state() -> Option<egui_wgpu::RenderState> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
     use std::sync::{mpsc, Arc};
 
     use super::*;
@@ -945,24 +917,6 @@ mod tests {
             validate_texture_dimensions(1, 4097, 4096),
             Err("height exceeds the renderer texture limit")
         );
-    }
-
-    #[test]
-    fn cpu_upload_unit_completes_registration_inside_the_budgeted_operation() {
-        let events = RefCell::new(Vec::new());
-        let result = prepare_and_register_cpu(
-            || {
-                events.borrow_mut().push("prepare");
-                Ok::<_, ()>(7_u8)
-            },
-            |prepared| {
-                events.borrow_mut().push("register");
-                prepared + 1
-            },
-        );
-
-        assert_eq!(result, Ok(8));
-        assert_eq!(*events.borrow(), ["prepare", "register"]);
     }
 
     fn read_texture(
@@ -1045,16 +999,6 @@ mod tests {
         );
         drop(uploaded);
         assert!(renderer.read().texture(&id).is_none());
-    }
-
-    #[test]
-    fn empty_and_cpu_only_batches_need_no_command_encoder() {
-        assert!(!upload_batch_needs_encoder(&[]));
-        assert!(!upload_batch_needs_encoder(&[DecodedTile::Cpu(RgbaTile {
-            width: 1,
-            height: 1,
-            rgba: vec![0, 0, 0, 255],
-        })]));
     }
 
     #[test]

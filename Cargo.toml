@@ -5,7 +5,7 @@ members = [
     "crates/dicom-viewer-core",
     "crates/metal-wgpu-interop",
 ]
-exclude = ["vendor/wayland-scanner"]
+exclude = ["vendor/lru", "vendor/wayland-scanner"]
 
 [workspace.package]
 edition = "2021"
@@ -23,6 +23,7 @@ dicom-transfer-syntax-registry = { version = "0.9", default-features = false }
 eframe = { version = "0.34.2", default-features = false, features = [
     "accesskit",
     "default_fonts",
+    "persistence",
     "wayland",
     "wgpu",
     "x11",
@@ -30,26 +31,30 @@ eframe = { version = "0.34.2", default-features = false, features = [
 egui-wgpu = "0.34.3"
 wgpu = "29.0.3"
 wgpu-hal = "29.0.3"
-metal = "0.33"
 objc2 = "0.6.4"
 objc2-metal = "0.3.2"
-foreign-types = "0.5"
-j2k-core = "=0.8.0"
-j2k-metal-support = "=0.8.0"
-j2k-native = "=0.8.0"
+j2k-core = { version = "0.10.0", git = "https://github.com/frames-sg/j2k.git", rev = "57b6af89c61f25e1a476415ef3a752f6d1b3f057" }
+j2k-metal-support = { version = "0.10.0", git = "https://github.com/frames-sg/j2k.git", rev = "57b6af89c61f25e1a476415ef3a752f6d1b3f057" }
+j2k-native = { version = "0.10.0", git = "https://github.com/frames-sg/j2k.git", rev = "57b6af89c61f25e1a476415ef3a752f6d1b3f057" }
 pollster = "0.4"
 rfd = "0.17.2"
 serde_json = "1"
-wsi-rs = "=0.5.2"
+serde = { version = "1", features = ["derive", "rc"] }
+wsi-rs = { version = "0.6.0", git = "https://github.com/frames-sg/wsi-rs.git", rev = "b940ea94f3290e54ca2c5f87823109538709c59d" }
 tempfile = "3"
 thiserror = "2"
 lcms2 = { version = "6.1.1", features = ["static"] }
 sha2 = "0.10"
+uuid = { version = "1", features = ["serde", "v4"] }
+geo = { version = "0.33.1", default-features = false }
+rstar = "0.12.2"
+peak_alloc = "0.3"
+wsi-dicom-annotations = { version = "=0.1.0", path = "../wsi-dicom-annotations" }
 
-# Temporary security patch for RUSTSEC-2026-0194 and RUSTSEC-2026-0195.
-# Remove this override after wayland-scanner publishes a release requiring
-# quick-xml >= 0.41. See vendor/wayland-scanner/SECURITY-PATCH.md.
+# Temporary security patches for advisories without compatible upstream
+# releases. See each vendored crate's SECURITY-PATCH.md for removal criteria.
 [patch.crates-io]
+lru = { path = "vendor/lru" }
 wayland-scanner = { path = "vendor/wayland-scanner" }
 
 [profile.release]

@@ -327,6 +327,35 @@ fn metadata_preflight_stops_before_pixel_data() {
 }
 
 #[test]
+fn metadata_preflight_stops_before_float_and_double_float_pixel_data() {
+    for (name, tag, vr) in [
+        ("float", tags::FLOAT_PIXEL_DATA, b"OF"),
+        ("double", tags::DOUBLE_FLOAT_PIXEL_DATA, b"OD"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("{name}-map.dcm"));
+        write_test_dicom(
+            &path,
+            "1.2.826.0.1.3680043.10.777.1010",
+            "1.2.826.0.1.3680043.10.777",
+        );
+        let mut bytes = std::fs::read(&path).unwrap();
+        let pixel_header = [0xE0, 0x7F, 0x10, 0x00, b'O', b'B', 0, 0];
+        let pixel_offset = bytes
+            .windows(pixel_header.len())
+            .position(|candidate| candidate == pixel_header)
+            .expect("test DICOM should contain explicit-VR Pixel Data");
+        bytes[pixel_offset + 2..pixel_offset + 4].copy_from_slice(&tag.element().to_le_bytes());
+        bytes[pixel_offset + 4..pixel_offset + 6].copy_from_slice(vr);
+        std::fs::write(&path, bytes).unwrap();
+
+        let object = open_metadata_object(&path).unwrap();
+
+        assert!(object.get(tag).is_none());
+    }
+}
+
+#[test]
 fn metadata_preflight_rejects_an_oversized_declared_value_before_allocating_it() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("oversized-metadata.dcm");
@@ -554,7 +583,7 @@ fn existing_rgba_api_remains_cpu_resident_with_render_options() {
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_metal_options_return_resident_tiles_for_synthetic_dicom_htj2k() {
-    let Some(device) = metal::Device::system_default() else {
+    let Ok(device) = j2k_metal_support::system_default_device() else {
         return;
     };
     let dir = tempfile::tempdir().unwrap();
@@ -640,7 +669,7 @@ fn cuda_viewer_download_matches_strict_cpu_for_synthetic_dicom_htj2k() {
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_metal_options_keep_adaptive_routing_for_non_dicom_sources() {
-    let Some(device) = metal::Device::system_default() else {
+    let Ok(device) = j2k_metal_support::system_default_device() else {
         return;
     };
     let dir = tempfile::tempdir().unwrap();

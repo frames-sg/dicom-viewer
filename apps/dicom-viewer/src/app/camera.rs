@@ -27,6 +27,12 @@ pub(super) struct CameraView {
     pub(super) zoom: f32,
 }
 
+impl CameraView {
+    pub(super) fn base_to_screen(self, rect: Rect, base: Vec2) -> egui::Pos2 {
+        rect.center() + (base - self.center_base) * self.zoom.max(MIN_ZOOM)
+    }
+}
+
 impl Default for CameraView {
     fn default() -> Self {
         Self {
@@ -139,6 +145,17 @@ impl CameraState {
         self.fit_pending = true;
         self.fit_mode = true;
         self.last_canvas_size = None;
+    }
+
+    pub(super) fn center_on_base_bounds(&mut self, bounds: [f64; 4]) {
+        let center = Vec2::new(
+            ((bounds[0] + bounds[2]) * 0.5) as f32,
+            ((bounds[1] + bounds[3]) * 0.5) as f32,
+        );
+        if center.is_finite() {
+            self.leave_fit_mode();
+            self.target.center_base = center;
+        }
     }
 
     pub(super) fn prepare_canvas(&mut self, rect: Rect, summary: &StudySummary) {

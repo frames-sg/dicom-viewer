@@ -1,6 +1,8 @@
 use std::error::Error as StdError;
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use wsi_rs::{PlaneIdx, SceneId, SeriesId, Slide, TileOutputPreference};
 
 pub type Result<T> = std::result::Result<T, ViewerError>;
@@ -24,8 +26,16 @@ pub enum ViewerError {
         #[source]
         source: Box<dyn StdError + Send + Sync>,
     },
+    #[error("DICOM write error at {path}: {source}")]
+    DicomWrite {
+        path: PathBuf,
+        #[source]
+        source: Box<dyn StdError + Send + Sync>,
+    },
     #[error("WSI read error: {0}")]
     Wsi(#[from] wsi_rs::WsiError),
+    #[error(transparent)]
+    Annotation(#[from] wsi_dicom_annotations::Error),
 }
 
 impl ViewerError {
@@ -40,11 +50,11 @@ impl ViewerError {
     pub fn is_cuda_download_failure(&self) -> bool {
         #[cfg(feature = "cuda")]
         {
-            return matches!(
+            matches!(
                 self,
                 Self::Wsi(wsi_rs::WsiError::Codec { codec, .. })
                     if matches!(*codec, "cuda-jpeg-download" | "cuda-j2k-download")
-            );
+            )
         }
         #[cfg(not(feature = "cuda"))]
         false
@@ -121,10 +131,91 @@ impl TileCoord {
 pub struct ViewerStudy {
     pub(crate) slide: Slide,
     pub(crate) summary: StudySummary,
+    pub(crate) annotation_context: Option<crate::DicomAnnotationContext>,
+    pub(crate) sidecars: Vec<crate::SidecarMetadata>,
     pub(crate) render_tile_output: TileOutputPreference,
     pub(crate) cpu_tile_output: TileOutputPreference,
     pub(crate) selected_view: SelectedView,
     pub(crate) color_management: crate::color::ColorManagement,
+}
+
+/// Path-free identity for one selected WSI scene, series, and Z/C/T plane.
+///
+/// The digest is safe to use as an application-data directory name. It does
+/// not contain the source path or patient-facing DICOM attributes.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ViewerSourceIdentity {
+    dataset_id: u128,
+    scene: usize,
+    series: usize,
+    z: u32,
+    c: u32,
+    t: u32,
+    dimensions: (u64, u64),
+    digest: String,
+}
+
+impl ViewerSourceIdentity {
+    pub fn new(
+        dataset_id: u128,
+        scene: usize,
+        series: usize,
+        z: u32,
+        c: u32,
+        t: u32,
+        dimensions: (u64, u64),
+    ) -> Self {
+        let mut digest = Sha256::new();
+        digest.update(b"dicom-viewer-source-identity-v1\0");
+        digest.update(dataset_id.to_le_bytes());
+        digest.update((scene as u64).to_le_bytes());
+        digest.update((series as u64).to_le_bytes());
+        digest.update(z.to_le_bytes());
+        digest.update(c.to_le_bytes());
+        digest.update(t.to_le_bytes());
+        digest.update(dimensions.0.to_le_bytes());
+        digest.update(dimensions.1.to_le_bytes());
+        Self {
+            dataset_id,
+            scene,
+            series,
+            z,
+            c,
+            t,
+            dimensions,
+            digest: format!("{:x}", digest.finalize()),
+        }
+    }
+
+    #[must_use]
+    pub const fn dataset_id(&self) -> u128 {
+        self.dataset_id
+    }
+
+    #[must_use]
+    pub const fn scene(&self) -> usize {
+        self.scene
+    }
+
+    #[must_use]
+    pub const fn series(&self) -> usize {
+        self.series
+    }
+
+    #[must_use]
+    pub const fn plane(&self) -> (u32, u32, u32) {
+        (self.z, self.c, self.t)
+    }
+
+    #[must_use]
+    pub const fn dimensions(&self) -> (u64, u64) {
+        self.dimensions
+    }
+
+    #[must_use]
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,7 +230,7 @@ pub struct ViewerOpenOptions {
     requested_tile_output: RequestedTileOutput,
     cache_budgets: ViewerCacheBudgets,
     #[cfg(target_os = "macos")]
-    metal_device: Option<metal::Device>,
+    metal_device: Option<wsi_rs::output::metal::MetalDevice>,
 }
 
 impl std::fmt::Debug for ViewerOpenOptions {
@@ -199,7 +290,7 @@ impl ViewerOpenOptions {
 
     #[cfg(target_os = "macos")]
     #[must_use]
-    pub fn with_metal_device(mut self, device: metal::Device) -> Self {
+    pub fn with_metal_device(mut self, device: wsi_rs::output::metal::MetalDevice) -> Self {
         self.metal_device = Some(device);
         self
     }
@@ -210,7 +301,7 @@ impl ViewerOpenOptions {
     }
 
     #[cfg(target_os = "macos")]
-    pub(crate) fn metal_device(&self) -> Option<&metal::Device> {
+    pub(crate) fn metal_device(&self) -> Option<&wsi_rs::output::metal::MetalDevice> {
         self.metal_device.as_ref()
     }
 }
@@ -594,3 +685,7 @@ fn bounded_tile_extent(value: f64) -> u32 {
     let rounded = value.ceil().max(1.0).min(f64::from(u32::MAX));
     rounded as u32
 }
+
+#[cfg(test)]
+#[path = "model_tests.rs"]
+mod tests;

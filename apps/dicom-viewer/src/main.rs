@@ -3,6 +3,7 @@
 mod app;
 
 const APP_TITLE: &str = "WSI Viewer — Research Use Only";
+const APP_ID: &str = "io.frames.dicom-viewer";
 
 fn main() -> eframe::Result<()> {
     let initial_path = std::env::args_os().nth(1).map(std::path::PathBuf::from);
@@ -27,6 +28,7 @@ fn native_options() -> eframe::NativeOptions {
 
     eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
+            .with_app_id(APP_ID)
             .with_title(APP_TITLE)
             .with_inner_size([1320.0, 880.0])
             .with_min_inner_size([900.0, 640.0]),
@@ -73,6 +75,7 @@ mod tests {
     fn native_viewer_is_explicitly_labeled_for_research_use() {
         assert!(APP_TITLE.contains("Research Use Only"));
         assert_eq!(native_options().viewport.title.as_deref(), Some(APP_TITLE));
+        assert_eq!(native_options().viewport.app_id.as_deref(), Some(APP_ID));
     }
 
     #[test]

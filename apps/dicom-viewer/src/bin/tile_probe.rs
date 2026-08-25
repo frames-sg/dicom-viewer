@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use dicom_viewer_core::{
-    LevelIndex, ReadControl, RenderTile, TileCoord, ViewerOpenOptions, ViewerStudy,
+    nearest_rank_percentile, LevelIndex, ReadControl, RenderTile, TileCoord, ViewerOpenOptions,
+    ViewerStudy,
 };
 
 const DEFAULT_TRIALS: usize = 3;
@@ -401,7 +402,7 @@ fn viewer_options(backend: RequestedBackend) -> ViewerOpenOptions {
         RequestedBackend::Auto => {
             let options = ViewerOpenOptions::auto();
             #[cfg(target_os = "macos")]
-            if let Some(device) = metal::Device::system_default() {
+            if let Ok(device) = j2k_metal_support::system_default_device() {
                 return options.with_metal_device(device);
             }
             options
@@ -468,21 +469,11 @@ fn distribution(values: impl IntoIterator<Item = f64>) -> Distribution {
         };
     }
     Distribution {
-        min: percentile(&values, 0.0),
-        p50: percentile(&values, 0.5),
-        p95: percentile(&values, 0.95),
-        max: percentile(&values, 1.0),
+        min: nearest_rank_percentile(&values, 0.0),
+        p50: nearest_rank_percentile(&values, 0.5),
+        p95: nearest_rank_percentile(&values, 0.95),
+        max: nearest_rank_percentile(&values, 1.0),
     }
-}
-
-fn percentile(values: &[f64], quantile: f64) -> f64 {
-    if values.is_empty() {
-        return 0.0;
-    }
-    let mut sorted = values.to_vec();
-    sorted.sort_by(f64::total_cmp);
-    let rank = (quantile.clamp(0.0, 1.0) * sorted.len() as f64).ceil() as usize;
-    sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
 }
 
 impl ProbeReport {
@@ -654,8 +645,46 @@ fn json_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+    use std::path::PathBuf;
+    use std::time::Instant;
 
-    use super::{centered_block, parse_arguments, percentile, ProbeApi, RequestedBackend};
+    use super::{
+        centered_block, count_render_outputs, distribution, elapsed_ms, expect_count, json_string,
+        nearest_rank_percentile, open_study, parse_arguments, run_probe, run_trial, viewer_options,
+        Arguments, LevelRecord, ProbeApi, ProbeReport, RequestedBackend, TrialRecord,
+    };
+    use dicom_viewer_core::{LevelIndex, RenderTile, RgbaTile};
+
+    fn report() -> ProbeReport {
+        ProbeReport {
+            path: PathBuf::from("slide\nname.svs"),
+            format: "Synthetic \"WSI\"".into(),
+            requested_backend: RequestedBackend::Cpu,
+            resolved_backend: "CPU".into(),
+            api: ProbeApi::ControlledRgba,
+            batch_size: 2,
+            initial_open_ms: 1.25,
+            levels: vec![LevelRecord {
+                index: LevelIndex::from_u32(0),
+                width: 1024,
+                height: 512,
+                downsample: 1.0,
+                cols: 2,
+                rows: 1,
+            }],
+            trials: vec![TrialRecord {
+                trial: 1,
+                level: LevelIndex::from_u32(0),
+                tiles: 2,
+                open_ms: 2.0,
+                prepare_ms: 3.0,
+                first_batch_ms: 4.0,
+                warm_batch_ms: 1.0,
+                cpu_outputs: 2,
+                metal_outputs: 0,
+            }],
+        }
+    }
 
     #[test]
     fn arguments_enable_json_and_repeated_trials() {
@@ -694,13 +723,72 @@ mod tests {
     }
 
     #[test]
+    fn arguments_cover_all_api_backend_and_usage_errors() {
+        for (value, expected) in [
+            ("controlled-render", ProbeApi::ControlledRender),
+            ("controlled-rgba", ProbeApi::ControlledRgba),
+            ("uncontrolled-rgba", ProbeApi::UncontrolledRgba),
+        ] {
+            assert_eq!(ProbeApi::parse(value), Ok(expected));
+            assert_eq!(expected.label(), value);
+        }
+        assert!(ProbeApi::parse("other").is_err());
+        assert_eq!(RequestedBackend::parse("auto"), Ok(RequestedBackend::Auto));
+        assert_eq!(RequestedBackend::parse("cpu"), Ok(RequestedBackend::Cpu));
+        assert!(RequestedBackend::parse("gpu").is_err());
+        assert_eq!(RequestedBackend::Auto.label(), "auto");
+        assert_eq!(RequestedBackend::Cpu.label(), "cpu");
+
+        for arguments in [
+            vec![],
+            vec!["--unknown"],
+            vec!["--trials"],
+            vec!["--trials", "0", "slide.svs"],
+            vec!["--trials", "x", "slide.svs"],
+            vec!["--api"],
+            vec!["--api", "bad", "slide.svs"],
+            vec!["--backend"],
+            vec!["--backend", "bad", "slide.svs"],
+            vec!["--batch-size"],
+            vec!["--batch-size", "x", "slide.svs"],
+            vec!["one.svs", "two.svs"],
+        ] {
+            assert!(
+                parse_arguments(arguments.into_iter().map(OsString::from)).is_err(),
+                "arguments should fail"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn valued_options_reject_non_utf8_without_guessing() {
+        use std::os::unix::ffi::OsStringExt;
+
+        for (option, expected) in [
+            ("--trials", "--trials must be valid UTF-8"),
+            ("--api", "--api must be valid UTF-8"),
+            ("--backend", "--backend must be valid UTF-8"),
+            ("--batch-size", "--batch-size must be valid UTF-8"),
+        ] {
+            let error = parse_arguments([
+                OsString::from(option),
+                OsString::from_vec(vec![0xff]),
+                OsString::from("slide.svs"),
+            ])
+            .unwrap_err();
+            assert_eq!(error, expected);
+        }
+    }
+
+    #[test]
     fn percentile_uses_nearest_rank_without_hiding_raw_samples() {
         let values = [40.0, 10.0, 30.0, 20.0, 50.0];
 
-        assert_eq!(percentile(&values, 0.0), 10.0);
-        assert_eq!(percentile(&values, 0.5), 30.0);
-        assert_eq!(percentile(&values, 0.95), 50.0);
-        assert_eq!(percentile(&[], 0.95), 0.0);
+        assert_eq!(nearest_rank_percentile(&values, 0.0), 10.0);
+        assert_eq!(nearest_rank_percentile(&values, 0.5), 30.0);
+        assert_eq!(nearest_rank_percentile(&values, 0.95), 50.0);
+        assert_eq!(nearest_rank_percentile(&[], 0.95), 0.0);
     }
 
     #[test]
@@ -711,5 +799,96 @@ mod tests {
         assert_eq!(first.len(), 8);
         assert_eq!(second.len(), 8);
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn centered_blocks_handle_empty_singleton_and_oversized_requests() {
+        assert!(centered_block(0, 4, 2, 0).is_empty());
+        assert!(centered_block(4, 0, 2, 0).is_empty());
+        assert!(centered_block(4, 4, 0, 0).is_empty());
+        assert_eq!(centered_block(1, 1, usize::MAX, 4).len(), 1);
+        assert_eq!(centered_block(2, 3, 99, 2).len(), 6);
+    }
+
+    #[test]
+    fn render_output_counting_preserves_cpu_residency_and_cardinality_errors() {
+        let level = LevelIndex::from_u32(3);
+        let tiles = vec![
+            RenderTile::Cpu(RgbaTile {
+                width: 1,
+                height: 1,
+                rgba: vec![1, 2, 3, 4],
+            }),
+            RenderTile::Cpu(RgbaTile {
+                width: 1,
+                height: 1,
+                rgba: vec![5, 6, 7, 8],
+            }),
+        ];
+        let counts = count_render_outputs(level, 2, tiles).expect("cardinality should match");
+        assert_eq!(counts.cpu, 2);
+        assert_eq!(counts.metal, 0);
+        assert!(expect_count(level, 2, 2).is_ok());
+        assert_eq!(
+            expect_count(level, 2, 1).expect_err("mismatch should fail"),
+            "batch at level 3 returned 1 tiles for 2 requests"
+        );
+    }
+
+    #[test]
+    fn distributions_reports_and_json_escaping_are_semantically_stable() {
+        let empty = distribution([]);
+        assert_eq!(
+            (empty.min, empty.p50, empty.p95, empty.max),
+            (0.0, 0.0, 0.0, 0.0)
+        );
+        let populated = distribution([4.0, 1.0, 3.0, 2.0]);
+        assert_eq!(
+            (populated.min, populated.p50, populated.p95, populated.max),
+            (1.0, 2.0, 4.0, 4.0)
+        );
+        assert!(elapsed_ms(Instant::now()) >= 0.0);
+        assert_eq!(
+            json_string("a\"b\\c\n\r\t\u{0001}"),
+            "\"a\\\"b\\\\c\\n\\r\\t\\u0001\""
+        );
+
+        let report = report();
+        let json: serde_json::Value =
+            serde_json::from_str(&report.to_json()).expect("report should be valid JSON");
+        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["levels"][0]["width"], 1024);
+        assert_eq!(json["trials"][0]["cpu_outputs"], 2);
+        assert_eq!(json["statistics"]["warm_batch_ms"]["p50"], 1.0);
+        report.print_human();
+    }
+
+    #[test]
+    fn probe_open_paths_return_contextual_errors_without_a_source() {
+        let missing = PathBuf::from("definitely-missing-tile-probe-input.svs");
+        assert!(open_study(&missing, RequestedBackend::Cpu).is_err());
+        assert!(run_trial(
+            &missing,
+            1,
+            LevelIndex::from_u32(0),
+            &[],
+            ProbeApi::ControlledRender,
+            RequestedBackend::Cpu,
+        )
+        .is_err());
+        let arguments = Arguments {
+            path: missing,
+            trials: 1,
+            json: true,
+            api: ProbeApi::ControlledRender,
+            backend: RequestedBackend::Auto,
+            batch_size: 1,
+        };
+        assert!(run_probe(&arguments).is_err());
+
+        let cpu = format!("{:?}", viewer_options(RequestedBackend::Cpu));
+        let auto = format!("{:?}", viewer_options(RequestedBackend::Auto));
+        assert!(cpu.contains("CpuOnly"));
+        assert!(auto.contains("Auto"));
     }
 }

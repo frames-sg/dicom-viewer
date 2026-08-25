@@ -7,14 +7,76 @@ It is a map of the current implementation, not a roadmap.
 
 | Area | Responsibility |
 | --- | --- |
-| `apps/dicom-viewer` | eframe application state, camera and measurement interaction, demand planning, worker ownership, tile cache, upload, and presentation |
-| `crates/dicom-viewer-core` | wsi-rs façade, input inspection, canonical slide geometry, renderer-facing tile conversion, and color-management policy |
+| `apps/dicom-viewer` | eframe/egui application and Pathology interaction state, revision storage, demand planning, worker ownership, tile cache, upload, and epaint/wgpu presentation |
+| `crates/dicom-viewer-core` | wsi-rs façade, input inspection, canonical slide geometry, durable pathology workspace and export adapters, renderer-facing tile conversion, and color-management policy |
+| `wsi-dicom-annotations` | UI-independent ANN/SEG/SR/PM models, readers, writers, coded terminology, profiled GeoJSON/raster conversion, publication, and semantic verification |
 | `crates/metal-wgpu-interop` | Audited macOS-only ownership boundary for importing immutable J2K Metal allocations into the renderer's wgpu device |
 | `wsi-rs` | Format detection, metadata, source I/O, tile extraction, codec dispatch, and source/display caches |
 
 The app crate is the composition root. Core does not own UI state, and the
 interop crate is the only viewer crate allowed to perform raw wgpu-hal or
-Objective-C operations.
+Objective-C operations. The frontend is native `eframe`/`egui`; epaint feeds
+the existing wgpu renderer. There is no WebView, Svelte, or Tauri boundary.
+
+## Pathology workspace and DICOM sidecars
+
+The VL WSI instance remains the immutable, tile-streamed image source. The app
+has one native **Pathology** workspace, not independent annotation,
+measurement, mask, report, and Derived documents. `WorkspaceDocument` is the
+only serializable source of truth and owns:
+
+- the source identity and embedded pinned Annotation Scheme snapshot;
+- editable vector layers and independently tracked point/region findings;
+- editable segmentation layers and independently tracked Add/Erase segments;
+- tracked linear measurements;
+- external-layer references and explicit semantic mappings;
+- restorable presentation state.
+
+`WorkspaceRuntime` owns nonserialized interaction and resource state: one
+`ActiveTool`, selection/drafts/pointer capture, undo/redo, loaded external
+payloads, R-tree/render caches, and background jobs. GPU textures and meshes
+remain owned by the UI thread. An unfinished polygon has a small recoverable
+`DraftInteraction` in revision snapshots but is not committed geometry.
+
+Vector findings and segmentation segments are deliberately different data
+representations behind one UI. Vectors contain points or independent simple
+polygon components and cannot encode boolean holes. Segments retain ordered
+polygon/brush Add/Erase primitives and compose per tracked segment through
+`geo`; objects of one class never merge globally. Immutable coordinate slices
+and document snapshots make command history and autosave cheap. History is
+bounded to 500 commands or 256 MiB and is not serialized.
+
+Same-directory discovery stops before large ANN coordinates, SEG per-frame
+groups/Pixel Data, or SR content. The user-triggered background loader creates
+a locked external-layer payload. Imported concepts remain isolated until every
+source class is explicitly mapped to a geometry-compatible controlled class;
+one object can then be promoted, or a complete layer converted atomically.
+Fractional masks and unsupported geometry remain read-only.
+
+`wsi-dicom-annotations` owns ANN/SEG/SR/PM construction and parsing, coded
+terminology, tracking primitives, profiled GeoJSON/raster conversion, and
+derived-object publication. Viewer core owns `WorkspaceDocument`, scheme-aware
+GeoJSON, the named tumor-mask compatibility adapter, and the explicit adapters
+and preflight decisions that translate workspace objects into library document
+types. ANN accepts only directly representable vector points/simple polygons.
+SEG accepts segments and explicitly requested vector rasterization. SR uses the
+fixed v1 pathology linear-measurement report. PM streams only from an existing
+profiled heatmap source; the app does not claim PM import.
+
+All file exports run as cancellable jobs through unique temporary destinations.
+The opened source is protected, existing output requires an explicit replace
+decision, and cancellation/failure leaves prior output unchanged. New derived
+SOP Instance UIDs are created per export while stored tracking identities are
+reused.
+
+The headless `annotation_probe` is a thin CLI over `wsi-dicom-annotations` and
+remains a separate process/reporting boundary.
+Profiled GeoJSON becomes ANN, SEG, or Comprehensive 3D SR; profiled TIFF, NPY,
+local Zarr, and tiled raster inputs become Parametric Maps. Production
+conversion is Rust-owned, while independent harnesses may use other DICOM
+implementations as file-level oracles. See [the pathology workflow](ANNOTATION_WORKFLOW.md),
+[scheme contract](ANNOTATION_SCHEME_V1.md), and [DICOM-native pathology
+conversion](DICOM_NATIVE_CONVERSION.md).
 
 ## Runtime ownership
 
@@ -22,7 +84,7 @@ The eframe UI thread owns `DicomViewerApp`, `SlideCanvas`, `TileRenderer`,
 `TileStore`, and `WgpuTileUploader`. Only this thread mutates presentation
 state or registers and frees egui textures.
 
-Background work has three explicit owners:
+Background work has explicit owners:
 
 - `OpenQueue` permits at most two open workers and retains only the latest
   pending request when both slots are occupied. Study generations prevent a
@@ -32,6 +94,13 @@ Background work has three explicit owners:
 - `LevelWarmer` owns one worker that prepares deferred per-level metadata. It
   reprioritizes pending levels for the active study without cancelling useful
   preparation from the same study.
+- `AnnotationLoadJob` owns one-shot lazy ANN/SEG decoding. `WorkspaceExportJob`
+  owns the single cancellable export slot for workspace, GeoJSON, ANN/SEG/SR,
+  and atomically published PM bundles.
+- Profiled-GeoJSON, structured-report, and raster sessions use one narrow
+  background-worker primitive for validation and semantic reread. Only the UI
+  thread transfers imported sessions into workspace-owned external payloads
+  and creates heatmap textures.
 
 `TileLoader` and `LevelWarmer` set shutdown state, cancel active work, notify
 their condition variables, and join their workers in `Drop`.
@@ -107,6 +176,16 @@ and cannot be evicted until the uploader returns ownership. Every upload
 outcome, including missing or surplus results, reconciles that reservation to
 ready, deferred decoded, one CPU retry, or terminal failure. Eviction order is
 unprotected LRU, frame-pinned LRU, then overview-reserved LRU.
+
+`TileFootprint` is the authoritative checked representation for tile-memory
+calculations. It derives actual edge-tile dimensions and records decoded-source,
+CPU-RGBA, final-texture, temporary-conversion, upload-peak, and in-flight
+reservation bytes. Loader admission, cache accounting and reconciliation, CPU
+upload validation, overview planning, and fallback-size checks consume this
+representation rather than repeating dimension arithmetic. CPU RGBA bytes
+describe the decoded source allocation and are not counted twice in the upload
+peak; the current CPU and Metal routes require no separately allocated temporary
+conversion buffer.
 
 The overview plan selects center-nearest tiles from the coarsest regular level
 up to 32 MiB. Those keys receive stronger cache protection than current-frame
@@ -207,10 +286,12 @@ for this reason.
 
 ## Release integration
 
-The viewer workspace resolves exact `wsi-rs` 0.5.2 and J2K 0.8.0 releases from
-the locked crates.io graph. CI and clean checkouts must not overlay sibling
-codec sources. wsi-rs owns codec selection; the viewer must not create a
-parallel codec or device-session stack.
+The viewer workspace resolves `wsi-rs` 0.6.0 at revision `b940ea94` and J2K
+0.10.0 at revision `57b6af89` from their upstream Git repositories. CI and
+clean checkouts must use the locked revisions without sibling source overlays.
+wsi-rs owns codec selection; the viewer must not create a parallel codec or
+device-session stack. Metal ownership crosses crate boundaries only as retained
+`objc2` protocol objects; the viewer has no `metal-rs` compatibility layer.
 
 Large conformance slides remain local. Repository tests use synthetic fixtures
 and opt-in paths for local SVS/DICOM acceptance.
