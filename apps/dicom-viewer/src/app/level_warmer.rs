@@ -826,7 +826,10 @@ mod tests {
             );
         }
         let deadline = Instant::now() + TEST_TIMEOUT;
-        while warmer.stats().prepared_total < 3 && Instant::now() < deadline {
+        while {
+            let stats = warmer.stats();
+            (stats.prepared_total < 3 || stats.events_dropped < 2) && Instant::now() < deadline
+        } {
             std::thread::yield_now();
         }
         let stats = warmer.stats();
