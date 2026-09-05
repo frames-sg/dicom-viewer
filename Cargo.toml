@@ -46,10 +46,10 @@ sha2 = "0.10"
 uuid = { version = "1", features = ["serde", "v4"] }
 geo = { version = "0.33.1", default-features = false }
 rstar = "0.12.2"
-wsi-dicom-annotations = "=0.1.2"
+wsi-dicom-annotations = { version = "=0.1.2", git = "https://github.com/frames-sg/wsi-dicom-annotations.git", rev = "71851b4a0c286fa9b57326e426962bf1a63a781e" }
 
-# Temporary security patches for advisories without compatible upstream
-# releases. See each vendored crate's SECURITY-PATCH.md for removal criteria.
+# Dependency patches and the Windows font backend; see SUPPLY_CHAIN.md.
+# Security-patched crates retain their SECURITY-PATCH.md removal criteria.
 [patch.crates-io]
 epaint = { path = "vendor/epaint" }
 lru = { path = "vendor/lru" }

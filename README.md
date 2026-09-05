@@ -133,22 +133,14 @@ contract](docs/FRAMES_PATHOLOGY_GEOJSON_V1.md), [tumor-mask compatibility
 adapter](docs/TUMOR_MASK_COMPATIBILITY.md), and [workspace storage/privacy
 notes](docs/WORKSPACE_STORAGE.md).
 
-### Annotation dependency release gate
+### Annotation dependency source
 
-The production manifest uses the exact registry version `wsi-dicom-annotations =0.1.2`.
-CI checks out only the viewer. Version 0.1.2 must first be published with the shared
-metadata reader, and Cargo.lock must then be refreshed from the registry and checked
-with `cargo metadata --locked` and the full standalone CI matrix. This release gate
-is currently pending; the local source validation does not prove a standalone build.
-
-For coordinated development before that release, use an explicit local Cargo overlay:
-
-```console
-cargo --config 'patch.crates-io.wsi-dicom-annotations.path="../wsi-dicom-annotations"' test --workspace --all-targets --locked
-```
-
-Do not copy this source overlay into release CI or treat its path-based lock entry
-as a published dependency checksum.
+Annotations 0.1.2 is pinned to immutable Git revision
+`71851b4a0c286fa9b57326e426962bf1a63a781e` in `frames-sg/wsi-dicom-annotations`.
+That revision owns the shared metadata reader and headless CLI. CI checks out only
+the viewer; Cargo resolves the owner without a sibling directory or local overlay.
+The dependency remains versioned and locked. A later registry migration requires
+publication of the matching API and a reviewed lockfile refresh.
 
 ### Headless annotation interoperability probe
 

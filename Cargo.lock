@@ -5578,6 +5578,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 [[package]]
 name = "wsi-dicom-annotations"
 version = "0.1.2"
+source = "git+https://github.com/frames-sg/wsi-dicom-annotations.git?rev=71851b4a0c286fa9b57326e426962bf1a63a781e#71851b4a0c286fa9b57326e426962bf1a63a781e"
 dependencies = [
  "chrono",
  "dicom-core",

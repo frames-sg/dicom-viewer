@@ -34,6 +34,13 @@ allow = [
 ]
 confidence-threshold = 0.93
 
+# Windows DirectWrite binding used by the local epaint font backend.
+# Keep approval specific to this reviewed version; see THIRD_PARTY_NOTICES.md.
+[[licenses.exceptions]]
+name = "dwrote"
+version = "=0.11.5"
+allow = ["MPL-2.0"]
+
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
@@ -46,4 +53,5 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
     "https://github.com/frames-sg/j2k.git",
     "https://github.com/frames-sg/wsi-rs.git",
+    "https://github.com/frames-sg/wsi-dicom-annotations.git",
 ]

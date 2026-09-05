@@ -20,17 +20,15 @@ runtime validation must pass when those backends are included in a release.
 
 ## Reproducible source gate
 
-The locked graph must resolve `wsi-rs` 0.6.0 at revision `b940ea94` and J2K
-0.10.0 at revision `57b6af89` from their upstream Git repositories, plus
-`wsi-dicom-annotations` 0.1.2 from crates.io. The annotations release must include
-the shared `metadata::open_metadata_object` API. Publication of that version and
-a registry lockfile refresh remain prerequisites recorded by the 4 September
-2026 validation.
+The locked graph must resolve `wsi-rs` 0.6.0 at revision `b940ea94`, J2K 0.10.0
+at revision `57b6af89`, and `wsi-dicom-annotations` 0.1.2 at revision `71851b4a`
+from their upstream Git repositories. The annotation revision includes the shared
+`metadata::open_metadata_object` API; the manifest pins its full 40-character SHA.
 
 CI and packaging must build without sibling checkouts or local source overrides.
 Run `cargo metadata --locked --format-version 1` from a clean checkout and confirm
-that it leaves `Cargo.lock` unchanged. A successful build with a local annotations
-overlay does not satisfy this gate.
+that it leaves `Cargo.lock` unchanged. Moving annotations to crates.io requires a
+matching owner publication and a reviewed registry lockfile refresh.
 
 ## Interactive performance gate
 
@@ -55,6 +53,10 @@ Before describing a build as real-time or interactively responsive:
    gate, not a pass.
 
 ## Acceptance and packaging
+
+- Include [third-party notices](../THIRD_PARTY_NOTICES.md) and the MPL 2.0
+  license text with Windows artifacts, retaining access to the corresponding
+  `dwrote` source described in that notice.
 
 - Open representative SVS, DICOM VL WSI, and raw JPEG 2000 fixtures;
   exercise fit, pan, zoom, facts pagination, measurement, annotation, and

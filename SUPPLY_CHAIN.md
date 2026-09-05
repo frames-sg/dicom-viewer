@@ -31,6 +31,12 @@ input surface.
 
 ## Temporary security patch
 
+The local `vendor/epaint` 0.34.3 integration also supplies the Windows DirectWrite
+font backend. It adds `dwrote` 0.11.5 on Windows. The license policy permits
+MPL-2.0 only for that exact crate version, with source and distribution notices
+in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). This font integration is
+separate from the security patches below.
+
 `vendor/lru` is the crates.io `lru 0.16.4` source with the upstream
 panic-safety fix and regression test from commit
 `f9a7f00fcf2d33e00adb03758cb350aaaa52cddb`. This addresses
