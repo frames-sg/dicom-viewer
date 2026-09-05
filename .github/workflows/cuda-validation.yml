@@ -25,6 +25,7 @@ env:
 jobs:
   cuda-runtime:
     name: CUDA decode and viewer parity
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.actor == 'jcwal1516' && github.triggering_actor == 'jcwal1516' }}
     runs-on: [self-hosted, Linux, X64, cuda]
     timeout-minutes: 60
     steps:
