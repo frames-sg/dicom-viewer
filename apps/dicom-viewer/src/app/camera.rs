@@ -10,6 +10,60 @@ const CAMERA_SMOOTHING_RESPONSE: f32 = 22.0;
 const CAMERA_SMOOTHING_SNAP_PX: f32 = 0.25;
 const CAMERA_SMOOTHING_SNAP_ZOOM: f32 = 0.0005;
 const WHEEL_ZOOM_SENSITIVITY: f32 = 0.0015;
+const MIN_WHEEL_ZOOM_SPEED: f32 = 0.25;
+const MAX_WHEEL_ZOOM_SPEED: f32 = 4.0;
+const MAX_WHEEL_ZOOM_EXPONENT: f32 = 1.5;
+
+#[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+pub(super) struct WheelZoomSettings {
+    speed: f32,
+    inverted: bool,
+}
+
+impl WheelZoomSettings {
+    pub(super) fn for_os(os: &str) -> Self {
+        if os == "windows" {
+            Self::new(2.0, false)
+        } else {
+            Self::new(1.0, true)
+        }
+    }
+
+    pub(super) fn new(speed: f32, inverted: bool) -> Self {
+        Self { speed, inverted }.sanitized()
+    }
+
+    pub(super) fn speed(self) -> f32 {
+        self.speed
+    }
+
+    pub(super) fn speed_mut(&mut self) -> &mut f32 {
+        &mut self.speed
+    }
+
+    pub(super) fn inverted(self) -> bool {
+        self.inverted
+    }
+
+    pub(super) fn inverted_mut(&mut self) -> &mut bool {
+        &mut self.inverted
+    }
+
+    pub(super) fn sanitized(mut self) -> Self {
+        if !self.speed.is_finite() {
+            self.speed = 1.0;
+        }
+        self.speed = self.speed.clamp(MIN_WHEEL_ZOOM_SPEED, MAX_WHEEL_ZOOM_SPEED);
+        self
+    }
+}
+
+impl Default for WheelZoomSettings {
+    fn default() -> Self {
+        Self::for_os(std::env::consts::OS)
+    }
+}
 
 fn clamp_camera_view_to_min(view: &mut CameraView, summary: &StudySummary, minimum_zoom: f32) {
     view.zoom = view.zoom.clamp(minimum_zoom, MAX_ZOOM);
@@ -196,6 +250,28 @@ impl CameraState {
         }
     }
 
+    pub(super) fn retarget_frame(
+        &mut self,
+        rendered: CameraView,
+        summary: &StudySummary,
+    ) -> CameraFrame {
+        clamp_camera_view_to_min(&mut self.target, summary, self.minimum_zoom);
+        if !self.motion.enabled || camera_is_settled(rendered, self.target) {
+            self.motion.reset(self.target);
+            return CameraFrame {
+                rendered: self.target,
+                target: self.target,
+                animating: false,
+            };
+        }
+
+        CameraFrame {
+            rendered,
+            target: self.target,
+            animating: true,
+        }
+    }
+
     pub(super) fn pan_by(&mut self, delta_screen: Vec2) {
         if delta_screen == Vec2::ZERO {
             return;
@@ -353,8 +429,32 @@ fn smooth_zoom(current: f32, target: f32, alpha: f32) -> f32 {
         .clamp(MIN_ZOOM, MAX_ZOOM)
 }
 
-pub(super) fn wheel_zoom_factor(scroll_y: f32) -> f32 {
-    (-scroll_y * WHEEL_ZOOM_SENSITIVITY).exp()
+pub(super) fn wheel_zoom_factor(scroll_y: f32, settings: WheelZoomSettings) -> f32 {
+    let direction = if settings.inverted() { -1.0 } else { 1.0 };
+    (scroll_y * WHEEL_ZOOM_SENSITIVITY * settings.speed() * direction)
+        .clamp(-MAX_WHEEL_ZOOM_EXPONENT, MAX_WHEEL_ZOOM_EXPONENT)
+        .exp()
+}
+
+pub(super) fn raw_wheel_delta_y(input: &egui::InputState) -> f32 {
+    let line_scroll_speed = egui::InputOptions::default().line_scroll_speed;
+    input
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            egui::Event::MouseWheel {
+                unit,
+                delta,
+                modifiers,
+                ..
+            } if !modifiers.command => Some(match unit {
+                egui::MouseWheelUnit::Point => delta.y,
+                egui::MouseWheelUnit::Line => delta.y * line_scroll_speed,
+                egui::MouseWheelUnit::Page => delta.y * input.viewport_rect().height(),
+            }),
+            _ => None,
+        })
+        .sum()
 }
 
 fn camera_is_settled(rendered: CameraView, target: CameraView) -> bool {

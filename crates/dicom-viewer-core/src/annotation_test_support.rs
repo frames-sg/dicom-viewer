@@ -12,6 +12,24 @@ pub(crate) fn write_source_wsi(
     tile_width: u16,
     tile_height: u16,
 ) {
+    write_source_wsi_with_optical_paths(
+        path,
+        width,
+        height,
+        tile_width,
+        tile_height,
+        &["OPTICAL-1"],
+    );
+}
+
+pub(crate) fn write_source_wsi_with_optical_paths(
+    path: &Path,
+    width: u32,
+    height: u32,
+    tile_width: u16,
+    tile_height: u16,
+    optical_path_identifiers: &[&str],
+) {
     const SOP_UID: &str = "1.2.826.0.1.3680043.10.777.101";
     const SERIES_UID: &str = "1.2.826.0.1.3680043.10.777.102";
     const STUDY_UID: &str = "1.2.826.0.1.3680043.10.777.103";
@@ -27,6 +45,18 @@ pub(crate) fn write_source_wsi(
         VR::DS,
         "0",
     ));
+    let optical_paths = optical_path_identifiers
+        .iter()
+        .map(|identifier| {
+            let mut item = InMemDicomObject::new_empty();
+            item.put(DataElement::new(
+                tags::OPTICAL_PATH_IDENTIFIER,
+                VR::SH,
+                *identifier,
+            ));
+            item
+        })
+        .collect::<Vec<_>>();
     let frame_count = width
         .div_ceil(u32::from(tile_width))
         .saturating_mul(height.div_ceil(u32::from(tile_height)));
@@ -41,7 +71,7 @@ pub(crate) fn write_source_wsi(
         DataElement::new(tags::STUDY_INSTANCE_UID, VR::UI, STUDY_UID),
         DataElement::new(tags::SERIES_INSTANCE_UID, VR::UI, SERIES_UID),
         DataElement::new(tags::FRAME_OF_REFERENCE_UID, VR::UI, FOR_UID),
-        DataElement::new(tags::PATIENT_NAME, VR::PN, "Research^Slide"),
+        DataElement::new(tags::PATIENT_NAME, VR::PN, "Example^Slide"),
         DataElement::new(tags::PATIENT_ID, VR::LO, "R-1"),
         DataElement::new(tags::STUDY_DATE, VR::DA, "20260804"),
         DataElement::new(tags::STUDY_TIME, VR::TM, "120000"),
@@ -56,7 +86,7 @@ pub(crate) fn write_source_wsi(
         DataElement::new(
             tags::NUMBER_OF_OPTICAL_PATHS,
             VR::UL,
-            PrimitiveValue::from(1_u32),
+            PrimitiveValue::from(u32::try_from(optical_paths.len()).unwrap()),
         ),
         DataElement::new(
             tags::TOTAL_PIXEL_MATRIX_FOCAL_PLANES,
@@ -85,6 +115,11 @@ pub(crate) fn write_source_wsi(
         tags::TOTAL_PIXEL_MATRIX_ORIGIN_SEQUENCE,
         VR::SQ,
         Value::from(DataSetSequence::new(vec![origin], Length::UNDEFINED)),
+    ));
+    object.put(DataElement::new(
+        tags::OPTICAL_PATH_SEQUENCE,
+        VR::SQ,
+        Value::from(DataSetSequence::new(optical_paths, Length::UNDEFINED)),
     ));
     object.put(DataElement::new(
         tags::PIXEL_DATA,

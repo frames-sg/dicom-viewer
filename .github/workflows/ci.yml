@@ -28,14 +28,6 @@ jobs:
           path: dicom-viewer
           persist-credentials: false
 
-      - name: Checkout wsi-dicom-annotations
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: frames-sg/wsi-dicom-annotations
-          ref: a623e84405d9be6779e7065a71031228b20849a5
-          path: wsi-dicom-annotations
-          persist-credentials: false
-
       - name: Install Linux GUI dependencies
         if: runner.os == 'Linux'
         run: |
@@ -106,14 +98,6 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: dicom-viewer
-          persist-credentials: false
-
-      - name: Checkout wsi-dicom-annotations
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: frames-sg/wsi-dicom-annotations
-          ref: a623e84405d9be6779e7065a71031228b20849a5
-          path: wsi-dicom-annotations
           persist-credentials: false
 
       - name: Install Rust

@@ -1,6 +1,6 @@
 # DICOM-native pathology conversion
 
-The separately versioned `wsi-dicom-annotations` library owns two research
+The separately versioned `wsi-dicom-annotations` library owns two
 conversion boundaries in Rust, while `annotation_probe` exposes them through a
 deterministic CLI/report contract:
 
@@ -18,8 +18,9 @@ an explicit source derivation reference. A common Frame of Reference means only
 that the derived object uses the source slide coordinate system; it does not
 claim spatial registration between pathology and radiology.
 
-New viewer and `annotation_probe` outputs explicitly identify Manufacturer
-`Frames` and Manufacturer Model Name `DICOM Viewer`. ANN, SEG, SR, and PM use
+New outputs identify Manufacturer `Frames`. Desktop exports use Manufacturer
+Model Name `DICOM Viewer`; the standalone `wsi-annotation-probe` package in
+`wsi-dicom-annotations` uses `Annotation Probe`. ANN, SEG, SR, and PM use
 Series Numbers 9101, 9201, 9301, and 9401 respectively, with format-specific
 Series Descriptions. Round-tripping an imported object instead retains its
 imported equipment identity.
@@ -205,6 +206,6 @@ losses, semantic digest, timing, and tracked peak heap. Profile and GeoJSON
 checksums are computed from the exact bounded byte buffers consumed by the
 parser. Timing and memory never enter the semantic digest.
 
-This is research-use-only infrastructure. It does not add model execution,
+This infrastructure does not add model execution,
 geographic CRS handling, ontology inference, fractional SEG generation,
 radiology/pathology spatial registration, or PACS transport.

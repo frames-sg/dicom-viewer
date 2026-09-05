@@ -6,6 +6,7 @@ use eframe::egui::{
 use dicom_viewer_core::StudySummary;
 
 use super::super::theme;
+use super::super::WheelZoomSettings;
 
 #[derive(Debug, Default)]
 pub(in crate::app) struct ToolbarActions {
@@ -24,12 +25,14 @@ pub(in crate::app) struct ToolbarActions {
 pub(in crate::app) struct ToolbarState<'a> {
     pub(in crate::app) has_study: bool,
     pub(in crate::app) show_facts: &'a mut bool,
+    pub(in crate::app) show_pathology: &'a mut bool,
     pub(in crate::app) can_undo: bool,
     pub(in crate::app) can_redo: bool,
     pub(in crate::app) autosave_status: &'a str,
     pub(in crate::app) export_running: bool,
     pub(in crate::app) export_cancel_requested: bool,
     pub(in crate::app) smooth_camera: &'a mut bool,
+    pub(in crate::app) wheel_zoom: &'a mut WheelZoomSettings,
 }
 
 pub(in crate::app) fn show_toolbar(ui: &mut egui::Ui, state: ToolbarState<'_>) -> ToolbarActions {
@@ -55,6 +58,10 @@ pub(in crate::app) fn show_toolbar(ui: &mut egui::Ui, state: ToolbarState<'_>) -
                 ui.toggle_value(state.show_facts, RichText::new("Info").size(13.0));
                 if state.has_study {
                     rule(ui);
+                    ui.toggle_value(
+                        state.show_pathology,
+                        RichText::new("Annotations").size(13.0),
+                    );
                     actions.import = ui.button(RichText::new("Import").size(13.0)).clicked();
                     if state.export_running {
                         actions.cancel_export = ui
@@ -83,6 +90,16 @@ pub(in crate::app) fn show_toolbar(ui: &mut egui::Ui, state: ToolbarState<'_>) -
                     actions.zoom_in = ui.button(RichText::new("+").size(13.0)).clicked();
                     ui.menu_button("View", |ui| {
                         ui.checkbox(state.smooth_camera, "Smooth navigation");
+                        ui.checkbox(
+                            state.wheel_zoom.inverted_mut(),
+                            "Invert wheel zoom direction",
+                        );
+                        ui.add(
+                            egui::Slider::new(state.wheel_zoom.speed_mut(), 0.25..=4.0)
+                                .logarithmic(true)
+                                .custom_formatter(|value, _| format!("{value:.2}×"))
+                                .text("Wheel zoom speed"),
+                        );
                     });
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -184,11 +201,7 @@ pub(in crate::app) fn privacy_badge(ui: &mut egui::Ui) {
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             ui.label(RichText::new("\u{25CF}").color(theme::GREEN).size(9.0));
-            ui.label(
-                RichText::new("RESEARCH · LOCAL")
-                    .color(theme::TEXT_MUTED)
-                    .size(11.0),
-            );
+            ui.label(RichText::new("LOCAL").color(theme::TEXT_MUTED).size(11.0));
         });
 }
 
@@ -211,19 +224,23 @@ mod tests {
     #[test]
     fn toolbar_and_status_bar_render_each_availability_state_without_actions() {
         let mut show_facts = false;
+        let mut show_pathology = false;
         let mut smooth_camera = true;
+        let mut wheel_zoom = WheelZoomSettings::for_os("windows");
         let output = run_ui(|ui| {
             let actions = show_toolbar(
                 ui,
                 ToolbarState {
                     has_study: false,
                     show_facts: &mut show_facts,
+                    show_pathology: &mut show_pathology,
                     can_undo: false,
                     can_redo: false,
                     autosave_status: "Not saved",
                     export_running: false,
                     export_cancel_requested: false,
                     smooth_camera: &mut smooth_camera,
+                    wheel_zoom: &mut wheel_zoom,
                 },
             );
             assert!(!actions.open_file);
@@ -239,12 +256,14 @@ mod tests {
                 ToolbarState {
                     has_study: true,
                     show_facts: &mut show_facts,
+                    show_pathology: &mut show_pathology,
                     can_undo: true,
                     can_redo: true,
                     autosave_status: "Saved",
                     export_running: false,
                     export_cancel_requested: false,
                     smooth_camera: &mut smooth_camera,
+                    wheel_zoom: &mut wheel_zoom,
                 },
             );
             assert!(!actions.undo);

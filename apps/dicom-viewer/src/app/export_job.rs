@@ -9,6 +9,7 @@ use super::background_worker::{BackgroundWorker, WorkerPoll};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum WorkspaceExportKind {
+    CurrentViewTiff,
     PortableWorkspace,
     SchemeGeoJson,
     CompatibilityGeoJson,
@@ -22,6 +23,7 @@ pub(super) enum WorkspaceExportKind {
 impl WorkspaceExportKind {
     pub(super) const fn label(self) -> &'static str {
         match self {
+            Self::CurrentViewTiff => "current view TIFF",
             Self::PortableWorkspace => "portable workspace",
             Self::SchemeGeoJson => "scheme-aware GeoJSON",
             Self::CompatibilityGeoJson => "CellViT compatibility GeoJSON",

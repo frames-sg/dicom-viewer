@@ -21,6 +21,7 @@ pub(super) const CYAN: Color32 = Color32::from_rgb(112, 192, 206);
 pub(super) const GREEN: Color32 = Color32::from_rgb(112, 192, 116);
 pub(super) const WARN: Color32 = Color32::from_rgb(206, 142, 60);
 pub(super) fn install_visuals(ctx: &egui::Context) {
+    install_platform_font(ctx);
     let mut style = (*ctx.global_style()).clone();
 
     style.text_styles = [
@@ -84,12 +85,39 @@ pub(super) fn install_visuals(ctx: &egui::Context) {
     ctx.set_global_style(style);
 }
 
+#[cfg(target_os = "windows")]
+fn install_platform_font(ctx: &egui::Context) {
+    let windows_directory = std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into());
+    let path = std::path::PathBuf::from(windows_directory)
+        .join("Fonts")
+        .join("segoeui.ttf");
+    let Ok(bytes) = std::fs::read(path) else {
+        return;
+    };
+
+    let name = "Segoe UI".to_owned();
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        name.clone(),
+        std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+    );
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .insert(0, name);
+    ctx.set_fonts(fonts);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn install_platform_font(_ctx: &egui::Context) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn installed_visuals_keep_the_research_viewer_palette_and_spacing() {
+    fn installed_visuals_keep_the_viewer_palette_and_spacing() {
         let context = egui::Context::default();
 
         install_visuals(&context);
@@ -100,5 +128,16 @@ mod tests {
         assert_eq!(style.visuals.selection.bg_fill, AMBER_GLOW);
         assert_eq!(style.spacing.item_spacing, vec2(8.0, 7.0));
         assert_eq!(style.spacing.interact_size.y, 26.0);
+    }
+
+    #[test]
+    fn text_rasterizer_is_native_only_on_windows() {
+        let expected = if cfg!(target_os = "windows") {
+            "DirectWrite grayscale"
+        } else {
+            "skrifa/vello"
+        };
+
+        assert_eq!(egui::epaint::text::font_rasterizer_name(), expected);
     }
 }

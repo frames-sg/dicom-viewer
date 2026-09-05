@@ -1,6 +1,7 @@
 [package]
 name = "dicom-viewer"
 version = "0.1.0"
+build = "build.rs"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -11,18 +12,21 @@ default = []
 cuda = ["dicom-viewer-core/cuda"]
 
 [dependencies]
-dicom-viewer-core = { version = "=0.1.0", path = "../../crates/dicom-viewer-core" }
+dicom-viewer-core = { version = "=0.1.1", path = "../../crates/dicom-viewer-core" }
 wsi-dicom-annotations = { workspace = true }
 eframe = { workspace = true }
 rfd = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
-peak_alloc = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
+tiff = { workspace = true }
 uuid = { workspace = true }
 rstar = { workspace = true }
+
+[build-dependencies]
+winresource = { version = "0.1.31", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 j2k-metal-support = { workspace = true }

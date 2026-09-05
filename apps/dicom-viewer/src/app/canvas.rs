@@ -300,6 +300,21 @@ impl SlideCanvas {
                 );
             }
         }
+        if let Some(level) =
+            sharpening_transition_level(summary, plan.render_level, plan.prefetch_level)
+                .and_then(|level| level_by_index(summary, level))
+        {
+            for tile in &plan.prefetch {
+                self.tiles.draw_ready_tile(
+                    painter,
+                    rect,
+                    level,
+                    tile,
+                    camera.rendered.center_base,
+                    camera.rendered.zoom,
+                );
+            }
+        }
 
         painter.rect_stroke(
             slide_rect,
@@ -382,6 +397,19 @@ fn interaction_measurement_target(
     } else {
         (plan.render_level, plan.render_visible.as_slice())
     }
+}
+
+fn sharpening_transition_level(
+    summary: &StudySummary,
+    rendered_level: LevelIndex,
+    target_level: LevelIndex,
+) -> Option<LevelIndex> {
+    if rendered_level == target_level {
+        return None;
+    }
+    let rendered = level_by_index(summary, rendered_level)?;
+    let target = level_by_index(summary, target_level)?;
+    (target.downsample < rendered.downsample).then_some(target_level)
 }
 
 fn level_preparation_observation(event: &LevelWarmerEvent) -> (Duration, LevelPreparationStatus) {
@@ -1089,6 +1117,20 @@ mod tests {
             .prefetch
             .iter()
             .all(|tile| tile.key.level == plan.prefetch_level));
+    }
+
+    #[test]
+    fn zoom_in_target_tiles_sharpen_progressively_but_zoom_out_targets_do_not() {
+        let summary = summary();
+        let fine = LevelIndex::from_u32(0);
+        let coarse = LevelIndex::from_u32(1);
+
+        assert_eq!(
+            sharpening_transition_level(&summary, coarse, fine),
+            Some(fine)
+        );
+        assert_eq!(sharpening_transition_level(&summary, fine, coarse), None);
+        assert_eq!(sharpening_transition_level(&summary, fine, fine), None);
     }
 
     #[test]

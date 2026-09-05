@@ -5,8 +5,10 @@ mod export;
 mod geojson;
 mod model;
 
-pub use document::{SegmentEditOutcome, WorkspaceDocument};
-pub use export::VectorSegmentationPolicy;
+pub use document::{
+    SegmentEditOutcome, WorkspaceDocument, WorkspaceObjectGeometryKind, WorkspaceObjectRef,
+};
+pub use export::{BulkAnnExport, BulkAnnotationLocation, VectorSegmentationPolicy};
 pub use geojson::WorkspaceGeoJsonExport;
 pub use model::{
     CompositeSegmentGeometry, ControlledFindingSite, ExternalLayerKind, ExternalLayerReference,

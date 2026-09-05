@@ -32,11 +32,11 @@ pub use annotations::{
     polygon_self_intersects, polygon_signed_area, srgb_to_dicom_cielab, AlgorithmIdentification,
     AnnotationClass, AnnotationClassConceptKey, AnnotationClassGeometry, AnnotationDocument,
     AnnotationGeometry, AnnotationGraphicType, AnnotationGroup, AnnotationMeasurement,
-    AnnotationObjectKind, AnnotationScheme, BinaryMaskRun, BinarySegmentationFrame,
-    CompositeSegmentGeometry, ControlledFindingSite, CoordinateGraphic, DiagnosticDisposition,
-    DiagnosticSeverity, DicomAnnotationContext, DicomBundlePublication, DicomCode,
-    DicomCodeValueKind, DicomPublicationError, DicomSinglePublication, ExternalLayerKind,
-    ExternalLayerReference, ExternalPromotionSource, FractionalMaskRun,
+    AnnotationObjectKind, AnnotationScheme, BinaryMaskRun, BinarySegmentationFrame, BulkAnnExport,
+    BulkAnnotationLocation, CompositeSegmentGeometry, ControlledFindingSite, CoordinateGraphic,
+    DiagnosticDisposition, DiagnosticSeverity, DicomAnnotationContext, DicomBundlePublication,
+    DicomCode, DicomCodeValueKind, DicomPublicationError, DicomSinglePublication,
+    ExternalLayerKind, ExternalLayerReference, ExternalPromotionSource, FractionalMaskRun,
     FractionalSegmentationFrame, GenerationType, InteroperabilityDiagnostic, LayerPresentation,
     LinearMeasurementSpec, MeasurementReportSemantics, ParametricMapDocument,
     ParametricMapInstance, ParametricMapPartPlan, ParametricMapPlan, ParametricMapPreview,
@@ -51,7 +51,8 @@ pub use annotations::{
     StructuredReportMeasurementGroup, StructuredReportQualitativeEvaluation,
     StructuredReportReferenceKind, TrackingIdentity, VectorFinding, VectorFindingGeometry,
     VectorLayer, VectorSegmentationPolicy, WorkspaceDocument, WorkspaceGeoJsonExport,
-    WorkspaceLinearMeasurement, WorkspaceObjectProvenance, WorkspacePresentation,
+    WorkspaceLinearMeasurement, WorkspaceObjectGeometryKind, WorkspaceObjectProvenance,
+    WorkspaceObjectRef, WorkspacePresentation,
 };
 use inspection::{inspect_input, summarize_slide};
 #[cfg(target_os = "macos")]

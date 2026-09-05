@@ -15,7 +15,7 @@ The production raster boundary adds only these direct crates:
 - `npyz = 0.9.1` (MIT): no optional features are enabled. The crate publishes
   no `rust-version`, so compatibility is established by the locked workspace
   build on Rust 1.96 rather than an upstream MSRV declaration.
-- `zarrs = 0.23.13` (MIT OR Apache-2.0, declared Rust 1.91): defaults are
+- `zarrs = 0.23.14` (MIT OR Apache-2.0, declared Rust 1.91): defaults are
   disabled; only `filesystem`, `blosc`, `crc32c`, `gzip`, `sharding`, and
   `zstd` are enabled. The application exposes only a local filesystem array
   path and does not compile the `ndarray`, async, remote-store, or optional
@@ -31,10 +31,16 @@ input surface.
 
 ## Temporary security patch
 
+The local `vendor/epaint` 0.34.3 integration also supplies the Windows DirectWrite
+font backend. It adds `dwrote` 0.11.5 on Windows. The license policy permits
+MPL-2.0 only for that exact crate version, with source and distribution notices
+in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). This font integration is
+separate from the security patches below.
+
 `vendor/lru` is the crates.io `lru 0.16.4` source with the upstream
 panic-safety fix and regression test from commit
 `f9a7f00fcf2d33e00adb03758cb350aaaa52cddb`. This addresses
-RUSTSEC-2026-0253 while `zarrs 0.23.13` still requires `lru 0.16.x`. See
+RUSTSEC-2026-0253 while `zarrs 0.23.14` still requires `lru 0.16.x`. See
 `vendor/lru/SECURITY-PATCH.md` for source, checksum, and removal criteria.
 
 `vendor/wayland-scanner` is the crates.io `wayland-scanner 0.31.10` source with

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -14,11 +14,16 @@ use super::composition::{
 };
 use super::model::{
     CompositeSegmentGeometry, ControlledFindingSite, ExternalLayerReference,
-    ExternalPromotionSource, LayerPresentation, SegmentOperation, SegmentationLayer,
-    SegmentationPrimitive, SegmentationSegmentFinding, SourceFrameContext, VectorFinding,
-    VectorFindingGeometry, VectorLayer, WorkspaceLinearMeasurement, WorkspaceObjectIdentity,
-    WorkspaceObjectProvenance, WorkspacePresentation,
+    ExternalPromotionSource, SegmentOperation, SegmentationLayer, SegmentationPrimitive,
+    SegmentationSegmentFinding, SourceFrameContext, VectorFinding, VectorFindingGeometry,
+    VectorLayer, WorkspaceLinearMeasurement, WorkspaceObjectIdentity, WorkspaceObjectProvenance,
+    WorkspacePresentation,
 };
+
+mod layers;
+mod object;
+mod validation;
+pub use object::{WorkspaceObjectGeometryKind, WorkspaceObjectRef};
 
 const WORKSPACE_SCHEMA_VERSION: u32 = 1;
 const MAX_WORKSPACE_BYTES: usize = 128 * 1024 * 1024;
@@ -148,25 +153,6 @@ impl WorkspaceDocument {
         self.segmentation_layers
             .iter()
             .flat_map(|layer| layer.segments().iter())
-    }
-
-    #[must_use]
-    pub fn finding(&self, object_id: Uuid) -> Option<&VectorFinding> {
-        self.vector_findings()
-            .find(|finding| finding.object_id() == object_id)
-    }
-
-    #[must_use]
-    pub fn segment(&self, object_id: Uuid) -> Option<&SegmentationSegmentFinding> {
-        self.segments()
-            .find(|segment| segment.object_id() == object_id)
-    }
-
-    #[must_use]
-    pub fn measurement(&self, object_id: Uuid) -> Option<&WorkspaceLinearMeasurement> {
-        self.measurements
-            .iter()
-            .find(|measurement| measurement.object_id() == object_id)
     }
 
     pub fn add_vector_finding(
@@ -534,146 +520,6 @@ impl WorkspaceDocument {
         Ok(object_id)
     }
 
-    pub fn add_external_layer(&mut self, layer: ExternalLayerReference) -> Result<Uuid> {
-        if layer.name().trim().is_empty() || layer.name().len() > 256 {
-            return Err(ViewerError::InvalidInput(
-                "external layer name must be 1..=256 bytes".into(),
-            ));
-        }
-        if self
-            .external_layers
-            .iter()
-            .any(|item| item.id() == layer.id())
-        {
-            return Err(ViewerError::InvalidInput(
-                "external layer ID already exists".into(),
-            ));
-        }
-        let id = layer.id();
-        self.presentation.insert_layer(id);
-        self.external_layers.push(layer);
-        self.bump_revision();
-        Ok(id)
-    }
-
-    pub fn remove_external_layer(&mut self, layer_id: Uuid) -> Result<bool> {
-        let Some(index) = self
-            .external_layers
-            .iter()
-            .position(|layer| layer.id() == layer_id)
-        else {
-            return Ok(false);
-        };
-        self.external_layers.remove(index);
-        self.presentation.remove_layer(layer_id);
-        self.bump_revision();
-        Ok(true)
-    }
-
-    /// Updates an unloaded external-layer reference after its payload has been
-    /// validated and loaded. The layer identity and any class mappings remain
-    /// stable so a discovered sidecar cannot turn into a duplicate layer.
-    pub fn hydrate_external_layer(
-        &mut self,
-        layer_id: Uuid,
-        source_object_count: u64,
-        source_digest: Option<String>,
-    ) -> Result<()> {
-        if source_digest
-            .as_deref()
-            .is_some_and(|digest| digest.is_empty() || digest.len() > 128)
-        {
-            return Err(ViewerError::InvalidInput(
-                "external source digest must be 1..=128 bytes when present".into(),
-            ));
-        }
-        let layer = self
-            .external_layers
-            .iter_mut()
-            .find(|layer| layer.id() == layer_id)
-            .ok_or_else(|| {
-                ViewerError::InvalidInput("the external source layer does not exist".into())
-            })?;
-        if let (Some(expected), Some(actual)) = (layer.source_digest(), source_digest.as_deref()) {
-            if expected != actual {
-                return Err(ViewerError::InvalidInput(
-                    "the external source content changed; remove the saved source layer and import it explicitly"
-                        .into(),
-                ));
-            }
-        }
-        let source_digest = source_digest.or_else(|| layer.source_digest().map(ToOwned::to_owned));
-        layer.hydrate(source_object_count, source_digest);
-        self.bump_revision();
-        Ok(())
-    }
-
-    pub fn set_external_class_mapping(
-        &mut self,
-        layer_id: Uuid,
-        source_class: &str,
-        target_class_id: &str,
-    ) -> Result<()> {
-        if source_class.trim().is_empty() || source_class.len() > 1_024 {
-            return Err(ViewerError::InvalidInput(
-                "external source class key must be 1..=1024 bytes".into(),
-            ));
-        }
-        if self.scheme.class(target_class_id).is_none() {
-            return Err(ViewerError::InvalidInput(
-                "external class mapping target is not in the pinned annotation scheme".into(),
-            ));
-        }
-        let layer = self
-            .external_layers
-            .iter_mut()
-            .find(|layer| layer.id() == layer_id)
-            .ok_or_else(|| {
-                ViewerError::InvalidInput("the external source layer does not exist".into())
-            })?;
-        layer.set_class_mapping(source_class.to_owned(), target_class_id.to_owned());
-        self.bump_revision();
-        Ok(())
-    }
-
-    pub fn delete_object(&mut self, object_id: Uuid) -> Result<bool> {
-        for layer in &mut self.vector_layers {
-            if let Some(index) = layer
-                .findings()
-                .iter()
-                .position(|finding| finding.object_id() == object_id)
-            {
-                layer.findings_mut().remove(index);
-                self.presentation.remove_object(object_id);
-                self.bump_revision();
-                return Ok(true);
-            }
-        }
-        for layer in &mut self.segmentation_layers {
-            if let Some(index) = layer
-                .segments()
-                .iter()
-                .position(|segment| segment.object_id() == object_id)
-            {
-                layer.segments_mut().remove(index);
-                self.presentation.remove_object(object_id);
-                self.bump_revision();
-                return Ok(true);
-            }
-        }
-        if let Some(index) = self
-            .measurements
-            .iter()
-            .position(|measurement| measurement.object_id() == object_id)
-        {
-            self.measurements.remove(index);
-            self.presentation.remove_object(object_id);
-            self.bump_revision();
-            return Ok(true);
-        }
-        Ok(false)
-    }
-
     pub fn move_vector_vertex(
         &mut self,
         object_id: Uuid,
@@ -767,40 +613,23 @@ impl WorkspaceDocument {
     }
 
     pub fn reclassify_object(&mut self, object_id: Uuid, class_id: &str) -> Result<()> {
-        let geometry = if let Some(finding) = self.finding(object_id) {
-            match finding.geometry() {
-                VectorFindingGeometry::Point(_) => AnnotationClassGeometry::Point,
-                VectorFindingGeometry::Regions(_) => AnnotationClassGeometry::Region,
+        let geometry = match self.object(object_id).map(|object| object.geometry_kind()) {
+            Some(object::WorkspaceObjectGeometryKind::Point) => AnnotationClassGeometry::Point,
+            Some(
+                object::WorkspaceObjectGeometryKind::Region
+                | object::WorkspaceObjectGeometryKind::Segmentation
+                | object::WorkspaceObjectGeometryKind::Measurement,
+            ) => AnnotationClassGeometry::Region,
+            None => {
+                return Err(ViewerError::InvalidInput(
+                    "the selected workspace object does not exist".into(),
+                ))
             }
-        } else if self.segment(object_id).is_some() || self.measurement(object_id).is_some() {
-            AnnotationClassGeometry::Region
-        } else {
-            return Err(ViewerError::InvalidInput(
-                "the selected workspace object does not exist".into(),
-            ));
         };
         self.validate_class(class_id, geometry)?;
-        if let Some(finding) = self
-            .vector_layers
-            .iter_mut()
-            .flat_map(|layer| layer.findings_mut())
-            .find(|finding| finding.object_id() == object_id)
-        {
-            finding.set_class_id(class_id.to_owned());
-        } else if let Some(segment) = self
-            .segmentation_layers
-            .iter_mut()
-            .flat_map(|layer| layer.segments_mut())
-            .find(|segment| segment.object_id() == object_id)
-        {
-            segment.set_class_id(class_id.to_owned());
-        } else if let Some(measurement) = self
-            .measurements
-            .iter_mut()
-            .find(|measurement| measurement.object_id() == object_id)
-        {
-            measurement.set_class_id(class_id.to_owned());
-        }
+        self.object_mut(object_id)
+            .expect("the object was checked before mutation")
+            .set_class_id(class_id.to_owned());
         self.bump_revision();
         Ok(())
     }
@@ -831,129 +660,60 @@ impl WorkspaceDocument {
                     })
             })
             .transpose()?;
-        if let Some(finding) = self
-            .vector_layers
-            .iter_mut()
-            .flat_map(|layer| layer.findings_mut())
-            .find(|finding| finding.object_id() == object_id)
-        {
-            if finding.finding_site() != site.as_ref() {
-                finding.set_finding_site(site);
-                self.bump_revision();
+        let changed = {
+            let mut object = self.object_mut(object_id).ok_or_else(|| {
+                ViewerError::InvalidInput("the selected workspace object does not exist".into())
+            })?;
+            if object.finding_site() == site.as_ref() {
+                false
+            } else {
+                object.set_finding_site(site);
+                true
             }
-            return Ok(());
+        };
+        if changed {
+            self.bump_revision();
         }
-        if let Some(segment) = self
-            .segmentation_layers
-            .iter_mut()
-            .flat_map(|layer| layer.segments_mut())
-            .find(|segment| segment.object_id() == object_id)
-        {
-            if segment.finding_site() != site.as_ref() {
-                segment.set_finding_site(site);
-                self.bump_revision();
-            }
-            return Ok(());
-        }
-        if let Some(measurement) = self
-            .measurements
-            .iter_mut()
-            .find(|measurement| measurement.object_id() == object_id)
-        {
-            if measurement.finding_site() != site.as_ref() {
-                measurement.set_finding_site(site);
-                self.bump_revision();
-            }
-            return Ok(());
-        }
-        Err(ViewerError::InvalidInput(
-            "the selected workspace object does not exist".into(),
-        ))
+        Ok(())
     }
 
     pub fn set_object_name(&mut self, object_id: Uuid, name: Option<&str>) -> Result<()> {
         let name = validate_optional_object_text(name, 256, "object name")?;
-        if let Some(finding) = self
-            .vector_layers
-            .iter_mut()
-            .flat_map(|layer| layer.findings_mut())
-            .find(|finding| finding.object_id() == object_id)
-        {
-            if finding.name() != name.as_deref() {
-                finding.set_name(name);
-                self.bump_revision();
+        let changed = {
+            let mut object = self.object_mut(object_id).ok_or_else(|| {
+                ViewerError::InvalidInput("the selected workspace object does not exist".into())
+            })?;
+            if object.name() == name.as_deref() {
+                false
+            } else {
+                object.set_name(name);
+                true
             }
-            return Ok(());
+        };
+        if changed {
+            self.bump_revision();
         }
-        if let Some(segment) = self
-            .segmentation_layers
-            .iter_mut()
-            .flat_map(|layer| layer.segments_mut())
-            .find(|segment| segment.object_id() == object_id)
-        {
-            if segment.name() != name.as_deref() {
-                segment.set_name(name);
-                self.bump_revision();
-            }
-            return Ok(());
-        }
-        if let Some(measurement) = self
-            .measurements
-            .iter_mut()
-            .find(|measurement| measurement.object_id() == object_id)
-        {
-            if measurement.name() != name.as_deref() {
-                measurement.set_name(name);
-                self.bump_revision();
-            }
-            return Ok(());
-        }
-        Err(ViewerError::InvalidInput(
-            "the selected workspace object does not exist".into(),
-        ))
+        Ok(())
     }
 
     /// Sets the optional comment on one tracked object.
     pub fn set_object_comment(&mut self, object_id: Uuid, comment: Option<&str>) -> Result<()> {
         let comment = validate_optional_object_text(comment, 4_096, "object comment")?;
-        if let Some(finding) = self
-            .vector_layers
-            .iter_mut()
-            .flat_map(|layer| layer.findings_mut())
-            .find(|finding| finding.object_id() == object_id)
-        {
-            if finding.comment() != comment.as_deref() {
-                finding.set_comment(comment);
-                self.bump_revision();
+        let changed = {
+            let mut object = self.object_mut(object_id).ok_or_else(|| {
+                ViewerError::InvalidInput("the selected workspace object does not exist".into())
+            })?;
+            if object.comment() == comment.as_deref() {
+                false
+            } else {
+                object.set_comment(comment);
+                true
             }
-            return Ok(());
+        };
+        if changed {
+            self.bump_revision();
         }
-        if let Some(segment) = self
-            .segmentation_layers
-            .iter_mut()
-            .flat_map(|layer| layer.segments_mut())
-            .find(|segment| segment.object_id() == object_id)
-        {
-            if segment.comment() != comment.as_deref() {
-                segment.set_comment(comment);
-                self.bump_revision();
-            }
-            return Ok(());
-        }
-        if let Some(measurement) = self
-            .measurements
-            .iter_mut()
-            .find(|measurement| measurement.object_id() == object_id)
-        {
-            if measurement.comment() != comment.as_deref() {
-                measurement.set_comment(comment);
-                self.bump_revision();
-            }
-            return Ok(());
-        }
-        Err(ViewerError::InvalidInput(
-            "the selected workspace object does not exist".into(),
-        ))
+        Ok(())
     }
 
     pub fn suggest_scheme_migration(&self, target: &AnnotationScheme) -> BTreeMap<String, String> {
@@ -1027,37 +787,6 @@ impl WorkspaceDocument {
         Ok(())
     }
 
-    pub fn set_layer_presentation(
-        &mut self,
-        layer_id: Uuid,
-        presentation: LayerPresentation,
-    ) -> Result<()> {
-        if !presentation.opacity.is_finite() || !(0.0..=1.0).contains(&presentation.opacity) {
-            return Err(ViewerError::InvalidInput(
-                "layer opacity must be between zero and one".into(),
-            ));
-        }
-        if !self.layer_exists(layer_id) {
-            return Err(ViewerError::InvalidInput(
-                "the selected layer does not exist".into(),
-            ));
-        }
-        self.presentation.set_layer(layer_id, presentation);
-        self.bump_revision();
-        Ok(())
-    }
-
-    pub fn set_object_visible(&mut self, object_id: Uuid, visible: bool) -> Result<()> {
-        if !self.object_exists(object_id) {
-            return Err(ViewerError::InvalidInput(
-                "the selected workspace object does not exist".into(),
-            ));
-        }
-        self.presentation.set_object_visible(object_id, visible);
-        self.bump_revision();
-        Ok(())
-    }
-
     #[must_use]
     pub fn object_count(&self) -> usize {
         self.vector_findings().count() + self.segments().count() + self.measurements.len()
@@ -1081,134 +810,6 @@ impl WorkspaceDocument {
         1024usize
             .saturating_add(self.object_count().saturating_mul(512))
             .saturating_add(self.coordinate_count().saturating_mul(16))
-    }
-
-    pub fn validate(&self) -> Result<()> {
-        if self.schema_version != WORKSPACE_SCHEMA_VERSION {
-            return Err(ViewerError::Unsupported(format!(
-                "workspace schema version {} is not supported",
-                self.schema_version
-            )));
-        }
-        validate_source_identity(&self.source_identity)?;
-        if self.object_count() > MAX_EDITABLE_OBJECTS {
-            return Err(ViewerError::InvalidInput(format!(
-                "workspace exceeds the {MAX_EDITABLE_OBJECTS} editable-object limit"
-            )));
-        }
-        if self.coordinate_count() > MAX_COORDINATE_POINTS {
-            return Err(ViewerError::InvalidInput(format!(
-                "workspace exceeds the {MAX_COORDINATE_POINTS} coordinate-point limit"
-            )));
-        }
-
-        let mut layer_ids = HashSet::new();
-        for id in self
-            .vector_layers
-            .iter()
-            .map(VectorLayer::id)
-            .chain(self.segmentation_layers.iter().map(SegmentationLayer::id))
-            .chain(self.external_layers.iter().map(ExternalLayerReference::id))
-        {
-            if !layer_ids.insert(id) {
-                return Err(ViewerError::InvalidInput(
-                    "workspace contains duplicate layer IDs".into(),
-                ));
-            }
-        }
-        for layer in &self.external_layers {
-            if layer.name().trim().is_empty() || layer.name().len() > 256 {
-                return Err(ViewerError::InvalidInput(
-                    "external layer name must be 1..=256 bytes".into(),
-                ));
-            }
-            for (source, target) in layer.class_mappings() {
-                if source.trim().is_empty()
-                    || source.len() > 1_024
-                    || self.scheme.class(target).is_none()
-                {
-                    return Err(ViewerError::InvalidInput(
-                        "external layer contains an invalid class mapping".into(),
-                    ));
-                }
-            }
-        }
-
-        let mut object_ids = HashSet::new();
-        let mut ordinals = HashSet::new();
-        let mut tracking_ids = HashSet::new();
-        let mut tracking_uids = HashSet::new();
-        let mut max_ordinal = 0;
-        for finding in self.vector_findings() {
-            self.validate_class(
-                finding.class_id(),
-                match finding.geometry() {
-                    VectorFindingGeometry::Point(_) => AnnotationClassGeometry::Point,
-                    VectorFindingGeometry::Regions(_) => AnnotationClassGeometry::Region,
-                },
-            )?;
-            validate_vector_geometry(finding.geometry(), self.source_identity.dimensions())?;
-            validate_identity(
-                finding.object_id(),
-                finding.ordinal(),
-                finding.tracking(),
-                &mut object_ids,
-                &mut ordinals,
-                &mut tracking_ids,
-                &mut tracking_uids,
-            )?;
-            max_ordinal = max_ordinal.max(finding.ordinal());
-        }
-        for segment in self.segments() {
-            self.validate_class(segment.class_id(), AnnotationClassGeometry::Region)?;
-            if segment
-                .primitives()
-                .first()
-                .map(SegmentationPrimitive::operation)
-                != Some(SegmentOperation::Add)
-            {
-                return Err(ViewerError::InvalidInput(
-                    "a segmentation segment must start with an Add primitive".into(),
-                ));
-            }
-            compose_segment(segment.primitives(), self.source_identity.dimensions())?;
-            validate_identity(
-                segment.object_id(),
-                segment.ordinal(),
-                segment.tracking(),
-                &mut object_ids,
-                &mut ordinals,
-                &mut tracking_ids,
-                &mut tracking_uids,
-            )?;
-            max_ordinal = max_ordinal.max(segment.ordinal());
-        }
-        for measurement in &self.measurements {
-            self.validate_class(measurement.class_id(), AnnotationClassGeometry::Region)?;
-            validate_measurement(
-                measurement.endpoints(),
-                measurement.physical_length_mm(),
-                self.source_identity.dimensions(),
-            )?;
-            validate_identity(
-                measurement.object_id(),
-                measurement.ordinal(),
-                measurement.tracking(),
-                &mut object_ids,
-                &mut ordinals,
-                &mut tracking_ids,
-                &mut tracking_uids,
-            )?;
-            max_ordinal = max_ordinal.max(measurement.ordinal());
-        }
-        if self.next_ordinal == 0 || self.next_ordinal <= max_ordinal {
-            return Err(ViewerError::InvalidInput(
-                "workspace next ordinal does not exceed every assigned ordinal".into(),
-            ));
-        }
-        self.validate_sites_for_scheme(&self.scheme)?;
-        self.presentation.validate(&layer_ids, &object_ids)?;
-        Ok(())
     }
 
     fn validate_class(&self, class_id: &str, geometry: AnnotationClassGeometry) -> Result<()> {
@@ -1327,19 +928,6 @@ impl WorkspaceDocument {
             .any(|existing| existing.id() == candidate.id() || existing.uid() == candidate.uid())
     }
 
-    fn layer_exists(&self, id: Uuid) -> bool {
-        self.vector_layers.iter().any(|layer| layer.id() == id)
-            || self
-                .segmentation_layers
-                .iter()
-                .any(|layer| layer.id() == id)
-            || self.external_layers.iter().any(|layer| layer.id() == id)
-    }
-
-    fn object_exists(&self, id: Uuid) -> bool {
-        self.finding(id).is_some() || self.segment(id).is_some() || self.measurement(id).is_some()
-    }
-
     fn bump_revision(&mut self) {
         self.revision = self.revision.saturating_add(1);
     }
@@ -1438,37 +1026,6 @@ fn validate_point_in_bounds(point: Point2, dimensions: (u64, u64)) -> Result<()>
     {
         return Err(ViewerError::InvalidInput(
             "workspace coordinate is outside the source bounds".into(),
-        ));
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn validate_identity(
-    object_id: Uuid,
-    ordinal: u64,
-    tracking: &TrackingIdentity,
-    object_ids: &mut HashSet<Uuid>,
-    ordinals: &mut HashSet<u64>,
-    tracking_ids: &mut HashSet<String>,
-    tracking_uids: &mut HashSet<String>,
-) -> Result<()> {
-    if object_id.is_nil() || !object_ids.insert(object_id) {
-        return Err(ViewerError::InvalidInput(
-            "workspace contains a nil or duplicate object ID".into(),
-        ));
-    }
-    if ordinal == 0 || !ordinals.insert(ordinal) {
-        return Err(ViewerError::InvalidInput(
-            "workspace contains a zero or duplicate ordinal".into(),
-        ));
-    }
-    TrackingIdentity::new(tracking.id(), tracking.uid())?;
-    if !tracking_ids.insert(tracking.id().to_owned())
-        || !tracking_uids.insert(tracking.uid().to_owned())
-    {
-        return Err(ViewerError::InvalidInput(
-            "workspace contains a conflicting tracking identity".into(),
         ));
     }
     Ok(())

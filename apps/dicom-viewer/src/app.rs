@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dicom_viewer_core::{TileDecodeBackend, ViewerStudy};
-use eframe::egui::{self, Frame, Sense};
+use eframe::egui;
 
 mod annotation_actions;
 mod annotation_job;
@@ -11,6 +11,7 @@ mod background_worker;
 mod bounded_input;
 mod camera;
 mod canvas;
+mod canvas_frame;
 mod export_job;
 mod format;
 mod level_warmer;
@@ -25,6 +26,7 @@ mod theme;
 mod tile;
 mod ui;
 mod viewport;
+mod viewport_export;
 mod workspace;
 mod workspace_actions;
 mod workspace_dialogs;
@@ -32,9 +34,11 @@ mod workspace_interaction;
 
 use annotation_job::AnnotationLoadResult;
 use background_worker::BackgroundWorker;
-use camera::{wheel_zoom_factor, CameraState};
+#[cfg(test)]
+use camera::{raw_wheel_delta_y, wheel_zoom_factor};
 #[cfg(test)]
 use camera::{CameraMotion, CameraView, MAX_ZOOM, MIN_ZOOM};
+use camera::{CameraState, WheelZoomSettings};
 use canvas::SlideCanvas;
 use export_job::WorkspaceExportJob;
 use open_job::{OpenPoll, OpenQueue};
@@ -43,16 +47,16 @@ use raster::RasterState;
 use report::ReportState;
 use ui::chrome::{show_status_bar, show_toolbar, ToolbarState};
 use ui::facts::show_facts_sidebar;
-use ui::overlay::{
-    draw_canvas_overlays, paint_canvas_background, paint_empty_state, FrameStats, OverlayInfo,
-};
-use ui::pathology_workspace::{show_pathology_workspace_panel, show_tool_rail};
+use ui::overlay::FrameStats;
+use ui::pathology_workspace::{show_populated_pathology_workspace_panel, show_tool_rail};
+#[cfg(test)]
 use viewport::screen_to_base;
 #[cfg(test)]
 use viewport::{choose_render_level, visible_tiles};
+use viewport_export::PendingViewportExport;
 use workspace::{
-    draw_external_layer_overlays, draw_workspace_overlay, AutosaveStatus, RestoredWorkspace,
-    RevisionStore, SchemeLibrary, WorkspaceAutosave, WorkspaceRuntime, WorkspaceSaveRequest,
+    AutosaveStatus, RestoredWorkspace, RevisionStore, SchemeLibrary, WorkspaceAutosave,
+    WorkspaceRuntime, WorkspaceSaveRequest,
 };
 
 #[cfg(test)]
@@ -69,6 +73,7 @@ const VISIBLE_UPLOAD_BUDGET: Duration = Duration::from_millis(6);
 const MAX_TRANSITION_UPLOADS_PER_FRAME: usize = 2;
 const MAX_PREFETCH_UPLOADS_PER_FRAME: usize = 4;
 const PREFETCH_UPLOAD_BUDGET: Duration = Duration::from_millis(1);
+const WHEEL_ZOOM_STORAGE_KEY: &str = "dicom-viewer-wheel-zoom-v1";
 
 pub struct DicomViewerApp {
     study: Option<Arc<ViewerStudy>>,
@@ -80,11 +85,15 @@ pub struct DicomViewerApp {
     frame_stats: FrameStats,
     camera: CameraState,
     show_facts_panel: bool,
+    show_pathology_workspace: bool,
+    wheel_zoom: WheelZoomSettings,
     pathology: PathologyState,
     report: ReportState,
     raster: RasterState,
     annotation_load_job: Option<BackgroundWorker<AnnotationLoadResult>>,
     workspace_export_job: Option<WorkspaceExportJob>,
+    pending_viewport_export: Option<PendingViewportExport>,
+    last_canvas_rect: Option<egui::Rect>,
     active_path: Option<PathBuf>,
     reported_cpu_fallbacks: usize,
     workspace: Option<WorkspaceRuntime>,
@@ -249,6 +258,13 @@ impl DicomViewerApp {
 
     pub fn new(cc: &eframe::CreationContext<'_>, initial_path: Option<PathBuf>) -> Self {
         theme::install_visuals(&cc.egui_ctx);
+        let wheel_zoom = cc
+            .storage
+            .and_then(|storage| {
+                eframe::get_value::<WheelZoomSettings>(storage, WHEEL_ZOOM_STORAGE_KEY)
+            })
+            .unwrap_or_default()
+            .sanitized();
         let render_state = cc
             .wgpu_render_state
             .clone()
@@ -283,11 +299,15 @@ impl DicomViewerApp {
             frame_stats: FrameStats::default(),
             camera: CameraState::default(),
             show_facts_panel: false,
+            show_pathology_workspace: false,
+            wheel_zoom,
             pathology: PathologyState::default(),
             report: ReportState::default(),
             raster: RasterState::default(),
             annotation_load_job: None,
             workspace_export_job: None,
+            pending_viewport_export: None,
+            last_canvas_rect: None,
             active_path: None,
             reported_cpu_fallbacks: 0,
             workspace: None,
@@ -377,12 +397,15 @@ impl DicomViewerApp {
             job.cancel();
         }
         self.workspace_export_job = None;
+        self.pending_viewport_export = None;
+        self.last_canvas_rect = None;
         self.active_path = None;
         self.reported_cpu_fallbacks = 0;
         self.workspace = None;
         self.autosave = None;
         self.pending_restore = None;
         self.pending_scheme_migration = None;
+        self.show_pathology_workspace = false;
         self.show_import_wizard = false;
         self.show_export_wizard = false;
         self.last_queued_workspace_revision = None;
@@ -507,7 +530,71 @@ fn reconcile_discovered_sidecar_stubs(
     Ok(())
 }
 
+impl DicomViewerApp {
+    fn show_app_toolbar(&mut self, ui: &mut egui::Ui) -> ui::chrome::ToolbarActions {
+        let has_study = self.study.is_some();
+
+        let autosave_label = self.autosave_label();
+        let (can_undo, can_redo) = self.workspace.as_ref().map_or((false, false), |runtime| {
+            (runtime.can_undo(), runtime.can_redo())
+        });
+        show_toolbar(
+            ui,
+            ToolbarState {
+                has_study,
+                show_facts: &mut self.show_facts_panel,
+                show_pathology: &mut self.show_pathology_workspace,
+                can_undo,
+                can_redo,
+                autosave_status: &autosave_label,
+                export_running: self.workspace_export_job.is_some()
+                    || self.pending_viewport_export.is_some(),
+                export_cancel_requested: self
+                    .workspace_export_job
+                    .as_ref()
+                    .is_some_and(WorkspaceExportJob::cancellation_requested),
+                smooth_camera: self.camera.smoothing_enabled_mut(),
+                wheel_zoom: &mut self.wheel_zoom,
+            },
+        )
+    }
+
+    fn apply_toolbar_actions(&mut self, ctx: &egui::Context, actions: &ui::chrome::ToolbarActions) {
+        if actions.open_file {
+            self.pick_file(ctx);
+        }
+        if actions.open_folder {
+            self.pick_folder(ctx);
+        }
+        if actions.undo && self.workspace.as_mut().is_some_and(WorkspaceRuntime::undo) {
+            self.status = "Undid the last pathology command.".into();
+        }
+        if actions.redo && self.workspace.as_mut().is_some_and(WorkspaceRuntime::redo) {
+            self.status = "Redid the pathology command.".into();
+        }
+        if actions.import {
+            self.show_pathology_workspace = true;
+            self.show_import_wizard = true;
+        }
+        if actions.export {
+            self.show_export_wizard = true;
+        }
+        if actions.cancel_export {
+            if let Some(job) = &self.workspace_export_job {
+                job.cancel();
+                self.status = "Cancelling export; the destination will remain unchanged…".into();
+            } else if self.pending_viewport_export.take().is_some() {
+                self.status = "Cancelled current view capture.".into();
+            }
+        }
+    }
+}
+
 impl eframe::App for DicomViewerApp {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, WHEEL_ZOOM_STORAGE_KEY, &self.wheel_zoom);
+    }
+
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_workspace_autosave();
         if ctx.input(|input| input.viewport().close_requested()) {
@@ -545,6 +632,7 @@ impl eframe::App for DicomViewerApp {
         self.handle_dropped_files(ctx);
         self.poll_open_job(ctx);
         self.poll_annotation_jobs(ctx);
+        self.poll_current_view_tiff_export(ctx);
         self.poll_workspace_export_job(ctx);
         self.poll_pathology_job();
         self.poll_report_job();
@@ -556,57 +644,13 @@ impl eframe::App for DicomViewerApp {
         let (stable_dt, predicted_dt) = ui.input(|input| (input.stable_dt, input.predicted_dt));
         self.frame_stats.record(stable_dt, predicted_dt);
 
-        let has_study = self.study.is_some();
-
-        let autosave_label = self.autosave_label();
-        let (can_undo, can_redo) = self.workspace.as_ref().map_or((false, false), |runtime| {
-            (runtime.can_undo(), runtime.can_redo())
-        });
-        let actions = show_toolbar(
-            ui,
-            ToolbarState {
-                has_study,
-                show_facts: &mut self.show_facts_panel,
-                can_undo,
-                can_redo,
-                autosave_status: &autosave_label,
-                export_running: self.workspace_export_job.is_some(),
-                export_cancel_requested: self
-                    .workspace_export_job
-                    .as_ref()
-                    .is_some_and(WorkspaceExportJob::cancellation_requested),
-                smooth_camera: self.camera.smoothing_enabled_mut(),
-            },
-        );
-        if actions.open_file {
-            self.pick_file(ui.ctx());
-        }
-        if actions.open_folder {
-            self.pick_folder(ui.ctx());
-        }
+        let actions = self.show_app_toolbar(ui);
+        self.apply_toolbar_actions(ui.ctx(), &actions);
         // Opening replaces the active study and generation. Refresh the frame
         // snapshot after the modal picker returns so this frame cannot submit
         // work for the previous study under the replacement generation.
         let study = self.study.clone();
         let opening = self.open_queue.is_opening();
-        if actions.undo && self.workspace.as_mut().is_some_and(WorkspaceRuntime::undo) {
-            self.status = "Undid the last pathology command.".into();
-        }
-        if actions.redo && self.workspace.as_mut().is_some_and(WorkspaceRuntime::redo) {
-            self.status = "Redid the pathology command.".into();
-        }
-        if actions.import {
-            self.show_import_wizard = true;
-        }
-        if actions.export {
-            self.show_export_wizard = true;
-        }
-        if actions.cancel_export {
-            if let Some(job) = &self.workspace_export_job {
-                job.cancel();
-            }
-            self.status = "Cancelling export; the destination will remain unchanged…".into();
-        }
         show_status_bar(
             ui,
             &self.status,
@@ -619,176 +663,21 @@ impl eframe::App for DicomViewerApp {
             self.active_generation,
             study.as_ref().map(|study| study.summary()),
         );
-        if let Some(runtime) = &mut self.workspace {
-            if let Some(error) = show_tool_rail(ui, runtime) {
-                self.status = error;
+        if self.show_pathology_workspace {
+            if let Some(runtime) = &mut self.workspace {
+                if let Some(error) = show_tool_rail(ui, runtime) {
+                    self.status = error;
+                }
+                if let Some(panel_actions) = show_populated_pathology_workspace_panel(ui, runtime) {
+                    if panel_actions.close_panel {
+                        self.show_pathology_workspace = false;
+                    }
+                    self.handle_pathology_workspace_actions(panel_actions, ui.ctx());
+                }
             }
-            let panel_actions = show_pathology_workspace_panel(ui, runtime);
-            self.handle_pathology_workspace_actions(panel_actions, ui.ctx());
         }
         self.show_workspace_dialogs(ui.ctx());
-        // ── Central canvas ─────────────────────────────────────────
-        egui::CentralPanel::default_margins()
-            .frame(Frame::NONE.fill(theme::CANVAS))
-            .show_inside(ui, |ui| {
-                let rect = ui.available_rect_before_wrap();
-                let response = ui.allocate_rect(rect, Sense::click_and_drag());
-                if response.clicked() || response.drag_started() {
-                    response.request_focus();
-                } else if ui.input(|input| input.pointer.any_pressed()) && !response.hovered() {
-                    response.surrender_focus();
-                }
-                let painter = ui.painter_at(rect);
-                paint_canvas_background(&painter, rect);
-
-                let Some(study) = study.clone() else {
-                    paint_empty_state(&painter, rect, opening);
-                    return;
-                };
-
-                if actions.fit {
-                    self.canvas.record_zoom_input();
-                    self.camera.request_fit();
-                }
-                self.camera.prepare_canvas(rect, study.summary());
-                if actions.zoom_out {
-                    self.canvas.record_zoom_input();
-                    self.camera.zoom_about_center(rect, 0.8);
-                }
-                if actions.zoom_in {
-                    self.canvas.record_zoom_input();
-                    self.camera.zoom_about_center(rect, 1.25);
-                }
-
-                let accepts_keys =
-                    (response.hovered() || response.has_focus()) && !ui.ctx().text_edit_focused();
-                let zoom_before_keys = self.camera.target_view().zoom;
-                if self.camera.handle_keys(ui, rect, accepts_keys) {
-                    if (self.camera.target_view().zoom - zoom_before_keys).abs() > f32::EPSILON {
-                        self.canvas.record_zoom_input();
-                    }
-                    ui.ctx().request_repaint();
-                }
-
-                let camera_frame = self.camera.frame(rect, study.summary(), stable_dt);
-                if camera_frame.animating {
-                    ui.ctx().request_repaint();
-                }
-                let workspace_interaction = self.handle_workspace_interaction(
-                    ui,
-                    &response,
-                    rect,
-                    study.summary(),
-                    camera_frame.rendered,
-                    accepts_keys,
-                );
-
-                if workspace_interaction.pan_requested {
-                    self.camera
-                        .pan_by_rendered(response.drag_delta(), camera_frame.rendered);
-                    ui.ctx().request_repaint();
-                }
-                if response.double_clicked() && !workspace_interaction.click_consumed {
-                    let pointer = response.interact_pointer_pos().unwrap_or(rect.center());
-                    self.canvas.record_zoom_input();
-                    self.camera
-                        .zoom_around_rendered(rect, pointer, 2.0, camera_frame.rendered);
-                    ui.ctx().request_repaint();
-                }
-
-                if response.hovered() {
-                    let scroll_y = ui.input(|input| input.smooth_scroll_delta.y);
-                    if scroll_y.abs() > 0.0 {
-                        let pointer = ui
-                            .input(|input| input.pointer.hover_pos())
-                            .unwrap_or(rect.center());
-                        self.canvas.record_zoom_input();
-                        self.camera.zoom_around_rendered(
-                            rect,
-                            pointer,
-                            wheel_zoom_factor(scroll_y),
-                            camera_frame.rendered,
-                        );
-                        ui.ctx().request_repaint();
-                    }
-                    let pinch = ui.input(|input| input.zoom_delta());
-                    if (pinch - 1.0).abs() > 0.001 {
-                        let pointer = ui
-                            .input(|input| input.pointer.hover_pos())
-                            .unwrap_or(rect.center());
-                        self.canvas.record_zoom_input();
-                        self.camera.zoom_around_rendered(
-                            rect,
-                            pointer,
-                            pinch,
-                            camera_frame.rendered,
-                        );
-                        ui.ctx().request_repaint();
-                    }
-                    if ui.input(|input| input.pointer.any_down()) {
-                        ui.ctx().request_repaint();
-                    }
-                }
-
-                self.canvas.paint(
-                    ui.ctx(),
-                    &painter,
-                    rect,
-                    &study,
-                    self.active_generation,
-                    camera_frame,
-                );
-                if let Some(runtime) = &mut self.workspace {
-                    if let Err(error) = runtime.refresh_spatial_index() {
-                        self.status =
-                            format!("Could not update annotation viewport index: {error}");
-                    }
-                }
-                if let Some((count, reason)) = self.canvas.cpu_fallback() {
-                    if count > self.reported_cpu_fallbacks {
-                        self.reported_cpu_fallbacks = count;
-                        self.status = format!(
-                            "{} preferred → wgpu; CPU fallback used for {count} tile(s): {reason}",
-                            study.summary().tile_decode_backend
-                        );
-                    }
-                }
-
-                let hover_base = response.hover_pos().map(|p| {
-                    screen_to_base(
-                        rect,
-                        p,
-                        camera_frame.rendered.center_base,
-                        camera_frame.rendered.zoom,
-                    )
-                });
-                let tile_failure = self.canvas.tile_failure();
-                let debug_stats = self.canvas.debug_stats_text();
-                draw_canvas_overlays(
-                    &painter,
-                    rect,
-                    OverlayInfo {
-                        summary: study.summary(),
-                        zoom: camera_frame.rendered.zoom,
-                        frame_rate: self.frame_stats.info(),
-                        hover_base,
-                        tile_failure,
-                        debug_stats: debug_stats.as_deref(),
-                    },
-                );
-                if let Some(runtime) = &self.workspace {
-                    if let Some(context) = study.annotation_context() {
-                        draw_external_layer_overlays(
-                            &painter,
-                            rect,
-                            runtime,
-                            context,
-                            camera_frame.rendered,
-                        );
-                    }
-                    draw_workspace_overlay(&painter, rect, runtime, camera_frame.rendered);
-                }
-            });
+        self.show_canvas(ui, study.as_ref(), opening, &actions, stable_dt);
         self.queue_workspace_autosave();
         if self
             .autosave

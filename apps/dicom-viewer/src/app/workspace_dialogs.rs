@@ -172,11 +172,21 @@ impl DicomViewerApp {
             == AnnotationScheme::tumor_mask_compatibility_v1().content_digest();
         let mut open = true;
         let mut action = PathologyWorkspaceActions::default();
-        egui::Window::new("Export Pathology")
+        egui::Window::new("Export")
             .id(egui::Id::new("pathology-export-wizard"))
             .open(&mut open)
             .default_width(430.0)
             .show(ctx, |ui| {
+                action.export_current_view_tiff =
+                    ui.button("Current screen view (TIFF)…").clicked();
+                ui.label(
+                    RichText::new(
+                        "Captures the visible slide canvas at the current pan and zoom, including pathology overlays but excluding the viewer HUD.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.separator();
                 ui.label(format!(
                     "Preflight: {vectors} vector finding(s), {segments} segment(s), {rulers} ruler(s)."
                 ));
@@ -229,7 +239,8 @@ impl DicomViewerApp {
                     ui.label(RichText::new("GeoJSON excludes rulers only after explicit eligible-items confirmation.").small().weak());
                 }
             });
-        let acted = action.export_portable_workspace
+        let acted = action.export_current_view_tiff
+            || action.export_portable_workspace
             || action.export_scheme_geojson
             || action.export_compatibility_geojson
             || action.export_ann

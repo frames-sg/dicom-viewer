@@ -58,13 +58,12 @@ does not survive restart.
 ## Privacy boundary
 
 Source directory keys do not include patient names. This is still local
-research annotation storage, not de-identification:
+annotation storage, not de-identification:
 
 - annotations, comments, controlled finding sites, and provenance are content;
 - portable workspaces embed that content and the pinned terminology;
 - linked external-layer metadata may contain local filesystem paths;
 - paths and content may appear in the UI, exports, screenshots, or backups.
 
-Use only inputs permitted by the viewer's research-use policy. The viewer does
-not upload workspaces, implement collaborative review, or provide a
+The viewer does not upload workspaces, implement collaborative review, or provide a
 PACS/DICOMweb storage workflow.

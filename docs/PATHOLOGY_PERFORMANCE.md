@@ -50,9 +50,8 @@ performance claim.
 Before using this result to retain or change a production limit, rerun the
 documented command and record the exact commit/worktree state, raw 15-sample
 series, output checksum or equivalent parity evidence, and peak RSS. New tile
-pipeline experiments belong in the [refactor performance
-program](refactor/PERFORMANCE.md) and must follow that document's complete
-before/after protocol.
+pipeline experiments must record equivalent before/after workloads, repeated samples,
+output parity, and peak memory before making performance claims.
 
 | Detailed objects | Detailed vertices | p50 | p95 / max |
 | ---: | ---: | ---: | ---: |

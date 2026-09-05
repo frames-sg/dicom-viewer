@@ -71,6 +71,9 @@ impl DicomViewerApp {
             }
         }
 
+        if actions.export_current_view_tiff {
+            self.begin_current_view_tiff_export(ctx);
+        }
         if actions.export_portable_workspace {
             self.export_portable_workspace(ctx);
         }

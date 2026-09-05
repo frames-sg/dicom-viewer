@@ -6,8 +6,89 @@ use crate::{
     AnnotationScheme, ExternalLayerKind, ExternalLayerReference, ExternalPromotionSource, Point2,
     SegmentEditOutcome, SegmentOperation, SegmentationPrimitive, SegmentationPrimitiveGeometry,
     SourceFrameContext, TrackingIdentity, VectorFindingGeometry, ViewerSourceIdentity,
-    WorkspaceDocument,
+    WorkspaceDocument, WorkspaceObjectGeometryKind, WorkspaceObjectRef,
 };
+
+#[test]
+fn common_object_view_preserves_identity_layer_ownership_and_json_v1() {
+    let mut document =
+        WorkspaceDocument::new(source_identity(), AnnotationScheme::general_pathology_v1())
+            .unwrap();
+    let vector_layer = document.vector_layers()[0].id();
+    let finding = document
+        .add_vector_finding(
+            vector_layer,
+            "cell",
+            VectorFindingGeometry::Point(Point2::new(10.0, 10.0)),
+        )
+        .unwrap();
+    let segment_layer = document.ensure_manual_segmentation_layer();
+    let segment = document
+        .add_segment(
+            segment_layer,
+            "neoplasm",
+            SegmentationPrimitive::polygon(SegmentOperation::Add, square(20.0, 20.0, 5.0)),
+        )
+        .unwrap();
+    let measurement = document
+        .add_linear_measurement(
+            "neoplasm",
+            [Point2::new(30.0, 30.0), Point2::new(40.0, 30.0)],
+            Some(0.01),
+        )
+        .unwrap();
+    let json_before = document.to_json().unwrap();
+
+    let objects = document.objects().collect::<Vec<_>>();
+    assert_eq!(
+        objects
+            .iter()
+            .map(|object| object.object_id())
+            .collect::<Vec<_>>(),
+        [finding, segment, measurement]
+    );
+    assert!(matches!(
+        document.object(finding),
+        Some(WorkspaceObjectRef::Vector(_))
+    ));
+    assert!(matches!(
+        document.object(segment),
+        Some(WorkspaceObjectRef::Segment(_))
+    ));
+    assert!(matches!(
+        document.object(measurement),
+        Some(WorkspaceObjectRef::Measurement(_))
+    ));
+    assert_eq!(
+        document.object(finding).unwrap().geometry_kind(),
+        WorkspaceObjectGeometryKind::Point
+    );
+    assert_eq!(
+        document.object(segment).unwrap().geometry_kind(),
+        WorkspaceObjectGeometryKind::Segmentation
+    );
+    assert_eq!(
+        document.object(measurement).unwrap().geometry_kind(),
+        WorkspaceObjectGeometryKind::Measurement
+    );
+    assert_eq!(
+        document.object_layer_id(finding).unwrap(),
+        Some(vector_layer)
+    );
+    assert_eq!(
+        document.object_layer_id(segment).unwrap(),
+        Some(segment_layer)
+    );
+    assert_eq!(document.object_layer_id(measurement).unwrap(), None);
+    assert!(document.object_layer_id(uuid::Uuid::nil()).is_err());
+    assert_eq!(document.to_json().unwrap(), json_before);
+    assert_eq!(
+        WorkspaceDocument::from_json(&json_before)
+            .unwrap()
+            .schema_version(),
+        1
+    );
+}
 
 fn source_identity() -> ViewerSourceIdentity {
     ViewerSourceIdentity::new(42, 1, 2, 3, 4, 5, (20_000, 10_000))

@@ -1,0 +1,5 @@
+This vendored copy of epaint 0.34.3 is used under the Apache License,
+Version 2.0. The full license text is available at ../../LICENSE-APACHE.
+
+Upstream project: https://github.com/emilk/egui
+Upstream package license: MIT OR Apache-2.0
