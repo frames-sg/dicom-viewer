@@ -80,6 +80,38 @@ impl SourceFrameContext {
     pub const fn plane(&self) -> (Option<u32>, Option<u32>, Option<u32>) {
         (self.z, self.c, self.t)
     }
+
+    /// Converts ANN group applicability into a promotable workspace source context.
+    ///
+    /// Groups applying to multiple optical paths remain readable but cannot be promoted into one
+    /// editable object because the workspace object model carries at most one optical path.
+    pub fn from_ann_group(group: &wsi_dicom_annotations::AnnotationGroup) -> Result<Self> {
+        if !group.applies_to_all_z_planes() || !group.common_z_coordinates().is_empty() {
+            return Err(ViewerError::Unsupported(
+                "ANN group has Z-plane applicability that one editable workspace object cannot preserve"
+                    .into(),
+            ));
+        }
+        let optical_path = match (
+            group.applies_to_all_optical_paths(),
+            group.referenced_optical_paths(),
+        ) {
+            (true, []) => None,
+            (false, [identifier]) => Some(identifier.clone()),
+            (false, identifiers) if identifiers.len() > 1 => {
+                return Err(ViewerError::Unsupported(format!(
+                    "ANN group references {} optical paths and remains read-only because promotion would lose applicability",
+                    identifiers.len()
+                )))
+            }
+            _ => {
+                return Err(ViewerError::InvalidInput(
+                    "ANN group has inconsistent optical-path applicability".into(),
+                ))
+            }
+        };
+        Ok(Self::new(optical_path, None, None, None))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

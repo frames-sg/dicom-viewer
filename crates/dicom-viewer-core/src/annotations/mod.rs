@@ -1,12 +1,14 @@
 mod workspace;
 
 pub use workspace::{
-    CompositeSegmentGeometry, ControlledFindingSite, ExternalLayerKind, ExternalLayerReference,
-    ExternalPromotionSource, LayerPresentation, PolygonComponent, SegmentEditOutcome,
-    SegmentOperation, SegmentationLayer, SegmentationPrimitive, SegmentationPrimitiveGeometry,
-    SegmentationSegmentFinding, SourceFrameContext, VectorFinding, VectorFindingGeometry,
-    VectorLayer, VectorSegmentationPolicy, WorkspaceDocument, WorkspaceGeoJsonExport,
-    WorkspaceLinearMeasurement, WorkspaceObjectProvenance, WorkspacePresentation,
+    BulkAnnExport, BulkAnnotationLocation, CompositeSegmentGeometry, ControlledFindingSite,
+    ExternalLayerKind, ExternalLayerReference, ExternalPromotionSource, LayerPresentation,
+    PolygonComponent, SegmentEditOutcome, SegmentOperation, SegmentationLayer,
+    SegmentationPrimitive, SegmentationPrimitiveGeometry, SegmentationSegmentFinding,
+    SourceFrameContext, VectorFinding, VectorFindingGeometry, VectorLayer,
+    VectorSegmentationPolicy, WorkspaceDocument, WorkspaceGeoJsonExport,
+    WorkspaceLinearMeasurement, WorkspaceObjectGeometryKind, WorkspaceObjectProvenance,
+    WorkspaceObjectRef, WorkspacePresentation,
 };
 pub use wsi_dicom_annotations::*;
 

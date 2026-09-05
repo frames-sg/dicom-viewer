@@ -29,6 +29,14 @@ fn square(x: f64) -> VectorFindingGeometry {
 }
 
 #[test]
+fn a_new_workspace_starts_in_pan_mode() {
+    let runtime =
+        WorkspaceRuntime::new(source(), AnnotationScheme::general_pathology_v1()).unwrap();
+
+    assert_eq!(runtime.active_tool(), ActiveTool::Pan);
+}
+
+#[test]
 fn history_undoes_and_redoes_whole_commands_and_new_edits_invalidate_redo() {
     let mut runtime = WorkspaceRuntime::with_history_limits(
         source(),
@@ -506,6 +514,58 @@ fn imported_ann_requires_explicit_complete_mapping_before_atomic_conversion() {
     assert!(runtime
         .promote_external_object(external, &source_object_id)
         .is_err());
+}
+
+#[test]
+fn imported_multi_optical_ann_remains_viewable_with_precise_promotion_block_reason() {
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("source.dcm");
+    crate::app::tests::write_source_wsi_with_optical_paths(&source_path, &["A", "B"]);
+    let context = DicomAnnotationContext::from_source(&source_path).unwrap();
+    let scheme = AnnotationScheme::general_pathology_v1();
+    let neoplasm = scheme.class("neoplasm").unwrap();
+    let group = AnnotationGroup::polygons(
+        "Multi-path finding",
+        neoplasm.category().clone(),
+        neoplasm.property_type().clone(),
+        neoplasm.recommended_display_cielab(),
+        vec![vec![
+            Point2::new(1.0, 1.0),
+            Point2::new(6.0, 1.0),
+            Point2::new(6.0, 6.0),
+            Point2::new(1.0, 6.0),
+        ]],
+    )
+    .unwrap()
+    .with_referenced_optical_paths(vec!["A".into(), "B".into()])
+    .unwrap();
+    let source_object_id = format!("{}:1", group.uid());
+    let ann = AnnotationDocument::new(context, vec![group]).unwrap();
+    let mut runtime = WorkspaceRuntime::new(
+        ViewerSourceIdentity::new(9, 0, 0, 0, 0, 0, (16, 16)),
+        scheme,
+    )
+    .unwrap();
+    let external = runtime
+        .add_external_annotation("Imported ANN", Some(source_path), ann)
+        .unwrap();
+    let class = runtime.external_classes(external).unwrap().remove(0);
+    runtime
+        .set_external_class_mapping(external, &class.key, "neoplasm")
+        .unwrap();
+
+    let object = runtime.external_objects(external).unwrap().remove(0);
+    assert_eq!(object.source_object_id, source_object_id);
+    assert!(!object.promotable);
+    assert!(!object.promoted);
+    let error = runtime
+        .promote_external_object(external, &source_object_id)
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "unsupported input: ANN group references 2 optical paths and remains read-only because promotion would lose applicability"
+    );
+    assert_eq!(runtime.document().object_count(), 0);
 }
 
 #[test]

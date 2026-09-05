@@ -61,6 +61,13 @@ pub(super) fn wait_for_background<T>(label: &str, mut poll: impl FnMut() -> Opti
 }
 
 pub(super) fn write_source_wsi(path: &std::path::Path) {
+    write_source_wsi_with_optical_paths(path, &[]);
+}
+
+pub(super) fn write_source_wsi_with_optical_paths(
+    path: &std::path::Path,
+    optical_path_identifiers: &[&str],
+) {
     use dicom_core::value::{DataSetSequence, PrimitiveValue, Value};
     use dicom_core::{DataElement, Length, VR};
     use dicom_dictionary_std::{tags, uids};
@@ -89,7 +96,7 @@ pub(super) fn write_source_wsi(path: &std::path::Path) {
         DataElement::new(tags::STUDY_INSTANCE_UID, VR::UI, "2.25.9902"),
         DataElement::new(tags::SERIES_INSTANCE_UID, VR::UI, "2.25.9903"),
         DataElement::new(tags::FRAME_OF_REFERENCE_UID, VR::UI, "2.25.9904"),
-        DataElement::new(tags::PATIENT_NAME, VR::PN, "Research^Slide"),
+        DataElement::new(tags::PATIENT_NAME, VR::PN, "Example^Slide"),
         DataElement::new(tags::PATIENT_ID, VR::LO, "R-1"),
         DataElement::new(tags::STUDY_DATE, VR::DA, "20260814"),
         DataElement::new(tags::STUDY_TIME, VR::TM, "120000"),
@@ -118,6 +125,30 @@ pub(super) fn write_source_wsi(path: &std::path::Path) {
         VR::SQ,
         Value::from(DataSetSequence::new(vec![origin], Length::UNDEFINED)),
     ));
+    if !optical_path_identifiers.is_empty() {
+        let optical_paths = optical_path_identifiers
+            .iter()
+            .map(|identifier| {
+                let mut item = InMemDicomObject::new_empty();
+                item.put(DataElement::new(
+                    tags::OPTICAL_PATH_IDENTIFIER,
+                    VR::SH,
+                    *identifier,
+                ));
+                item
+            })
+            .collect::<Vec<_>>();
+        object.put(DataElement::new(
+            tags::NUMBER_OF_OPTICAL_PATHS,
+            VR::UL,
+            PrimitiveValue::from(u32::try_from(optical_paths.len()).unwrap()),
+        ));
+        object.put(DataElement::new(
+            tags::OPTICAL_PATH_SEQUENCE,
+            VR::SQ,
+            Value::from(DataSetSequence::new(optical_paths, Length::UNDEFINED)),
+        ));
+    }
     object.put(DataElement::new(
         tags::PIXEL_DATA,
         VR::OB,
@@ -157,6 +188,7 @@ fn headless_app_runs_empty_logic_and_ui_with_real_renderer_state() {
     assert!(!output.shapes.is_empty());
     assert!(app.study.is_none());
     assert_eq!(app.active_generation, 0);
+    assert!(!app.show_pathology_workspace);
 
     app.show_facts_panel = true;
     let output = context.run_ui(egui::RawInput::default(), |ui| {
@@ -681,10 +713,65 @@ fn pointer_zoom_preserves_the_base_point_in_the_rendered_frame() {
 }
 
 #[test]
-fn wheel_zoom_direction_is_inverted_for_natural_scroll() {
-    assert!(wheel_zoom_factor(120.0) < 1.0);
-    assert!(wheel_zoom_factor(-120.0) > 1.0);
-    assert_eq!(wheel_zoom_factor(0.0), 1.0);
+fn same_frame_wheel_zoom_retargets_tile_planning_before_animation_advances() {
+    let summary = summary();
+    let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(512.0, 512.0));
+    let pointer = pos2(400.0, 180.0);
+    let mut camera = CameraState::default();
+    camera.reset_for_study(&summary);
+    camera.prepare_canvas(rect, &summary);
+    let frame_before_input = camera.frame(rect, &summary, 1.0 / 60.0);
+
+    camera.zoom_around_rendered(rect, pointer, 2.0, frame_before_input.rendered);
+    let frame_for_tiles = camera.retarget_frame(frame_before_input.rendered, &summary);
+
+    assert_eq!(
+        frame_for_tiles.rendered.zoom,
+        frame_before_input.rendered.zoom
+    );
+    assert_eq!(frame_for_tiles.target.zoom, camera.target_view().zoom);
+    assert!(frame_for_tiles.target.zoom > frame_for_tiles.rendered.zoom);
+    assert!(frame_for_tiles.animating);
+}
+
+#[test]
+fn windows_wheel_zoom_defaults_to_native_direction_and_faster_steps() {
+    let settings = WheelZoomSettings::for_os("windows");
+
+    assert!(!settings.inverted());
+    assert_eq!(settings.speed(), 2.0);
+    assert!(wheel_zoom_factor(120.0, settings) > 1.0);
+    assert!(wheel_zoom_factor(-120.0, settings) < 1.0);
+    assert_eq!(wheel_zoom_factor(0.0, settings), 1.0);
+}
+
+#[test]
+fn wheel_zoom_direction_and_speed_are_explicitly_configurable() {
+    let normal = WheelZoomSettings::new(1.0, false);
+    let faster = WheelZoomSettings::new(2.0, false);
+    let inverted = WheelZoomSettings::new(1.0, true);
+
+    assert!(wheel_zoom_factor(60.0, faster) > wheel_zoom_factor(60.0, normal));
+    assert!(wheel_zoom_factor(60.0, inverted) < 1.0);
+}
+
+#[test]
+fn wheel_zoom_consumes_the_immediate_native_wheel_step() {
+    let context = egui::Context::default();
+    let input = egui::RawInput {
+        events: vec![egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: vec2(0.0, 1.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        }],
+        ..Default::default()
+    };
+    let mut observed = 0.0;
+
+    let _ = context.run_ui(input, |ui| observed = ui.input(raw_wheel_delta_y));
+
+    assert_eq!(observed, egui::InputOptions::default().line_scroll_speed);
 }
 
 #[test]

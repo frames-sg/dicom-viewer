@@ -1,5 +1,4 @@
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 
 use crate::{
     frames_viewer_producer, polygon_signed_area, AnnotationDocument, AnnotationGroup,
@@ -7,7 +6,9 @@ use crate::{
 };
 
 use super::document::WorkspaceDocument;
-use super::export::{apply_vector_context, dicom_label, finding_site_code};
+use super::export::shared::{
+    apply_vector_context, dicom_label, finding_site_code, validate_ann_source_context,
+};
 use super::model::{PolygonComponent, VectorFindingGeometry};
 
 const VIABLE_TUMOR_CIELAB: [u16; 3] = [49_152, 20_000, 48_000];
@@ -35,6 +36,11 @@ impl WorkspaceDocument {
         let mut groups = Vec::new();
 
         for finding in self.vector_findings() {
+            validate_ann_source_context(
+                &format!("compatibility finding #{}", finding.ordinal()),
+                finding.source_frame(),
+                context,
+            )?;
             let class = self.scheme().class(finding.class_id()).ok_or_else(|| {
                 ViewerError::InvalidInput(
                     "finding references an unknown compatibility class".into(),
@@ -71,6 +77,11 @@ impl WorkspaceDocument {
         }
 
         for segment in self.segments() {
+            validate_ann_source_context(
+                &format!("compatibility segment #{}", segment.ordinal()),
+                segment.source_frame(),
+                context,
+            )?;
             if segment.class_id() != "viable-tumor" {
                 return Err(ViewerError::InvalidInput(
                     "compatibility segmentation contains a non-viable-tumor segment".into(),
@@ -104,9 +115,13 @@ impl WorkspaceDocument {
                     exclusion.clone(),
                     EXCLUSION_CIELAB,
                     holes,
-                )?
-                .with_uid(derived_exclusion_uid(segment.object_id()))?;
+                )?;
                 exclusion_group = apply_segment_context(self, segment, exclusion_group)?;
+                exclusion_group = exclusion_group.with_deterministic_uid(
+                    "frames-dicom-viewer:tumor-mask-exclusion:v1",
+                    context.sop_instance_uid(),
+                    &segment.object_id().to_string(),
+                )?;
                 groups.push(exclusion_group);
             }
         }
@@ -224,19 +239,6 @@ fn apply_segment_context(
         group = group.with_referenced_optical_paths(vec![optical_path.to_owned()])?;
     }
     Ok(group)
-}
-
-fn derived_exclusion_uid(object_id: uuid::Uuid) -> String {
-    let digest = Sha256::digest(
-        [
-            b"frames-tumor-mask-exclusion-v1\0".as_slice(),
-            object_id.as_bytes(),
-        ]
-        .concat(),
-    );
-    let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&digest[..16]);
-    format!("2.25.{}", u128::from_be_bytes(bytes))
 }
 
 fn closed_ring(points: &[Point2], positive_area: bool) -> Vec<[f64; 2]> {

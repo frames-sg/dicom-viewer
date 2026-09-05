@@ -1,8 +1,4 @@
-# Research release checklist
-
-This project may be released only as a research-use-only viewer for inputs
-that contain no patient data. It has no clinical, diagnostic, or
-de-identification claim.
+# Release checklist
 
 ## Automated gates
 
@@ -25,10 +21,16 @@ runtime validation must pass when those backends are included in a release.
 ## Reproducible source gate
 
 The locked graph must resolve `wsi-rs` 0.6.0 at revision `b940ea94` and J2K
-0.10.0 at revision `57b6af89` from their upstream Git repositories. CI and
-packaging must build without sibling codec checkouts or local-only source
-overrides. Run `cargo metadata --locked --format-version 1` from a clean
-checkout and confirm that it leaves `Cargo.lock` unchanged.
+0.10.0 at revision `57b6af89` from their upstream Git repositories, plus
+`wsi-dicom-annotations` 0.1.2 from crates.io. The annotations release must include
+the shared `metadata::open_metadata_object` API. Publication of that version and
+a registry lockfile refresh remain prerequisites recorded by the 4 September
+2026 validation.
+
+CI and packaging must build without sibling checkouts or local source overrides.
+Run `cargo metadata --locked --format-version 1` from a clean checkout and confirm
+that it leaves `Cargo.lock` unchanged. A successful build with a local annotations
+overlay does not satisfy this gate.
 
 ## Interactive performance gate
 
@@ -45,7 +47,7 @@ Before describing a build as real-time or interactively responsive:
    stderr, and externally capture presentation frame times. Exercise sustained
    pan and zoom plus repeated fit, level transitions, facts pagination,
    measurement, annotation, and GeoJSON replacement.
-4. Test representative SVS, DICOM VL WSI, and raw JPEG 2000 research inputs for
+4. Test representative SVS, DICOM VL WSI, and raw JPEG 2000 inputs for
    at least 30 minutes in total. Include cold starts, warm revisits, malformed
    input, rapid direction reversals, and memory pressure.
 5. Report p50, p95, p99, and maximum observations alongside every predeclared
@@ -54,7 +56,7 @@ Before describing a build as real-time or interactively responsive:
 
 ## Acceptance and packaging
 
-- Open representative SVS, DICOM VL WSI, and raw JPEG 2000 research fixtures;
+- Open representative SVS, DICOM VL WSI, and raw JPEG 2000 fixtures;
   exercise fit, pan, zoom, facts pagination, measurement, annotation, and
   atomic GeoJSON replacement.
 - Exercise malformed metadata, oversized geometry, and decoder failures and

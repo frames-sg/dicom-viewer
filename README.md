@@ -2,11 +2,6 @@
 
 Lightweight desktop viewer for local whole-slide image files through `wsi-rs`.
 
-This application is for research use only. It is not a medical device and is
-not intended for diagnosis, treatment decisions, or other clinical use. Use
-only research inputs that contain no patient data; the viewer does not perform
-de-identification or validate that an input is free of identifying metadata.
-
 The app is intended for checking `wsi-dicom` output locally and for verifying
 other wsi-rs-supported WSI inputs. It does not upload files or use DICOMweb.
 Its facts panel reads only the technical WSI tags documented below; local file
@@ -14,7 +9,7 @@ paths can still be visible in the UI and in screenshots.
 
 See [Architecture](docs/ARCHITECTURE.md) for ownership, scheduling, cache, and
 Metal interoperability invariants, the [pathology annotation
-workflow](docs/ANNOTATION_WORKFLOW.md), and the [research release
+workflow](docs/ANNOTATION_WORKFLOW.md), and the [release
 checklist](docs/RELEASE.md) for distribution gates.
 
 ## Build
@@ -26,6 +21,15 @@ complete revisions, so no sibling codec checkout is required.
 ```sh
 cargo run -p dicom-viewer
 ```
+
+Build the standalone Windows GUI executable on an x86-64 Windows host with:
+
+```powershell
+cargo build -p dicom-viewer --bin dicom-viewer --release --locked
+```
+
+The Windows build statically links the MSVC runtime, so the resulting
+`target\release\dicom-viewer.exe` requires no application-specific sidecar DLLs.
 
 wgpu is the only presentation backend on every platform. On macOS, ordinary
 builds automatically enable `wsi-rs` Metal decoding and use the renderer's
@@ -81,7 +85,7 @@ space, wsi-rs source caches, or GPU driver overhead.
 DICOM inspection rejects metadata beyond explicit resource limits before the
 eager object parser runs: 1 MiB of file-meta data, 16 MiB per primitive value,
 128 MiB of cumulative primitive values, two million metadata tokens, and 64
-nested sequences. These are research-viewer safety limits rather than DICOM
+nested sequences. These are viewer safety limits rather than DICOM
 conformance claims.
 
 ## Pathology annotation workspace
@@ -129,10 +133,28 @@ contract](docs/FRAMES_PATHOLOGY_GEOJSON_V1.md), [tumor-mask compatibility
 adapter](docs/TUMOR_MASK_COMPATIBILITY.md), and [workspace storage/privacy
 notes](docs/WORKSPACE_STORAGE.md).
 
+### Annotation dependency release gate
+
+The production manifest uses the exact registry version `wsi-dicom-annotations =0.1.2`.
+CI checks out only the viewer. Version 0.1.2 must first be published with the shared
+metadata reader, and Cargo.lock must then be refreshed from the registry and checked
+with `cargo metadata --locked` and the full standalone CI matrix. This release gate
+is currently pending; the local source validation does not prove a standalone build.
+
+For coordinated development before that release, use an explicit local Cargo overlay:
+
+```console
+cargo --config 'patch.crates-io.wsi-dicom-annotations.path="../wsi-dicom-annotations"' test --workspace --all-targets --locked
+```
+
+Do not copy this source overlay into release CI or treat its path-based lock entry
+as a published dependency checksum.
+
 ### Headless annotation interoperability probe
 
-`annotation_probe` is a thin CLI over the separately versioned
-`wsi-dicom-annotations` library. It exposes ANN/SEG parsing and rewriting plus
+`annotation_probe` is maintained in the `wsi-dicom-annotations` repository as the
+`wsi-annotation-probe` package. Build it there with
+`cargo build -p wsi-annotation-probe --bin annotation_probe --locked`. It exposes ANN/SEG parsing and rewriting plus
 Rust-owned GeoJSON and raster conversion without the GUI. It writes one
 schema-versioned JSON object to stdout; warnings and human-readable failures go
 to stderr.
@@ -207,8 +229,6 @@ Dual-licensed under either [MIT](LICENSE-MIT) or
 
 ## Current Scope
 
-- Research-use-only operation with non-patient inputs; no clinical claims or
-  de-identification workflow.
 - Desktop-only `egui/eframe` app with a unified wgpu renderer.
 - Open one wsi-rs-supported WSI file or a folder of DICOM instances.
 - View WSI levels as tiled RGB/RGBA pixels through `wsi-rs`.

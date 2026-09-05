@@ -5,7 +5,7 @@ members = [
     "crates/dicom-viewer-core",
     "crates/metal-wgpu-interop",
 ]
-exclude = ["vendor/lru", "vendor/wayland-scanner"]
+exclude = ["vendor/epaint", "vendor/lru", "vendor/wayland-scanner"]
 
 [workspace.package]
 edition = "2021"
@@ -16,10 +16,7 @@ repository = "https://github.com/frames-sg/dicom-viewer"
 [workspace.dependencies]
 dicom-core = "0.9"
 dicom-dictionary-std = "0.9"
-dicom-encoding = "0.9"
 dicom-object = "0.9"
-dicom-parser = "0.9"
-dicom-transfer-syntax-registry = { version = "0.9", default-features = false }
 eframe = { version = "0.34.2", default-features = false, features = [
     "accesskit",
     "default_fonts",
@@ -43,17 +40,18 @@ serde = { version = "1", features = ["derive", "rc"] }
 wsi-rs = { version = "0.6.0", git = "https://github.com/frames-sg/wsi-rs.git", rev = "b940ea94f3290e54ca2c5f87823109538709c59d" }
 tempfile = "3"
 thiserror = "2"
+tiff = "0.11.3"
 lcms2 = { version = "6.1.1", features = ["static"] }
 sha2 = "0.10"
 uuid = { version = "1", features = ["serde", "v4"] }
 geo = { version = "0.33.1", default-features = false }
 rstar = "0.12.2"
-peak_alloc = "0.3"
-wsi-dicom-annotations = { version = "=0.1.1", path = "../wsi-dicom-annotations" }
+wsi-dicom-annotations = "=0.1.2"
 
 # Temporary security patches for advisories without compatible upstream
 # releases. See each vendored crate's SECURITY-PATCH.md for removal criteria.
 [patch.crates-io]
+epaint = { path = "vendor/epaint" }
 lru = { path = "vendor/lru" }
 wayland-scanner = { path = "vendor/wayland-scanner" }
 
