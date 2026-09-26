@@ -1,5 +1,27 @@
 use super::*;
 use dicom_viewer_core::VectorFindingGeometry;
+use std::sync::Arc;
+
+#[derive(Clone, Default)]
+pub(super) struct FindingRowsCache {
+    document: Option<Arc<dicom_viewer_core::WorkspaceDocument>>,
+    rows: Arc<[FindingRow]>,
+}
+
+impl FindingRowsCache {
+    pub(super) fn rows(&mut self, runtime: &WorkspaceRuntime) -> Arc<[FindingRow]> {
+        let document = runtime.document_snapshot();
+        if !self
+            .document
+            .as_ref()
+            .is_some_and(|cached| Arc::ptr_eq(cached, &document))
+        {
+            self.rows = Arc::from(finding_rows(runtime));
+            self.document = Some(document);
+        }
+        Arc::clone(&self.rows)
+    }
+}
 
 pub(super) fn show_findings(
     ui: &mut egui::Ui,
@@ -7,7 +29,12 @@ pub(super) fn show_findings(
     actions: &mut PathologyWorkspaceActions,
 ) {
     section_heading(ui, "Findings");
-    let rows = finding_rows(runtime);
+    let cache_id = ui.make_persistent_id("finding-rows");
+    let mut cache = ui
+        .data_mut(|data| data.get_temp::<FindingRowsCache>(cache_id))
+        .unwrap_or_default();
+    let rows = cache.rows(runtime);
+    ui.data_mut(|data| data.insert_temp(cache_id, cache));
     if rows.is_empty() {
         ui.label(
             RichText::new("No tracked findings yet.")

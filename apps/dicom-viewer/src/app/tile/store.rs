@@ -1,4 +1,5 @@
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::time::Duration;
 
 use dicom_viewer_core::{LevelIndex, LevelInfo};
@@ -811,13 +812,12 @@ impl TileStore {
                     } else {
                         0
                     };
-                    Some((protection, *last_used, *key))
+                    Some(Reverse((protection, *last_used, *key)))
                 }
                 _ => None,
             })
-            .collect::<Vec<_>>();
-        candidates.sort_unstable();
-        for (_, _, key) in candidates {
+            .collect::<BinaryHeap<_>>();
+        while let Some(Reverse((_, _, key))) = candidates.pop() {
             if self
                 .resident_bytes
                 .checked_add(additional_bytes)
@@ -966,6 +966,29 @@ mod tests {
             },
         );
         store.evict_resident_tiles();
+    }
+
+    #[test]
+    #[ignore = "release CPU cache-pressure characterization"]
+    fn eviction_cpu_performance() {
+        for count in [1024u64, 8192] {
+            for evicted in [1, 8, count / 2] {
+                for sample in 0..15 {
+                    let mut store = TileStore::new(count as usize * 4);
+                    for col in 0..count {
+                        make_ready(&mut store, key(1, col));
+                    }
+                    let started = std::time::Instant::now();
+                    assert!(store.evict_to_fit(evicted as usize * 4));
+                    let elapsed = started.elapsed();
+                    assert_eq!(store.resident_bytes, (count - evicted) as usize * 4);
+                    for col in 0..count {
+                        assert_eq!(store.entries.contains_key(&key(1, col)), col >= evicted);
+                    }
+                    println!("{{\"workload\":\"eviction\",\"tiles\":{count},\"evicted\":{evicted},\"sample\":{sample},\"ms\":{}}}", elapsed.as_secs_f64()*1000.0);
+                }
+            }
+        }
     }
 
     #[test]

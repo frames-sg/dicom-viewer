@@ -202,7 +202,8 @@ The ceiling is deliberately scoped to store-owned decoded data, ready
 textures, synchronous source-plus-destination upload overlap, and one shared
 decoded-byte reservation across all worker batches. Reservations remain held
 until the UI has transferred every batch result into the byte-accounted store.
-Decoder scratch, wsi-rs source caches, and driver overhead are outside it.
+Decoder scratch, wsi-rs source caches, separately bounded ICC tables, and driver
+overhead are outside it.
 
 ## Upload and color management
 
@@ -210,26 +211,63 @@ The UI thread builds one ordered upload plan per paint. Foreground capacity is
 reserved for visible work, with at most two transition uploads during
 interaction. CPU work is time-budgeted and may be deferred without another
 source read. Empty and CPU-only batches create no command encoder; a batch
-with successful Metal work uses one encoder and one submission.
+with successful Metal work uses one encoder and one submission, retaining a
+separate compute pass per tile.
+Each conversion retains its imported buffers and bind group until encoding;
+the command buffer then retains the GPU resources through completion. Each pass
+binds the shared pipeline and dispatches its tile with its own dimensions,
+pitch, and color parameters. CPU deferral and output ordering are unchanged.
 
 `dicom-viewer-core` selects the source ICC profile and owns the CPU transform
 and color-management summary. CPU tiles are converted directly with
 LittleCMS. On the Metal path, the uploader owns the per-profile LUT texture
-used by the existing RGB-to-RGBA compute pass. A profile that cannot meet the
-validated LUT error bound forces the correct CPU color path. A malformed
-profile leaves pixels uncorrected and produces a persistent warning.
+used by the existing RGB-to-RGBA compute pass. A 65³ table is used only after
+its interpolation passes the existing two-code-value error bound over every
+RGB8 input. If it fails, the core generates an exact 256³ RGBA8 table by applying
+the CPU LittleCMS transform directly to all 16,777,216 RGB inputs. The shader
+loads the corresponding integer texel without filtering. For this exact-table
+route, source decoding stays on CPU and regular render reads return
+`CpuWithColorLut`: uncorrected RGBA8 plus the shared table. The uploader copies
+the source to a storage buffer and performs color conversion on Metal. The
+summary reports CPU decoding and `MetalExactLut` color conversion separately.
+Compatibility RGBA reads remain fully color-managed on CPU. Malformed profiles
+still leave pixels uncorrected with a
+persistent warning, and transform/allocation/infrastructure failures retain the
+explicit CPU fallback.
 
-The exhaustive `256^3` LUT proof is cached process-locally in a 16-entry LRU
+The proof or exact table is cached process-locally in a two-entry LRU
 keyed by profile hash, LUT edge, error bound, and validation-algorithm version.
 Concurrent requests for one key share one proof, and both pass and fail
-results are cached. A cold proof uses at most four scoped workers, each with an
-independent color transform. Cache, worker, transform, or proof infrastructure
-failure is visible and forces CPU color conversion; it never accepts an
-unproved LUT.
+results are cached. A cold interpolation proof uses at most four scoped workers,
+each with an independent color transform. Distinct profiles wait for an in-flight
+slot when the cache is full, without holding its lock; cache pressure alone does
+not force CPU routing. Exact construction is one bounded transform over a 64 MiB
+buffer. The proof-cache algorithm version includes this construction policy.
 
-The Metal uploader keeps at most 16 GPU copies of proved LUTs in an LRU and
-clears them when the study is replaced. A LUT evicted or cleared while an
-upload batch is being encoded remains explicitly owned through submission.
+The Metal uploader keeps at most two GPU copies of LUTs and their immutable
+texture views in an LRU and clears them when the study is replaced. A LUT evicted
+or cleared while an upload batch is being prepared remains explicitly owned
+through submission. Unprofiled tiles share one identity view. Each destination
+view is reused for compute and egui registration; immutable tile uniforms are
+initialized with their buffers, avoiding a separate queue write per tile.
+
+Each exact table costs 64 MiB on the CPU and 64 MiB on the GPU. The two-entry
+caches cap their generated table payloads at 128 MiB per side instead of allowing
+16 large tables to occupy 1 GiB per side. Active study/tile owners and in-flight
+GPU work can retain evicted tables until their existing lifetimes end; driver
+staging during initial upload is additional. This trades more memory and first
+upload work for exact GPU color lookup. Forced native Metal JPEG2000 decoding
+was rejected for the newly admitted profiles after repeated 256-pixel batches
+took roughly 0.7–0.95 seconds versus about 8 ms for the CPU pipeline. Existing
+native Metal routing remains for profiles that pass the small-table proof.
+
+CPU input used for GPU color conversion obeys the existing CPU upload budget and
+can be deferred without decoding again. Its host vector is released after the
+GPU source buffer is initialized and before the destination is allocated, keeping
+the explicitly owned input/output payload within the existing RGBA upload-peak
+calculation. Alpha is preserved; RGB Metal inputs remain opaque. Storage-buffer
+limit failures permit the existing one-time CPU color retry. Full and cropped
+DICOM tiles can use this color path, while their decompression stays on CPU.
 
 ## Metal boundary
 

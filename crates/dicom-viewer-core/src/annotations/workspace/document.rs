@@ -9,9 +9,7 @@ use crate::{
     ViewerError, ViewerSourceIdentity,
 };
 
-use super::composition::{
-    compose_segment, composite_geometry, erase_intersects, validate_primitive,
-};
+use super::composition::{compose_segment, erase_intersects, validate_primitive};
 use super::model::{
     CompositeSegmentGeometry, ControlledFindingSite, ExternalLayerReference,
     ExternalPromotionSource, SegmentOperation, SegmentationLayer, SegmentationPrimitive,
@@ -49,6 +47,10 @@ pub struct WorkspaceDocument {
     measurements: Vec<WorkspaceLinearMeasurement>,
     external_layers: Vec<ExternalLayerReference>,
     presentation: WorkspacePresentation,
+    #[serde(skip)]
+    validation: validation::ValidationCache,
+    #[serde(skip)]
+    geometry_identity: Arc<()>,
 }
 
 impl WorkspaceDocument {
@@ -68,6 +70,8 @@ impl WorkspaceDocument {
             measurements: Vec::new(),
             external_layers: Vec::new(),
             presentation,
+            validation: Default::default(),
+            geometry_identity: Arc::new(()),
         })
     }
 
@@ -116,6 +120,16 @@ impl WorkspaceDocument {
     #[must_use]
     pub const fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// Whether snapshots share the same render geometry and class assignments.
+    ///
+    /// This conservative cache identity survives metadata/presentation edits and
+    /// cloning. Independently deserialized documents never share it, even when
+    /// their geometry is equal. It is not a semantic equality comparison.
+    #[must_use]
+    pub fn shares_render_geometry_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.geometry_identity, &other.geometry_identity)
     }
 
     #[must_use]
@@ -430,7 +444,7 @@ impl WorkspaceDocument {
             .find(|segment| segment.object_id() == segment_id)
             .expect("the segment was checked before mutation")
             .set_primitive(primitive_index, primitive)?;
-        self.bump_revision();
+        self.bump_geometry_revision();
         Ok(())
     }
 
@@ -438,10 +452,7 @@ impl WorkspaceDocument {
         let segment = self.segment(segment_id).ok_or_else(|| {
             ViewerError::InvalidInput("the selected segmentation segment does not exist".into())
         })?;
-        Ok(composite_geometry(compose_segment(
-            segment.primitives(),
-            self.source_identity.dimensions(),
-        )?))
+        segment.composite_geometry(self.source_identity.dimensions())
     }
 
     pub fn add_linear_measurement(
@@ -553,7 +564,7 @@ impl WorkspaceDocument {
             .find(|finding| finding.object_id() == object_id)
             .expect("the finding was checked before mutation")
             .set_geometry(geometry);
-        self.bump_revision();
+        self.bump_geometry_revision();
         Ok(())
     }
 
@@ -578,6 +589,7 @@ impl WorkspaceDocument {
                 "geometry replacement cannot change a finding between point and region".into(),
             ));
         }
+        let same_count = finding.geometry().coordinate_count() == geometry.coordinate_count();
         validate_vector_geometry(&geometry, self.source_identity.dimensions())?;
         self.vector_layers
             .iter_mut()
@@ -585,7 +597,11 @@ impl WorkspaceDocument {
             .find(|finding| finding.object_id() == object_id)
             .expect("the finding was checked before mutation")
             .set_geometry(geometry);
-        self.bump_revision();
+        if same_count {
+            self.bump_geometry_revision();
+        } else {
+            self.bump_revision();
+        }
         Ok(())
     }
 
@@ -608,7 +624,7 @@ impl WorkspaceDocument {
                 ViewerError::InvalidInput("the selected measurement does not exist".into())
             })?;
         measurement.set_endpoints(endpoints, physical_length_mm);
-        self.bump_revision();
+        self.bump_geometry_revision();
         Ok(())
     }
 
@@ -630,7 +646,7 @@ impl WorkspaceDocument {
         self.object_mut(object_id)
             .expect("the object was checked before mutation")
             .set_class_id(class_id.to_owned());
-        self.bump_revision();
+        self.bump_geometry_revision();
         Ok(())
     }
 
@@ -672,7 +688,7 @@ impl WorkspaceDocument {
             }
         };
         if changed {
-            self.bump_revision();
+            self.bump_metadata_revision();
         }
         Ok(())
     }
@@ -691,7 +707,7 @@ impl WorkspaceDocument {
             }
         };
         if changed {
-            self.bump_revision();
+            self.bump_metadata_revision();
         }
         Ok(())
     }
@@ -711,7 +727,7 @@ impl WorkspaceDocument {
             }
         };
         if changed {
-            self.bump_revision();
+            self.bump_metadata_revision();
         }
         Ok(())
     }
@@ -807,9 +823,43 @@ impl WorkspaceDocument {
 
     #[must_use]
     pub fn estimated_retained_bytes(&self) -> usize {
-        1024usize
-            .saturating_add(self.object_count().saturating_mul(512))
-            .saturating_add(self.coordinate_count().saturating_mul(16))
+        let input_bytes = || {
+            1024usize
+                .saturating_add(self.object_count().saturating_mul(512))
+                .saturating_add(self.coordinate_count().saturating_mul(16))
+        };
+        if !self.validation.is_validated() {
+            // Accounting must not compose unvalidated input or cache a size
+            // before validation prepares the retained segment geometry.
+            return input_bytes();
+        }
+        *self.validation.retained_bytes.get_or_init(|| {
+            self.segments().fold(input_bytes(), |total, segment| {
+                let composite = segment
+                    .composite_geometry(self.source_identity.dimensions())
+                    .expect("validated segment primitives must compose successfully");
+                composite
+                    .components()
+                    .iter()
+                    .fold(total, |total, component| {
+                        let exterior = component
+                            .exterior()
+                            .len()
+                            .saturating_mul(std::mem::size_of::<Point2>());
+                        let holes = component.holes().iter().fold(0usize, |bytes, hole| {
+                            bytes
+                                .saturating_add(std::mem::size_of::<Vec<Point2>>())
+                                .saturating_add(
+                                    hole.len().saturating_mul(std::mem::size_of::<Point2>()),
+                                )
+                        });
+                        total
+                            .saturating_add(std::mem::size_of_val(component))
+                            .saturating_add(exterior)
+                            .saturating_add(holes)
+                    })
+            })
+        })
     }
 
     fn validate_class(&self, class_id: &str, geometry: AnnotationClassGeometry) -> Result<()> {
@@ -929,6 +979,21 @@ impl WorkspaceDocument {
     }
 
     fn bump_revision(&mut self) {
+        self.validation = Default::default();
+        self.bump_geometry_revision();
+    }
+
+    // Locally validated replacements with unchanged counts preserve the global
+    // validation proof and location map; derived geometry size may change.
+    fn bump_geometry_revision(&mut self) {
+        self.geometry_identity = Arc::new(());
+        self.validation.retained_bytes = Default::default();
+        self.bump_metadata_revision();
+    }
+
+    /// These setters validate their new values before writing and cannot change
+    /// identities, coordinates, classes, or resource counts of a validated input.
+    fn bump_metadata_revision(&mut self) {
         self.revision = self.revision.saturating_add(1);
     }
 }

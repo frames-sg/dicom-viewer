@@ -7,12 +7,14 @@ use std::time::{Duration, Instant};
 use dicom_viewer_core::ColorLut3d;
 use dicom_viewer_core::{RgbaTile, ViewerOpenOptions};
 use eframe::{egui, egui_wgpu, wgpu};
+#[cfg(target_os = "macos")]
+use wgpu::util::DeviceExt;
 
 use super::{DecodedTile, TileFootprint};
 
 #[cfg(target_os = "macos")]
 // Keep the renderer copy bound aligned with the process-wide ICC proof cache.
-const RENDERER_COLOR_LUT_CACHE_CAPACITY: usize = 16;
+const RENDERER_COLOR_LUT_CACHE_CAPACITY: usize = 2;
 
 #[cfg(target_os = "macos")]
 const RGB_TO_RGBA_SHADER: &str = r#"
@@ -23,7 +25,7 @@ struct TileLayout {
     byte_offset: u32,
     use_color_lut: u32,
     color_lut_edge: u32,
-    _padding0: u32,
+    source_pixel_bytes: u32,
     _padding1: u32,
 }
 
@@ -43,6 +45,10 @@ fn apply_color_lut(rgb: vec3<f32>) -> vec3<f32> {
     if (tile_layout.use_color_lut == 0u) {
         return rgb;
     }
+    if (tile_layout.color_lut_edge == 256u) {
+        // Source values are RGB8. Address exact entries without filtering.
+        return textureLoad(color_lut, vec3<i32>(round(rgb * 255.0)), 0).rgb;
+    }
     let edge = f32(tile_layout.color_lut_edge);
     let coordinate = (rgb * (edge - 1.0) + vec3<f32>(0.5)) / edge;
     return textureSampleLevel(color_lut, color_lut_sampler, coordinate, 0.0).rgb;
@@ -53,13 +59,17 @@ fn convert(@builtin(global_invocation_id) id: vec3<u32>) {
     if (id.x >= tile_layout.width || id.y >= tile_layout.height) {
         return;
     }
-    let offset = tile_layout.byte_offset + id.y * tile_layout.pitch_bytes + id.x * 3u;
+    let offset = tile_layout.byte_offset + id.y * tile_layout.pitch_bytes + id.x * tile_layout.source_pixel_bytes;
     let rgb = vec3<f32>(
         f32(source_byte(offset)),
         f32(source_byte(offset + 1u)),
         f32(source_byte(offset + 2u)),
     ) / 255.0;
-    textureStore(destination, vec2<i32>(id.xy), vec4<f32>(apply_color_lut(rgb), 1.0));
+    var alpha = 1.0;
+    if (tile_layout.source_pixel_bytes == 4u) {
+        alpha = f32(source_byte(offset + 3u)) / 255.0;
+    }
+    textureStore(destination, vec2<i32>(id.xy), vec4<f32>(apply_color_lut(rgb), alpha));
 }
 "#;
 
@@ -97,7 +107,7 @@ struct ColorLutTextureKey {
 
 #[cfg(target_os = "macos")]
 struct ColorLutTextureCache {
-    entries: VecDeque<(ColorLutTextureKey, Arc<wgpu::Texture>)>,
+    entries: VecDeque<(ColorLutTextureKey, Arc<wgpu::TextureView>)>,
 }
 
 #[cfg(target_os = "macos")]
@@ -112,7 +122,7 @@ impl ColorLutTextureCache {
         &mut self,
         key: ColorLutTextureKey,
         create: impl FnOnce() -> wgpu::Texture,
-    ) -> Arc<wgpu::Texture> {
+    ) -> Arc<wgpu::TextureView> {
         if let Some(position) = self
             .entries
             .iter()
@@ -129,7 +139,8 @@ impl ColorLutTextureCache {
         if self.entries.len() >= RENDERER_COLOR_LUT_CACHE_CAPACITY {
             self.entries.pop_front();
         }
-        let texture = Arc::new(create());
+        // TextureView retains its texture; cache the immutable view as well.
+        let texture = Arc::new(create().create_view(&wgpu::TextureViewDescriptor::default()));
         self.entries.push_back((key, Arc::clone(&texture)));
         texture
     }
@@ -153,10 +164,9 @@ impl ColorLutTextureCache {
 
 #[cfg(target_os = "macos")]
 struct ColorLutBinding {
-    view: wgpu::TextureView,
     edge: u32,
     enabled: bool,
-    owner: Arc<wgpu::Texture>,
+    owner: Arc<wgpu::TextureView>,
 }
 
 /// Owns a native wgpu texture and its egui registration as one lifetime.
@@ -202,7 +212,7 @@ pub(super) struct WgpuTileUploader {
     #[cfg(target_os = "macos")]
     color_lut_sampler: wgpu::Sampler,
     #[cfg(target_os = "macos")]
-    identity_color_lut: Arc<wgpu::Texture>,
+    identity_color_lut: Arc<wgpu::TextureView>,
     #[cfg(target_os = "macos")]
     color_luts: ColorLutTextureCache,
     #[cfg(target_os = "macos")]
@@ -233,7 +243,7 @@ pub(super) trait TileUploadSink {
 enum PreparedBudgetedUpload {
     Registered(RegisteredTileTexture),
     #[cfg(target_os = "macos")]
-    Prepared(PreparedTexture),
+    Prepared(PreparedMetalConversion),
     Failed(TileUploadError),
     Deferred(DecodedTile),
 }
@@ -259,13 +269,16 @@ impl WgpuTileUploader {
             ..wgpu::SamplerDescriptor::default()
         });
         #[cfg(target_os = "macos")]
-        let identity_color_lut = Arc::new(create_color_lut_texture(
-            &state.device,
-            &state.queue,
-            2,
-            &identity_color_lut_rgba(),
-            "DICOM viewer identity color LUT",
-        ));
+        let identity_color_lut = Arc::new(
+            create_color_lut_texture(
+                &state.device,
+                &state.queue,
+                2,
+                &identity_color_lut_rgba(),
+                "DICOM viewer identity color LUT",
+            )
+            .create_view(&wgpu::TextureViewDescriptor::default()),
+        );
         #[cfg(target_os = "macos")]
         let (metal_bridge, metal_bridge_error) =
             match metal_wgpu_interop::MetalWgpuBridge::new(&state.device) {
@@ -386,21 +399,20 @@ impl WgpuTileUploader {
         }
         let device = self.context.state.device.clone();
         let queue = self.context.state.queue.clone();
-        #[cfg(target_os = "macos")]
-        let mut encoder = None;
         let mut prepared = Vec::with_capacity(inputs.len());
         let mut cpu_uploads = 0_usize;
         let mut cpu_elapsed = Duration::ZERO;
 
         for input in inputs {
             let result = match input {
+                OwnedUploadInput::Decoded(tile)
+                    if tile.is_cpu()
+                        && cpu_uploads > 0
+                        && cpu_budget.is_some_and(|budget| cpu_elapsed >= budget) =>
+                {
+                    PreparedBudgetedUpload::Deferred(tile)
+                }
                 OwnedUploadInput::Decoded(tile) => match tile {
-                    DecodedTile::Cpu(tile)
-                        if cpu_uploads > 0
-                            && cpu_budget.is_some_and(|budget| cpu_elapsed >= budget) =>
-                    {
-                        PreparedBudgetedUpload::Deferred(DecodedTile::Cpu(tile))
-                    }
                     DecodedTile::Cpu(tile) => {
                         let started = Instant::now();
                         let result = prepare_cpu_texture(&device, &queue, tile)
@@ -413,16 +425,25 @@ impl WgpuTileUploader {
                         }
                     }
                     #[cfg(target_os = "macos")]
-                    DecodedTile::Metal(tile) => {
-                        match self.prepare_metal_texture(&mut encoder, tile) {
-                            Ok(texture) => PreparedBudgetedUpload::Prepared(texture),
+                    DecodedTile::CpuWithColorLut { tile, color_lut } => {
+                        let started = Instant::now();
+                        let result = self.prepare_cpu_color_texture(tile, &color_lut);
+                        cpu_elapsed = cpu_elapsed.saturating_add(started.elapsed());
+                        cpu_uploads = cpu_uploads.saturating_add(1);
+                        match result {
+                            Ok(conversion) => PreparedBudgetedUpload::Prepared(conversion),
                             Err(error) => PreparedBudgetedUpload::Failed(error),
                         }
                     }
+                    #[cfg(target_os = "macos")]
+                    DecodedTile::Metal(tile) => match self.prepare_metal_texture(tile) {
+                        Ok(texture) => PreparedBudgetedUpload::Prepared(texture),
+                        Err(error) => PreparedBudgetedUpload::Failed(error),
+                    },
                 },
                 #[cfg(all(test, target_os = "macos"))]
                 OwnedUploadInput::TestMetal(image) => {
-                    match self.prepare_metal_image(&mut encoder, &image, None) {
+                    match self.prepare_metal_image(&image, None) {
                         Ok(texture) => PreparedBudgetedUpload::Prepared(texture),
                         Err(error) => PreparedBudgetedUpload::Failed(error),
                     }
@@ -432,8 +453,16 @@ impl WgpuTileUploader {
         }
 
         #[cfg(target_os = "macos")]
-        if let Some(encoder) = encoder {
-            queue.submit([encoder.finish()]);
+        if let Some(commands) =
+            self.encode_metal_conversions(prepared.iter().filter_map(|result| {
+                if let PreparedBudgetedUpload::Prepared(conversion) = result {
+                    Some(conversion)
+                } else {
+                    None
+                }
+            }))
+        {
+            queue.submit([commands]);
             self.submissions = self.submissions.saturating_add(1);
         }
         prepared
@@ -444,7 +473,7 @@ impl WgpuTileUploader {
                 }
                 #[cfg(target_os = "macos")]
                 PreparedBudgetedUpload::Prepared(texture) => {
-                    BudgetedUploadOutcome::Ready(self.register(texture))
+                    BudgetedUploadOutcome::Ready(self.register(texture.texture))
                 }
                 PreparedBudgetedUpload::Failed(error) => BudgetedUploadOutcome::Failed(error),
                 PreparedBudgetedUpload::Deferred(tile) => BudgetedUploadOutcome::Deferred(tile),
@@ -457,12 +486,9 @@ impl WgpuTileUploader {
     }
 
     fn register(&self, prepared: PreparedTexture) -> RegisteredTileTexture {
-        let view = prepared
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
         let texture_id = self.context.state.renderer.write().register_native_texture(
             &self.context.state.device,
-            &view,
+            &prepared.view,
             wgpu::FilterMode::Nearest,
         );
         RegisteredTileTexture {
@@ -477,22 +503,20 @@ impl WgpuTileUploader {
     #[cfg(target_os = "macos")]
     fn prepare_metal_texture(
         &mut self,
-        encoder: &mut Option<wgpu::CommandEncoder>,
         tile: dicom_viewer_core::MetalRenderTile,
-    ) -> Result<PreparedTexture, TileUploadError> {
+    ) -> Result<PreparedMetalConversion, TileUploadError> {
         let image = tile
             .resident_image()
             .map_err(|error| TileUploadError::MetalTile(error.to_string()))?;
-        self.prepare_metal_image(encoder, image, tile.color_lut())
+        self.prepare_metal_image(image, tile.color_lut())
     }
 
     #[cfg(target_os = "macos")]
     fn prepare_metal_image(
         &mut self,
-        encoder: &mut Option<wgpu::CommandEncoder>,
         image: &metal_wgpu_interop::ResidentMetalImage,
         color_lut: Option<&ColorLut3d>,
-    ) -> Result<PreparedTexture, TileUploadError> {
+    ) -> Result<PreparedMetalConversion, TileUploadError> {
         let (width, height) = image.dimensions();
         validate_texture_dimensions(
             width,
@@ -508,15 +532,83 @@ impl WgpuTileUploader {
             )
         })?;
         let imported = bridge.import_rgb8(image)?;
-        let encoder = encoder.get_or_insert_with(|| {
-            self.context
-                .state
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("DICOM viewer tile upload batch"),
-                })
-        });
         let (width, height) = imported.dimensions();
+        Ok(self.prepare_color_conversion(
+            imported.buffer(),
+            ColorConversionLayout {
+                width,
+                height,
+                pitch_bytes: imported.pitch_bytes(),
+                byte_offset: imported.byte_offset(),
+                pixel_bytes: 3,
+            },
+            color_lut,
+        ))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn prepare_cpu_color_texture(
+        &mut self,
+        tile: RgbaTile,
+        color_lut: &ColorLut3d,
+    ) -> Result<PreparedMetalConversion, TileUploadError> {
+        let device = &self.context.state.device;
+        validate_texture_dimensions(
+            tile.width,
+            tile.height,
+            device.limits().max_texture_dimension_2d,
+        )
+        .map_err(TileUploadError::InvalidCpuTile)?;
+        let byte_len = TileFootprint::rgba_texture_bytes(tile.width, tile.height)
+            .map_err(|_| TileUploadError::InvalidCpuTile("RGBA byte size overflows"))?;
+        if tile.rgba.len() != byte_len {
+            return Err(TileUploadError::InvalidCpuTile(
+                "pixel byte count does not match dimensions",
+            ));
+        }
+        if byte_len as u64
+            > device
+                .limits()
+                .max_buffer_size
+                .min(device.limits().max_storage_buffer_binding_size)
+        {
+            return Err(TileUploadError::MetalTile(
+                "CPU-decoded color input exceeds the renderer storage-buffer limit".into(),
+            ));
+        }
+        let layout = ColorConversionLayout {
+            width: tile.width,
+            height: tile.height,
+            pitch_bytes: tile.width * 4,
+            byte_offset: 0,
+            pixel_bytes: 4,
+        };
+        let source = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("DICOM viewer CPU-decoded color input"),
+            contents: &tile.rgba,
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        // Transfer ownership from host input to GPU input before allocating the
+        // destination. The explicit source+destination payload still fits the
+        // existing CPU-RGBA upload footprint; driver staging is separate.
+        drop(tile);
+        Ok(self.prepare_color_conversion(&source, layout, Some(color_lut)))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn prepare_color_conversion(
+        &mut self,
+        source: &wgpu::Buffer,
+        layout: ColorConversionLayout,
+        color_lut: Option<&ColorLut3d>,
+    ) -> PreparedMetalConversion {
+        let ColorConversionLayout {
+            width,
+            height,
+            pitch_bytes,
+            byte_offset,
+            pixel_bytes,
+        } = layout;
         let texture = create_rgba_texture(
             &self.context.state.device,
             width,
@@ -528,28 +620,28 @@ impl WgpuTileUploader {
         let params = [
             width,
             height,
-            imported.pitch_bytes(),
-            imported.byte_offset(),
+            pitch_bytes,
+            byte_offset,
             u32::from(color_lut.enabled),
             color_lut.edge,
-            0,
+            pixel_bytes,
             0,
         ];
-        let uniform = self
-            .context
-            .state
-            .device
-            .create_buffer(&wgpu::BufferDescriptor {
-                label: Some("DICOM viewer Metal tile layout"),
-                size: 32,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
         let mut bytes = [0_u8; 32];
         for (chunk, value) in bytes.chunks_exact_mut(4).zip(params) {
             chunk.copy_from_slice(&value.to_le_bytes());
         }
-        self.context.state.queue.write_buffer(&uniform, 0, &bytes);
+        // Initialize immutable parameters with the buffer, avoiding a separate
+        // Queue::write_buffer call for every tile.
+        let uniform =
+            self.context
+                .state
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("DICOM viewer Metal tile layout"),
+                    contents: &bytes,
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
         let bind_group = self
             .context
             .state
@@ -560,7 +652,7 @@ impl WgpuTileUploader {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: imported.buffer().as_entire_binding(),
+                        resource: source.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
@@ -572,7 +664,7 @@ impl WgpuTileUploader {
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
-                        resource: wgpu::BindingResource::TextureView(&color_lut.view),
+                        resource: wgpu::BindingResource::TextureView(&color_lut.owner),
                     },
                     wgpu::BindGroupEntry {
                         binding: 4,
@@ -580,21 +672,46 @@ impl WgpuTileUploader {
                     },
                 ],
             });
-        {
+        PreparedMetalConversion {
+            texture: PreparedTexture {
+                texture,
+                view,
+                width,
+                height,
+                _color_lut_owner: Some(color_lut.owner),
+            },
+            bind_group,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn encode_metal_conversions<'a>(
+        &mut self,
+        conversions: impl Iterator<Item = &'a PreparedMetalConversion>,
+    ) -> Option<wgpu::CommandBuffer> {
+        let mut conversions = conversions.peekable();
+        conversions.peek()?;
+        let mut encoder =
+            self.context
+                .state
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("DICOM viewer tile upload batch"),
+                });
+        for conversion in conversions {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("DICOM viewer Metal RGB8 conversion"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.conversion_pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
+            pass.set_bind_group(0, &conversion.bind_group, &[]);
+            pass.dispatch_workgroups(
+                conversion.texture.width.div_ceil(8),
+                conversion.texture.height.div_ceil(8),
+                1,
+            );
         }
-        Ok(PreparedTexture {
-            texture,
-            width,
-            height,
-            _color_lut_owner: Some(color_lut.owner),
-        })
+        Some(encoder.finish())
     }
 
     #[cfg(target_os = "macos")]
@@ -602,7 +719,6 @@ impl WgpuTileUploader {
         let Some(color_lut) = color_lut else {
             let owner = Arc::clone(&self.identity_color_lut);
             return ColorLutBinding {
-                view: owner.create_view(&wgpu::TextureViewDescriptor::default()),
                 edge: 2,
                 enabled: false,
                 owner,
@@ -624,7 +740,6 @@ impl WgpuTileUploader {
             )
         });
         ColorLutBinding {
-            view: owner.create_view(&wgpu::TextureViewDescriptor::default()),
             edge: color_lut.edge(),
             enabled: true,
             owner,
@@ -694,12 +809,30 @@ fn create_color_lut_texture(
     texture
 }
 
+#[cfg(target_os = "macos")]
+struct ColorConversionLayout {
+    width: u32,
+    height: u32,
+    pitch_bytes: u32,
+    byte_offset: u32,
+    pixel_bytes: u32,
+}
+
+#[cfg(target_os = "macos")]
+struct PreparedMetalConversion {
+    texture: PreparedTexture,
+    // Owns imported buffers and views until the batch is encoded. The finished
+    // command buffer retains those resources through GPU completion.
+    bind_group: wgpu::BindGroup,
+}
+
 struct PreparedTexture {
     texture: wgpu::Texture,
+    view: wgpu::TextureView,
     width: u32,
     height: u32,
     #[cfg(target_os = "macos")]
-    _color_lut_owner: Option<Arc<wgpu::Texture>>,
+    _color_lut_owner: Option<Arc<wgpu::TextureView>>,
 }
 
 fn prepare_cpu_texture(
@@ -745,8 +878,10 @@ fn prepare_cpu_texture(
             depth_or_array_layers: 1,
         },
     );
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     Ok(PreparedTexture {
         texture,
+        view,
         width: tile.width,
         height: tile.height,
         #[cfg(target_os = "macos")]
@@ -873,6 +1008,11 @@ fn conversion_pipeline(
 
 #[cfg(test)]
 pub(in crate::app) fn render_state() -> Option<egui_wgpu::RenderState> {
+    render_state_with_features(wgpu::Features::empty())
+}
+
+#[cfg(test)]
+fn render_state_with_features(features: wgpu::Features) -> Option<egui_wgpu::RenderState> {
     let descriptor = wgpu::InstanceDescriptor {
         #[cfg(target_os = "macos")]
         backends: wgpu::Backends::METAL,
@@ -882,8 +1022,11 @@ pub(in crate::app) fn render_state() -> Option<egui_wgpu::RenderState> {
     let adapter =
         pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
             .ok()?;
-    let (device, queue) =
-        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()?;
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        required_features: features,
+        ..wgpu::DeviceDescriptor::default()
+    }))
+    .ok()?;
     let renderer = egui_wgpu::Renderer::new(
         &device,
         wgpu::TextureFormat::Rgba8Unorm,
@@ -907,6 +1050,48 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "release CPU upload and registration characterization; requires a GPU adapter"]
+    fn upload_cpu_performance() {
+        let state = render_state().expect("benchmark requires a renderer");
+        let device = state.device.clone();
+        let queue = state.queue.clone();
+        let renderer = Arc::clone(&state.renderer);
+        let mut uploader = WgpuTileUploader::new(state);
+        for edge in [64u32, 256, 1024] {
+            let expected: Vec<u8> = (0..edge as usize * edge as usize * 4)
+                .map(|i| (i % 251) as u8)
+                .collect();
+            for sample in 0..15 {
+                let tiles = (0..8)
+                    .map(|_| {
+                        DecodedTile::Cpu(RgbaTile {
+                            width: edge,
+                            height: edge,
+                            rgba: expected.clone(),
+                        })
+                    })
+                    .collect();
+                let started = std::time::Instant::now();
+                let uploads = uploader.upload_batch(tiles);
+                let elapsed = started.elapsed();
+                assert_eq!(uploads.len(), 8);
+                let uploads: Vec<_> = uploads.into_iter().map(Result::unwrap).collect();
+                let ids: Vec<_> = uploads.iter().map(RegisteredTileTexture::id).collect();
+                for tile in &uploads {
+                    assert!(renderer.read().texture(&tile.id()).is_some());
+                    assert_eq!(
+                        read_texture(&device, &queue, tile.texture(), edge, edge),
+                        expected
+                    );
+                }
+                drop(uploads);
+                assert!(ids.iter().all(|id| renderer.read().texture(id).is_none()));
+                println!("{{\"workload\":\"upload\",\"edge\":{edge},\"batch\":8,\"sample\":{sample},\"ms\":{}}}", elapsed.as_secs_f64()*1000.0);
+            }
+        }
+    }
+
+    #[test]
     fn texture_dimensions_are_rejected_before_wgpu_resource_creation() {
         assert_eq!(validate_texture_dimensions(4096, 4096, 4096), Ok(()));
         assert_eq!(
@@ -919,7 +1104,7 @@ mod tests {
         );
     }
 
-    fn read_texture(
+    pub(super) fn read_texture(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         texture: &wgpu::Texture,
@@ -1075,7 +1260,7 @@ mod tests {
             return;
         };
         let mut uploader = WgpuTileUploader::new(state);
-        for index in 0..16 {
+        for index in 0..RENDERER_COLOR_LUT_CACHE_CAPACITY {
             let lut = synthetic_color_lut(&format!("profile-{index}"));
             drop(uploader.color_lut_binding(Some(&lut)));
         }
@@ -1085,7 +1270,7 @@ mod tests {
         let newest = synthetic_color_lut("profile-16");
         drop(uploader.color_lut_binding(Some(&newest)));
 
-        assert_eq!(uploader.color_luts.len(), 16);
+        assert_eq!(uploader.color_luts.len(), RENDERER_COLOR_LUT_CACHE_CAPACITY);
         assert!(uploader.color_luts.contains_profile("profile-0"));
         assert!(!uploader.color_luts.contains_profile("profile-1"));
         assert!(uploader.color_luts.contains_profile("profile-16"));
@@ -1113,6 +1298,8 @@ mod tests {
         let Some(state) = render_state() else {
             return;
         };
+        let device = state.device.clone();
+        let queue = state.queue.clone();
         let mut uploader = WgpuTileUploader::new(state);
         let (first_metal, second_metal) = {
             let bridge = uploader.metal_bridge.as_ref().unwrap();
@@ -1121,7 +1308,7 @@ mod tests {
                     .resident_rgb8_test_fixture(&[1, 2, 3, 0], 0, (1, 1), 4)
                     .unwrap(),
                 bridge
-                    .resident_rgb8_test_fixture(&[4, 5, 6, 0], 0, (1, 1), 4)
+                    .resident_rgb8_test_fixture(&[4, 5, 6, 7, 8, 9, 0, 0], 0, (2, 1), 8)
                     .unwrap(),
             )
         };
@@ -1144,6 +1331,21 @@ mod tests {
             .iter()
             .all(|outcome| matches!(outcome, BudgetedUploadOutcome::Ready(_))));
         assert_eq!(uploader.submission_count(), 1);
+        for (outcome, expected) in outcomes.iter().zip([
+            vec![7, 8, 9, 255],
+            vec![1, 2, 3, 255],
+            vec![4, 5, 6, 255, 7, 8, 9, 255],
+        ]) {
+            let BudgetedUploadOutcome::Ready(tile) = outcome else {
+                unreachable!()
+            };
+            let (width, height) = tile.dimensions();
+            assert_eq!(width as usize * height as usize * 4, expected.len());
+            assert_eq!(
+                read_texture(&device, &queue, tile.texture(), width, height),
+                expected
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -1213,12 +1415,11 @@ mod tests {
         let image = bridge
             .resident_rgb8_test_fixture(&pitched, 4, (3, 2), 12)
             .unwrap();
-        let mut encoder = None;
-        let prepared = uploader
-            .prepare_metal_image(&mut encoder, &image, None)
-            .unwrap();
-        queue.submit([encoder.take().unwrap().finish()]);
-        let uploaded = uploader.register(prepared);
+        let prepared = uploader.prepare_metal_image(&image, None).unwrap();
+        queue.submit([uploader
+            .encode_metal_conversions(std::iter::once(&prepared))
+            .unwrap()]);
+        let uploaded = uploader.register(prepared.texture);
         let expected = rgb
             .chunks_exact(3)
             .flat_map(|pixel| [pixel[0], pixel[1], pixel[2], 255])
@@ -1228,6 +1429,21 @@ mod tests {
             read_texture(&device, &queue, uploaded.texture(), 3, 2),
             expected
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn repeated_color_lut_bindings_reuse_the_same_gpu_view() {
+        let Some(state) = render_state() else {
+            return;
+        };
+        let mut uploader = WgpuTileUploader::new(state);
+        let lut = synthetic_color_lut("reused-view");
+        for lut in [None, Some(&lut)] {
+            let first = uploader.color_lut_binding(lut);
+            let second = uploader.color_lut_binding(lut);
+            assert_eq!(first.owner, second.owner);
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -1253,20 +1469,29 @@ mod tests {
             }
         }
         let lut = ColorLut3d::from_rgba8(2, lut, "synthetic-inverse").unwrap();
-        let mut encoder = None;
-        let prepared = uploader
-            .prepare_metal_image(&mut encoder, &image, Some(&lut))
-            .unwrap();
-        assert!(prepared._color_lut_owner.is_some());
+        let prepared = uploader.prepare_metal_image(&image, Some(&lut)).unwrap();
+        assert!(prepared.texture._color_lut_owner.is_some());
         assert_eq!(uploader.color_luts.len(), 1);
+        let plain = uploader.prepare_metal_image(&image, None).unwrap();
         uploader.clear_study_resources();
         assert_eq!(uploader.color_luts.len(), 0);
-        queue.submit([encoder.take().unwrap().finish()]);
-        let uploaded = uploader.register(prepared);
+        queue.submit([uploader
+            .encode_metal_conversions([&prepared, &plain].into_iter())
+            .unwrap()]);
+        let uploaded = uploader.register(prepared.texture);
 
         assert_eq!(
             read_texture(&device, &queue, uploaded.texture(), 4, 1),
             vec![255, 255, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255, 0, 0, 0, 255,]
+        );
+        let plain = uploader.register(plain.texture);
+        let expected: Vec<_> = rgb
+            .chunks_exact(3)
+            .flat_map(|p| [p[0], p[1], p[2], 255])
+            .collect();
+        assert_eq!(
+            read_texture(&device, &queue, plain.texture(), 4, 1),
+            expected
         );
     }
 
@@ -1331,3 +1556,9 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, target_os = "macos"))]
+mod metal_performance_tests;
+
+#[cfg(all(test, target_os = "macos"))]
+mod color_tests;

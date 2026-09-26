@@ -1,5 +1,6 @@
 use geo::algorithm::bool_ops::FillRule;
 use geo::{BooleanOps, Buffer, Coord, LineString, MultiPolygon, Point, Polygon};
+use std::sync::{Arc, OnceLock};
 
 use crate::{Point2, Result, ViewerError};
 
@@ -7,6 +8,35 @@ use super::model::{
     CompositeSegmentGeometry, PolygonComponent, SegmentOperation, SegmentationPrimitive,
     SegmentationPrimitiveGeometry,
 };
+
+/// Immutable derived geometry follows the primitive snapshot, including through
+/// metadata edits and undo. Deserialization and primitive edits start fresh.
+#[derive(Debug, Clone, Default)]
+pub(super) struct SegmentGeometryCache(Arc<OnceLock<((u64, u64), CompositeSegmentGeometry)>>);
+
+impl PartialEq for SegmentGeometryCache {
+    fn eq(&self, _other: &Self) -> bool {
+        // Cache population is not part of the serialized document's semantics.
+        true
+    }
+}
+
+impl SegmentGeometryCache {
+    pub(super) fn get(
+        &self,
+        primitives: &[SegmentationPrimitive],
+        dimensions: (u64, u64),
+    ) -> Result<CompositeSegmentGeometry> {
+        if let Some((cached_dimensions, geometry)) = self.0.get() {
+            if *cached_dimensions == dimensions {
+                return Ok(geometry.clone());
+            }
+        }
+        let geometry = composite_geometry(compose_segment(primitives, dimensions)?);
+        let _ = self.0.set((dimensions, geometry.clone()));
+        Ok(geometry)
+    }
+}
 
 pub(super) fn validate_primitive(primitive: &SegmentationPrimitive) -> Result<()> {
     match primitive.geometry() {

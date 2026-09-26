@@ -403,6 +403,8 @@ pub enum ColorManagementMode {
     Identity,
     CpuLittleCms,
     MetalLut65,
+    /// Direct lookup of the LittleCMS result for every RGB8 input.
+    MetalExactLut,
     CpuLutValidationFallback,
     UncorrectedMalformedProfile,
 }
@@ -413,6 +415,7 @@ impl std::fmt::Display for ColorManagementMode {
             Self::Identity => "identity",
             Self::CpuLittleCms => "LittleCMS → sRGB",
             Self::MetalLut65 => "Metal 65³ LUT → sRGB",
+            Self::MetalExactLut => "Metal exact RGB8 LUT → sRGB",
             Self::CpuLutValidationFallback => "CPU LittleCMS fallback",
             Self::UncorrectedMalformedProfile => "uncorrected",
         })
@@ -531,6 +534,13 @@ pub struct RgbaTile {
 #[non_exhaustive]
 pub enum RenderTile {
     Cpu(RgbaTile),
+    /// CPU-decoded, uncorrected RGBA8 with deferred GPU color conversion.
+    /// Compatibility RGBA reads still return fully color-managed CPU pixels.
+    #[cfg(target_os = "macos")]
+    CpuWithColorLut {
+        tile: RgbaTile,
+        color_lut: std::sync::Arc<ColorLut3d>,
+    },
     #[cfg(target_os = "macos")]
     Metal(MetalRenderTile),
 }

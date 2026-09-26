@@ -139,14 +139,21 @@ impl DicomViewerApp {
             self.status = format!("Could not register discovered pathology sidecars: {error}");
         }
         self.workspace = Some(runtime);
-        self.pending_restore = self
-            .revision_store
-            .as_ref()
-            .and_then(|store| store.restore_latest(&source_identity).ok().flatten());
-        self.autosave = self
-            .revision_store
-            .clone()
-            .and_then(|store| WorkspaceAutosave::new(store, &source_identity).ok());
+        self.pending_restore = None;
+        self.autosave = None;
+        if let Some(store) = self.revision_store.clone() {
+            match store.restore_latest(&source_identity) {
+                Ok(restored) => {
+                    self.autosave =
+                        Some(WorkspaceAutosave::from_restored(store, restored.as_ref()));
+                    self.pending_restore = restored;
+                }
+                Err(error) => {
+                    self.status =
+                        format!("Could not read saved workspace; autosave is unavailable: {error}");
+                }
+            }
+        }
         self.last_queued_workspace_revision = Some(0);
         self.last_queued_draft = None;
         if let Some(restored) = &self.pending_restore {

@@ -122,7 +122,7 @@ impl WorkspaceDocument {
             ));
         }
         self.presentation.set_layer(layer_id, presentation);
-        self.bump_revision();
+        self.bump_metadata_revision();
         Ok(())
     }
 
@@ -133,7 +133,7 @@ impl WorkspaceDocument {
             ));
         }
         self.presentation.set_object_visible(object_id, visible);
-        self.bump_revision();
+        self.bump_metadata_revision();
         Ok(())
     }
 

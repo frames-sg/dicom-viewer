@@ -1,5 +1,6 @@
 mod external;
 mod external_overlay;
+mod external_spatial;
 mod geometry;
 mod history;
 mod overlay;
@@ -340,6 +341,8 @@ pub(super) struct WorkspaceRuntime {
     spatial_index: WorkspaceSpatialIndex,
     spatial_revision: u64,
     external_payloads: HashMap<Uuid, ExternalLayerPayload>,
+    external_render_cache:
+        HashMap<Uuid, std::sync::OnceLock<external_spatial::PreparedExternalLayer>>,
     handle_drag: Option<HandleDrag>,
 }
 
@@ -362,8 +365,7 @@ impl WorkspaceRuntime {
         let mut candidate = (*self.document).clone();
         candidate.set_layer_presentation(layer_id, presentation)?;
         candidate.validate()?;
-        self.document = Arc::new(candidate);
-        self.invalidate_spatial_index();
+        self.publish_document(Arc::new(candidate));
         Ok(())
     }
 
@@ -375,8 +377,7 @@ impl WorkspaceRuntime {
         let mut candidate = (*self.document).clone();
         candidate.set_object_visible(object_id, visible)?;
         candidate.validate()?;
-        self.document = Arc::new(candidate);
-        self.invalidate_spatial_index();
+        self.publish_document(Arc::new(candidate));
         Ok(())
     }
 }

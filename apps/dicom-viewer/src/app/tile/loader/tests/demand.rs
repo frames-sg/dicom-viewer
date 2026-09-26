@@ -1,6 +1,31 @@
 use super::*;
 
 #[test]
+fn unchanged_frame_demand_retains_one_heap_job_per_tile() {
+    let loader = TileLoader::with_worker_count(0);
+    let study = study();
+    let keep = (0..8).map(key).collect();
+    for frame in 0..100 {
+        let requests = (0..8)
+            .map(|col| request(&study, col, QueueLane::Visible, frame * 8 + col))
+            .collect();
+        loader.publish_frame_demand(DemandEpoch(1), requests, &keep);
+    }
+    let mut state = lock_state(&loader.shared);
+    assert_eq!(state.queued.len(), 8);
+    assert_eq!(
+        state.jobs.len(),
+        8,
+        "unchanged frame priorities must not accumulate stale heap entries"
+    );
+    let jobs = pop_next_batch(&mut state).unwrap();
+    assert_eq!(
+        jobs.iter().map(|job| job.key).collect::<Vec<_>>(),
+        (0..8).map(key).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn atomic_frame_demand_dispatches_visible_then_transition_before_background() {
     let loader = TileLoader::with_worker_count(0);
     let shared_study = study();

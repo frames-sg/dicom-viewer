@@ -373,6 +373,8 @@ fn count_render_outputs(
         match tile {
             RenderTile::Cpu(_) => counts.cpu += 1,
             #[cfg(target_os = "macos")]
+            RenderTile::CpuWithColorLut { .. } => counts.cpu += 1,
+            #[cfg(target_os = "macos")]
             RenderTile::Metal(_) => counts.metal += 1,
             #[allow(unreachable_patterns)]
             _ => return Err("renderer returned an unsupported output type".into()),

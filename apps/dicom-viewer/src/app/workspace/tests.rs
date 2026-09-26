@@ -37,6 +37,41 @@ fn a_new_workspace_starts_in_pan_mode() {
 }
 
 #[test]
+fn renaming_preserves_cached_geometry_through_undo_and_redo() {
+    let mut runtime =
+        WorkspaceRuntime::new(source(), AnnotationScheme::general_pathology_v1()).unwrap();
+    runtime.set_active_tool(ActiveTool::Point).unwrap();
+    let id = runtime.add_point_finding(Point2::new(10.0, 20.0)).unwrap();
+    runtime.select_only(id);
+    runtime.refresh_spatial_index().unwrap();
+    let geometry = runtime.spatial_index().render_object(id).unwrap() as *const _;
+    runtime.set_selected_name(Some("Renamed")).unwrap();
+    runtime.refresh_spatial_index().unwrap();
+    assert_eq!(
+        runtime.spatial_index().render_object(id).unwrap() as *const _,
+        geometry
+    );
+    assert_eq!(runtime.hit_test(Point2::new(10.0, 20.0), 1.0), Some(id));
+    assert!(runtime.undo());
+    runtime.refresh_spatial_index().unwrap();
+    assert_eq!(
+        runtime.spatial_index().render_object(id).unwrap() as *const _,
+        geometry
+    );
+    assert_eq!(runtime.document().object(id).unwrap().name(), None);
+    assert!(runtime.redo());
+    runtime.refresh_spatial_index().unwrap();
+    assert_eq!(
+        runtime.spatial_index().render_object(id).unwrap() as *const _,
+        geometry
+    );
+    assert_eq!(
+        runtime.document().object(id).unwrap().name(),
+        Some("Renamed")
+    );
+}
+
+#[test]
 fn history_undoes_and_redoes_whole_commands_and_new_edits_invalidate_redo() {
     let mut runtime = WorkspaceRuntime::with_history_limits(
         source(),
@@ -395,6 +430,67 @@ fn selections_are_object_level_and_support_multiple_independent_findings() {
     assert_eq!(runtime.selection().len(), 2);
     runtime.toggle_selection(first);
     assert_eq!(runtime.selection(), &HashSet::from([second]));
+}
+
+#[test]
+fn dragging_updates_only_its_spatial_record_and_matches_a_full_rebuild() {
+    let mut runtime =
+        WorkspaceRuntime::new(source(), AnnotationScheme::general_pathology_v1()).unwrap();
+    let layer = runtime.document().vector_layers()[0].id();
+    let (moving, unchanged) = runtime
+        .edit("Add", |document| {
+            Ok((
+                document.add_vector_finding(layer, "neoplasm", square(10.0))?,
+                document.add_vector_finding(layer, "neoplasm", square(100.0))?,
+            ))
+        })
+        .unwrap();
+    runtime.refresh_spatial_index().unwrap();
+    let unchanged_class = runtime
+        .spatial_index()
+        .render_object(unchanged)
+        .unwrap()
+        .class_id()
+        .as_ptr();
+    runtime.select_only(moving);
+    assert!(runtime.begin_handle_drag(Point2::new(10.0, 10.0), 3.0));
+    for x in [9.0, 7.0, 5.0] {
+        runtime
+            .update_handle_drag(Point2::new(x, 10.0), |_, _| None)
+            .unwrap();
+        assert_eq!(
+            runtime.spatial_revision,
+            runtime.document().revision(),
+            "drag should leave the index current"
+        );
+        runtime.refresh_spatial_index().unwrap();
+        assert_eq!(
+            unchanged_class,
+            runtime
+                .spatial_index()
+                .render_object(unchanged)
+                .unwrap()
+                .class_id()
+                .as_ptr()
+        );
+        let oracle = WorkspaceSpatialIndex::build(runtime.document()).unwrap();
+        for id in [moving, unchanged] {
+            assert_eq!(runtime.object_bounds(id), oracle.bounds(id));
+        }
+        assert_eq!(
+            runtime.spatial_index().query([0.0, 0.0, 200.0, 200.0], 100),
+            oracle.query([0.0, 0.0, 200.0, 200.0], 100)
+        );
+        assert_eq!(runtime.hit_test(Point2::new(x, 10.0), 0.01), Some(moving));
+    }
+    let before_invalid = runtime.document().to_json().unwrap();
+    assert!(runtime
+        .update_handle_drag(Point2::new(f64::NAN, 0.0), |_, _| None)
+        .is_err());
+    assert_eq!(runtime.document().to_json().unwrap(), before_invalid);
+    assert!(runtime.cancel_handle_drag());
+    runtime.refresh_spatial_index().unwrap();
+    assert_eq!(runtime.object_bounds(moving).unwrap()[0], 10.0);
 }
 
 #[test]

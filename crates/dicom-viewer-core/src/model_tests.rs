@@ -39,6 +39,10 @@ fn public_status_and_backend_labels_cover_every_declared_variant() {
         "Metal 65³ LUT → sRGB"
     );
     assert_eq!(
+        ColorManagementMode::MetalExactLut.to_string(),
+        "Metal exact RGB8 LUT → sRGB"
+    );
+    assert_eq!(
         ColorManagementMode::CpuLutValidationFallback.to_string(),
         "CPU LittleCMS fallback"
     );

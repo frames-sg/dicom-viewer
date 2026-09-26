@@ -53,7 +53,6 @@ fn profiled_geojson_import_builds_a_lossless_editable_preview() {
     .unwrap();
 
     assert_eq!(session.preview.features().len(), 1);
-    assert!(session.editable_ann.is_some());
     assert!(session.editable_ann().is_some());
 }
 

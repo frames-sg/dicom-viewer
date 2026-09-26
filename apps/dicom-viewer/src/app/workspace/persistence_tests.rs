@@ -8,7 +8,9 @@ use dicom_viewer_core::{
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 
-use super::{DraftInteraction, RevisionStore, WorkspaceAutosave, WorkspaceSaveRequest};
+use super::{
+    AutosaveStatus, DraftInteraction, RevisionStore, WorkspaceAutosave, WorkspaceSaveRequest,
+};
 
 fn source(dataset: u128) -> ViewerSourceIdentity {
     ViewerSourceIdentity::new(dataset, 0, 0, 0, 0, 0, (2_000, 1_000))
@@ -47,6 +49,31 @@ fn revision_store_restores_draft_and_falls_back_from_a_corrupt_newer_revision() 
 }
 
 #[test]
+fn restore_loads_one_payload_and_autosave_reuses_its_revision() {
+    let temp = tempdir().unwrap();
+    let store = RevisionStore::new(temp.path().to_path_buf());
+    let request = WorkspaceSaveRequest::new(Arc::new(document(1)), None);
+    for revision in 1..=5 {
+        store.save_revision(&request, revision).unwrap();
+    }
+    let fresh = RevisionStore::new(temp.path().to_path_buf());
+    let restored = fresh.restore_latest(&source(1)).unwrap();
+    assert_eq!(fresh.revision_parse_count(), 1);
+    let mut autosave = WorkspaceAutosave::from_restored(fresh.clone(), restored.as_ref());
+    assert_eq!(fresh.revision_parse_count(), 1);
+    autosave.queue(request, Instant::now());
+    autosave.flush().unwrap();
+    assert_eq!(
+        fresh
+            .restore_latest(&source(1))
+            .unwrap()
+            .unwrap()
+            .revision(),
+        6
+    );
+}
+
+#[test]
 fn revision_store_keeps_five_newest_valid_immutable_revisions() {
     let temp = tempdir().unwrap();
     let store = RevisionStore::new(temp.path().to_path_buf());
@@ -71,6 +98,25 @@ fn revision_store_keeps_five_newest_valid_immutable_revisions() {
     assert_eq!(revisions.len(), 5);
     assert_eq!(revisions.first().unwrap().revision(), 7);
     assert_eq!(revisions.last().unwrap().revision(), 3);
+}
+
+#[test]
+fn pruning_reuses_verified_semantics_but_still_checks_changed_revision_bytes() {
+    let temp = tempdir().unwrap();
+    let store = RevisionStore::new(temp.path().to_path_buf());
+    let request = WorkspaceSaveRequest::new(Arc::new(document(72)), None);
+    let first = store.save_revision(&request, 1).unwrap();
+    let before = store.revision_parse_count();
+    let second = store.save_revision(&request, 2).unwrap();
+    assert_eq!(
+        store.revision_parse_count(),
+        before,
+        "known, byte-verified revisions should not repeat JSON/geometry validation during pruning"
+    );
+    fs::write(&second, b"corrupt").unwrap();
+    let restored = store.restore_latest(&source(72)).unwrap().unwrap();
+    assert_eq!(restored.path(), first);
+    assert_eq!(restored.revision(), 1);
 }
 
 #[test]
@@ -193,6 +239,77 @@ fn autosave_coalesces_pending_changes_to_the_latest_snapshot_and_flushes() {
     assert_eq!(revisions.len(), 1);
     assert_eq!(revisions[0].document().object_count(), 1);
     assert!(!autosave.has_pending_write());
+}
+
+#[test]
+fn autosave_retries_failed_writes_without_losing_the_latest_snapshot() {
+    for (background, poll_failure, newer_edit) in [
+        (false, false, false),
+        (true, false, false),
+        (true, true, false),
+        (true, true, true),
+    ] {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        // A regular file prevents the revision store from creating its directories.
+        fs::write(&root, b"blocked").unwrap();
+        let store = RevisionStore::new(root.clone());
+        let mut autosave = WorkspaceAutosave::from_restored(store.clone(), None);
+        let mut latest = document(9);
+        let layer = latest.vector_layers()[0].id();
+        latest
+            .add_vector_finding(
+                layer,
+                "cell",
+                VectorFindingGeometry::Point(Point2::new(9.0, 9.0)),
+            )
+            .unwrap();
+        autosave.queue(
+            WorkspaceSaveRequest::new(Arc::new(latest.clone()), None),
+            Instant::now(),
+        );
+        if background {
+            autosave.poll(Instant::now() + std::time::Duration::from_secs(2));
+        }
+        if newer_edit {
+            latest
+                .add_vector_finding(
+                    layer,
+                    "cell",
+                    VectorFindingGeometry::Point(Point2::new(10.0, 9.0)),
+                )
+                .unwrap();
+            autosave.queue(
+                WorkspaceSaveRequest::new(Arc::new(latest.clone()), None),
+                Instant::now(),
+            );
+        }
+        if poll_failure {
+            let deadline = Instant::now() + std::time::Duration::from_secs(2);
+            while !matches!(autosave.status(), AutosaveStatus::Failed(_)) {
+                assert!(Instant::now() < deadline, "save worker did not complete");
+                autosave.poll(Instant::now());
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+
+        assert!(autosave.flush().is_err());
+        assert!(matches!(autosave.status(), AutosaveStatus::Failed(_)));
+        assert!(autosave.has_pending_write());
+        assert!(
+            autosave.flush().is_err(),
+            "retry must attempt the write again"
+        );
+
+        fs::rename(&root, temp.path().join("former-blocker")).unwrap();
+        autosave.flush().unwrap();
+
+        let restored = store.restore_latest(&source(9)).unwrap().unwrap();
+        assert_eq!(restored.document().object_count(), latest.object_count());
+        assert_eq!(restored.document().revision(), latest.revision());
+        assert!(!autosave.has_pending_write());
+        assert!(matches!(autosave.status(), AutosaveStatus::Saved { .. }));
+    }
 }
 
 #[test]

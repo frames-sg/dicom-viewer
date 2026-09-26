@@ -9,6 +9,30 @@ const TILE_BACKEND_ENV: &str = "DICOM_VIEWER_TILE_BACKEND";
 const MEMORY_PROFILE_ENV: &str = "DICOM_VIEWER_MEMORY_PROFILE";
 
 pub(crate) fn rgba_tile_from_cpu_tile(tile: wsi_rs::CpuTile) -> Result<RgbaTile> {
+    // The renderer always consumes interleaved RGBA8. Specialize the common
+    // RGB8 layout once, outside the loop, so LLVM can vectorize expansion.
+    // All other layouts, color spaces, and sample types use the source adapter.
+    if tile.channels() == 3
+        && *tile.color_space() == wsi_rs::ColorSpace::Rgb
+        && tile.layout() == wsi_rs::CpuTileLayout::Interleaved
+    {
+        if let Some(rgb) = tile.as_u8() {
+            let pixels = (tile.width() as usize).checked_mul(tile.height() as usize);
+            if let Some(byte_len) = pixels.and_then(|n| n.checked_mul(4)) {
+                if pixels.and_then(|n| n.checked_mul(3)) == Some(rgb.len()) {
+                    let mut rgba = vec![255; byte_len];
+                    for (source, destination) in rgb.chunks_exact(3).zip(rgba.chunks_exact_mut(4)) {
+                        destination[..3].copy_from_slice(source);
+                    }
+                    return Ok(RgbaTile {
+                        width: tile.width(),
+                        height: tile.height(),
+                        rgba,
+                    });
+                }
+            }
+        }
+    }
     let image = tile.into_rgba()?;
     Ok(RgbaTile {
         width: image.width(),
@@ -133,6 +157,48 @@ fn render_tile_from_device(device: wsi_rs::DeviceTile) -> Result<RenderTile> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rgb_expansion_matches_source_adapter_and_rgba_preserves_ownership() {
+        for (width, height) in [(1, 1), (2, 1), (17, 3), (256, 256), (257, 3)] {
+            let bytes = (0..width * height * 3).map(|i| (i % 256) as u8).collect();
+            let tile = wsi_rs::CpuTile::from_u8_interleaved(
+                width,
+                height,
+                3,
+                wsi_rs::ColorSpace::Rgb,
+                bytes,
+            )
+            .unwrap();
+            let expected = tile.to_rgba().unwrap();
+            let shared = tile.clone();
+            let actual = rgba_tile_from_cpu_tile(tile).unwrap();
+            assert_eq!(actual.rgba, expected.into_raw());
+            assert_eq!(actual.width, width);
+            assert_eq!(actual.height, height);
+            assert_eq!(shared.to_rgba().unwrap().into_raw(), actual.rgba);
+        }
+        let planar = wsi_rs::CpuTile::new(
+            2,
+            1,
+            3,
+            wsi_rs::ColorSpace::Rgb,
+            wsi_rs::CpuTileLayout::Planar,
+            wsi_rs::CpuTileData::u8(vec![10, 40, 20, 50, 30, 60]),
+        )
+        .unwrap();
+        assert_eq!(
+            rgba_tile_from_cpu_tile(planar).unwrap().rgba,
+            [10, 20, 30, 255, 40, 50, 60, 255]
+        );
+        let bytes = vec![10, 20, 30, 47];
+        let pointer = bytes.as_ptr();
+        let tile =
+            wsi_rs::CpuTile::from_u8_interleaved(1, 1, 4, wsi_rs::ColorSpace::Rgba, bytes).unwrap();
+        let actual = rgba_tile_from_cpu_tile(tile).unwrap();
+        assert_eq!(actual.rgba, [10, 20, 30, 47]);
+        assert_eq!(actual.rgba.as_ptr(), pointer);
+    }
 
     #[cfg(any(not(feature = "cuda"), target_os = "macos"))]
     #[test]

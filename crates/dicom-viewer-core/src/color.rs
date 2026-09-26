@@ -13,9 +13,12 @@ use crate::{
 };
 
 const LUT_EDGE: u32 = 65;
+const EXACT_LUT_EDGE: u32 = 256;
 const MAX_LUT_CHANNEL_ERROR: u8 = 2;
-const LUT_VALIDATION_ALGORITHM_VERSION: u32 = 1;
-const ICC_PROOF_CACHE_CAPACITY: usize = 16;
+const LUT_VALIDATION_ALGORITHM_VERSION: u32 = 2;
+// An exact table is 64 MiB. Bound cached/in-flight profiles to two so adding
+// exact fallback cannot turn the former 16-entry cache into a 1 GiB cache.
+const ICC_PROOF_CACHE_CAPACITY: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum IccProofFailure {
@@ -43,6 +46,24 @@ struct IccProofEntry {
     ready: Condvar,
 }
 
+impl IccProofEntry {
+    fn wait(&self) -> IccProofResult {
+        let mut state = self.state.lock().map_err(|_| {
+            IccProofFailure::Infrastructure("ICC proof entry lock is poisoned".into())
+        })?;
+        loop {
+            match &*state {
+                IccProofState::Complete(result) => return result.clone(),
+                IccProofState::InFlight => {
+                    state = self.ready.wait(state).map_err(|_| {
+                        IccProofFailure::Infrastructure("ICC proof wait lock is poisoned".into())
+                    })?;
+                }
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct IccProofCacheState {
     entries: HashMap<IccProofKey, Arc<IccProofEntry>>,
@@ -67,20 +88,29 @@ impl IccProofCache {
         key: IccProofKey,
         compute: impl FnOnce() -> IccProofResult,
     ) -> IccProofResult {
-        let (entry, computes) = {
+        let (entry, computes) = 'admit: loop {
             let mut cache = self.state.lock().map_err(|_| {
                 IccProofFailure::Infrastructure("ICC proof cache lock is poisoned".into())
             })?;
             if let Some(entry) = cache.entries.get(&key).cloned() {
                 touch_lru(&mut cache.lru, &key);
-                (entry, false)
+                break (entry, false);
             } else {
                 while cache.entries.len() >= self.capacity {
                     let Some(evicted) = oldest_completed_entry(&cache) else {
-                        return Err(IccProofFailure::Infrastructure(format!(
-                            "ICC proof cache has {} validations in flight",
-                            cache.entries.len()
-                        )));
+                        let oldest = cache
+                            .lru
+                            .front()
+                            .expect("nonempty ICC proof cache has an LRU entry");
+                        let pending = Arc::clone(&cache.entries[oldest]);
+                        drop(cache);
+                        // Wait without holding the cache lock. A completed
+                        // slot can then be evicted without duplicating work or
+                        // falling back to CPU just because another study opens.
+                        if let Err(error @ IccProofFailure::Infrastructure(_)) = pending.wait() {
+                            return Err(error);
+                        }
+                        continue 'admit;
                     };
                     cache.entries.remove(&evicted);
                     remove_lru(&mut cache.lru, &evicted);
@@ -91,7 +121,7 @@ impl IccProofCache {
                 });
                 cache.entries.insert(key.clone(), Arc::clone(&entry));
                 cache.lru.push_back(key);
-                (entry, true)
+                break (entry, true);
             }
         };
 
@@ -111,21 +141,7 @@ impl IccProofCache {
             return result;
         }
 
-        let mut state = entry.state.lock().map_err(|_| {
-            IccProofFailure::Infrastructure("ICC proof entry lock is poisoned".into())
-        })?;
-        loop {
-            match &*state {
-                IccProofState::Complete(result) => return result.clone(),
-                IccProofState::InFlight => {
-                    state = entry.ready.wait(state).map_err(|_| {
-                        IccProofFailure::Infrastructure(
-                            "ICC proof coalescing wait lock is poisoned".into(),
-                        )
-                    })?;
-                }
-            }
-        }
+        entry.wait()
     }
 
     #[cfg(test)]
@@ -293,13 +309,31 @@ impl ColorManagement {
                 algorithm_version: LUT_VALIDATION_ALGORITHM_VERSION,
             };
             match process_icc_proof_cache().get_or_compute(key, || {
-                let generated = Arc::new(generate_lut(&transform, &sha256));
-                validate_lut_parallel(&profile.bytes, &generated)?;
-                Ok(generated)
+                let generated = generate_lut(&transform, &sha256);
+                match validate_lut_parallel(&profile.bytes, &generated) {
+                    Ok(()) => Ok(Arc::new(generated)),
+                    Err(IccProofFailure::Validation { .. }) => {
+                        // A failed interpolation proof does not prevent exact
+                        // GPU lookup over the finite RGB8 input domain.
+                        drop(generated);
+                        generate_exact_lut(&transform, &sha256).map(Arc::new)
+                    }
+                    Err(error) => Err(error),
+                }
             }) {
                 Ok(proved_lut) => {
+                    let mode = if proved_lut.edge() == EXACT_LUT_EDGE {
+                        // These profiles previously used CPU decoding. Keep
+                        // that fast source route and defer only color to Metal;
+                        // forcing classic JPEG2000 device decode regresses the
+                        // measured 256-pixel workload by roughly two orders.
+                        force_cpu = true;
+                        ColorManagementMode::MetalExactLut
+                    } else {
+                        ColorManagementMode::MetalLut65
+                    };
                     lut = Some(proved_lut);
-                    ColorManagementMode::MetalLut65
+                    mode
                 }
                 Err(IccProofFailure::Validation { max_error }) => {
                     force_cpu = true;
@@ -348,6 +382,13 @@ impl ColorManagement {
     pub(crate) fn prepare_render_tile(&self, tile: RenderTile) -> RenderTile {
         match tile {
             RenderTile::Cpu(mut tile) => {
+                #[cfg(target_os = "macos")]
+                if let Some(lut) = self.lut.as_ref().filter(|lut| lut.edge() == EXACT_LUT_EDGE) {
+                    return RenderTile::CpuWithColorLut {
+                        tile,
+                        color_lut: Arc::clone(lut),
+                    };
+                }
                 self.apply_rgba_tile(&mut tile);
                 RenderTile::Cpu(tile)
             }
@@ -412,6 +453,29 @@ fn generate_lut(transform: &IccTransform, profile_sha256: &str) -> ColorLut3d {
 
 fn lut_axis_value(index: usize) -> u8 {
     ((index as u32 * 255 + (LUT_EDGE - 1) / 2) / (LUT_EDGE - 1)) as u8
+}
+
+fn generate_exact_lut(
+    transform: &IccTransform,
+    profile_sha256: &str,
+) -> Result<ColorLut3d, IccProofFailure> {
+    const BYTE_LEN: usize = 256 * 256 * 256 * 4;
+    let mut rgba = Vec::new();
+    rgba.try_reserve_exact(BYTE_LEN).map_err(|error| {
+        IccProofFailure::Infrastructure(format!("cannot allocate exact RGB8 color table: {error}"))
+    })?;
+    for blue in 0..=255u8 {
+        for green in 0..=255u8 {
+            for red in 0..=255u8 {
+                rgba.extend_from_slice(&[red, green, blue, 255]);
+            }
+        }
+    }
+    // Every possible RGB8 input is transformed directly by the same LittleCMS
+    // transform used for CPU tiles. The GPU loads the corresponding texel;
+    // there is no interpolation, resampling, or approximation to prove.
+    transform.transform_rgba(&mut rgba);
+    Ok(ColorLut3d::new(EXACT_LUT_EDGE, rgba, profile_sha256.into()))
 }
 
 #[derive(Clone, Copy)]
@@ -606,6 +670,10 @@ mod tests {
     }
 
     fn gamma_18_rgb_profile() -> Vec<u8> {
+        gamma_rgb_profile(1.8)
+    }
+
+    pub(super) fn gamma_rgb_profile(gamma: f64) -> Vec<u8> {
         let white = CIExyY {
             x: 0.3127,
             y: 0.3290,
@@ -629,14 +697,71 @@ mod tests {
             },
         };
         let curves = [
-            ToneCurve::new(1.8),
-            ToneCurve::new(1.8),
-            ToneCurve::new(1.8),
+            ToneCurve::new(gamma),
+            ToneCurve::new(gamma),
+            ToneCurve::new(gamma),
         ];
         Profile::new_rgb(&white, &primaries, &[&curves[0], &curves[1], &curves[2]])
             .unwrap()
             .icc()
             .unwrap()
+    }
+
+    #[test]
+    #[ignore = "release RGB expansion and exact ICC characterization"]
+    fn color_cpu_performance() {
+        for edge in [64u32, 256, 1024] {
+            let rgb: Vec<u8> = (0..edge as usize * edge as usize * 3)
+                .map(|i| (i % 251) as u8)
+                .collect();
+            let expected: Vec<u8> = rgb
+                .chunks_exact(3)
+                .flat_map(|p| [p[0], p[1], p[2], 255])
+                .collect();
+            for (profile_name, profile) in [
+                ("unprofiled", None),
+                ("srgb", Some(srgb_profile())),
+                ("gamma18", Some(gamma_18_rgb_profile())),
+            ] {
+                let transform = profile
+                    .as_ref()
+                    .map(|profile| IccTransform::new(profile).unwrap());
+                let mut oracle = expected.clone();
+                if let Some(transform) = &transform {
+                    transform.transform_rgba(&mut oracle);
+                }
+                for sample in 0..15 {
+                    let tiles: Vec<_> = (0..8)
+                        .map(|_| {
+                            wsi_rs::CpuTile::from_u8_interleaved(
+                                edge,
+                                edge,
+                                3,
+                                wsi_rs::ColorSpace::Rgb,
+                                rgb.clone(),
+                            )
+                            .unwrap()
+                        })
+                        .collect();
+                    let started = std::time::Instant::now();
+                    let mut rgba: Vec<_> = tiles
+                        .into_iter()
+                        .map(|tile| crate::tile_output::rgba_tile_from_cpu_tile(tile).unwrap())
+                        .collect();
+                    let expansion = started.elapsed();
+                    assert!(rgba.iter().all(|tile| tile.rgba == expected));
+                    let started = std::time::Instant::now();
+                    if let Some(transform) = &transform {
+                        for tile in &mut rgba {
+                            transform.transform_rgba(&mut tile.rgba);
+                        }
+                    }
+                    let icc = started.elapsed();
+                    assert!(rgba.iter().all(|tile| tile.rgba == oracle));
+                    println!("{{\"workload\":\"color\",\"edge\":{edge},\"batch\":8,\"profile\":\"{profile_name}\",\"sample\":{sample},\"expansion_ms\":{},\"icc_ms\":{}}}", expansion.as_secs_f64()*1000.0, icc.as_secs_f64()*1000.0);
+                }
+            }
+        }
     }
 
     #[test]
@@ -681,6 +806,58 @@ mod tests {
             build.summary.applied_mode,
             ColorManagementMode::CpuLittleCms
         );
+    }
+
+    #[test]
+    fn linear_rgb_profile_retains_metal_color_conversion() {
+        let dataset = dataset_with_profiles(vec![source_profile(
+            gamma_rgb_profile(1.0),
+            None,
+            "linear RGB regression",
+        )]);
+        let build = ColorManagement::build(&dataset, selected_view(), TileDecodeBackend::Metal);
+        assert!(build.force_cpu, "exact color retains CPU source decoding");
+        assert_eq!(
+            build.summary.applied_mode,
+            ColorManagementMode::MetalExactLut
+        );
+        let lut = build.color.lut.as_deref().unwrap();
+        assert_eq!(lut.edge(), 256);
+        #[cfg(target_os = "macos")]
+        {
+            let rgba = vec![1, 2, 3, 127];
+            let rendered = build.color.prepare_render_tile(RenderTile::Cpu(RgbaTile {
+                width: 1,
+                height: 1,
+                rgba: rgba.clone(),
+            }));
+            let RenderTile::CpuWithColorLut { tile, color_lut } = rendered else {
+                panic!("color must be deferred to Metal")
+            };
+            assert_eq!(
+                tile.rgba, rgba,
+                "source pixels must not be transformed twice"
+            );
+            assert!(Arc::ptr_eq(&color_lut, build.color.lut.as_ref().unwrap()));
+        }
+        let inputs = [
+            [0, 0, 0, 255],
+            [1, 2, 3, 255],
+            [129, 124, 0, 255],
+            [255, 255, 255, 255],
+        ];
+        let mut expected = inputs.concat();
+        build
+            .color
+            .transform
+            .as_ref()
+            .unwrap()
+            .transform_rgba(&mut expected);
+        for (input, expected) in inputs.iter().zip(expected.chunks_exact(4)) {
+            let [r, g, b, _] = input.map(usize::from);
+            let offset = ((b * 256 + g) * 256 + r) * 4;
+            assert_eq!(&lut.rgba()[offset..offset + 4], expected);
+        }
     }
 
     #[test]
@@ -826,6 +1003,35 @@ mod tests {
     }
 
     #[test]
+    fn icc_proof_capacity_waits_instead_of_forcing_cpu_fallback() {
+        let cache = Arc::new(IccProofCache::new(1));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_cache = Arc::clone(&cache);
+        let first = std::thread::spawn(move || {
+            first_cache.get_or_compute(proof_key(1), || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(Arc::new(ColorLut3d::new(2, vec![0; 32], "first".into())))
+            })
+        });
+        started_rx.recv().unwrap();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            let result = cache.get_or_compute(proof_key(2), || {
+                Ok(Arc::new(ColorLut3d::new(2, vec![0; 32], "second".into())))
+            });
+            result_tx.send(result).unwrap();
+        });
+        let early = result_rx.recv_timeout(std::time::Duration::from_millis(50));
+        release_tx.send(()).unwrap();
+        first.join().unwrap().unwrap();
+        let result = early.unwrap_or_else(|_| result_rx.recv().unwrap());
+        assert_eq!(result.unwrap().profile_sha256(), "second");
+        second.join().unwrap();
+    }
+
+    #[test]
     fn icc_proof_cache_is_a_bounded_lru() {
         let cache = IccProofCache::new(2);
         let executions = AtomicUsize::new(0);
@@ -887,3 +1093,6 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod metal_performance_tests;

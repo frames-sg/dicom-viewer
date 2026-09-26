@@ -119,6 +119,11 @@ impl TileFailure {
 pub(super) enum DecodedTile {
     Cpu(dicom_viewer_core::RgbaTile),
     #[cfg(target_os = "macos")]
+    CpuWithColorLut {
+        tile: dicom_viewer_core::RgbaTile,
+        color_lut: Arc<dicom_viewer_core::ColorLut3d>,
+    },
+    #[cfg(target_os = "macos")]
     Metal(dicom_viewer_core::MetalRenderTile),
 }
 
@@ -126,6 +131,10 @@ impl DecodedTile {
     fn from_render_tile(tile: RenderTile) -> std::result::Result<Self, String> {
         match tile {
             RenderTile::Cpu(tile) => Ok(Self::Cpu(tile)),
+            #[cfg(target_os = "macos")]
+            RenderTile::CpuWithColorLut { tile, color_lut } => {
+                Ok(Self::CpuWithColorLut { tile, color_lut })
+            }
             #[cfg(target_os = "macos")]
             RenderTile::Metal(tile) => Ok(Self::Metal(tile)),
             #[allow(unreachable_patterns)]
@@ -141,6 +150,8 @@ impl DecodedTile {
         match self {
             Self::Cpu(tile) => (tile.width, tile.height),
             #[cfg(target_os = "macos")]
+            Self::CpuWithColorLut { tile, .. } => (tile.width, tile.height),
+            #[cfg(target_os = "macos")]
             Self::Metal(tile) => (tile.width(), tile.height()),
         }
     }
@@ -150,6 +161,11 @@ impl DecodedTile {
         let footprint = match self {
             Self::Cpu(tile) => TileFootprint::for_cpu_rgba(width, height, tile.rgba.len())
                 .map_err(|error| error.to_string())?,
+            #[cfg(target_os = "macos")]
+            Self::CpuWithColorLut { tile, .. } => {
+                TileFootprint::for_cpu_rgba(width, height, tile.rgba.len())
+                    .map_err(|error| error.to_string())?
+            }
             #[cfg(target_os = "macos")]
             Self::Metal(tile) => {
                 let image = tile
@@ -175,7 +191,13 @@ impl DecodedTile {
     }
 
     const fn is_cpu(&self) -> bool {
-        matches!(self, Self::Cpu(_))
+        match self {
+            Self::Cpu(_) => true,
+            #[cfg(target_os = "macos")]
+            Self::CpuWithColorLut { .. } => true,
+            #[cfg(target_os = "macos")]
+            Self::Metal(_) => false,
+        }
     }
 }
 
