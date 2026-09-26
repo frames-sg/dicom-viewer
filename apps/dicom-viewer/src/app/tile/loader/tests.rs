@@ -2,6 +2,7 @@ mod config;
 mod decode;
 mod demand;
 mod lifecycle;
+mod performance;
 mod queue;
 
 use std::sync::Barrier;

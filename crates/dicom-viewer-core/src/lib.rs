@@ -19,6 +19,9 @@ mod model;
 mod statistics;
 mod tile_output;
 
+#[cfg(all(test, target_os = "macos"))]
+mod metal_decode_performance_tests;
+
 #[cfg(test)]
 mod annotation_test_support;
 #[cfg(test)]
@@ -552,3 +555,6 @@ fn build_tile_view_request(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod metadata_performance_tests;

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use dicom_viewer_core::{
     CompositeSegmentGeometry, Point2, SegmentationPrimitive, VectorFindingGeometry, ViewerError,
-    WorkspaceDocument, WorkspaceLinearMeasurement,
+    WorkspaceDocument, WorkspaceLinearMeasurement, WorkspaceObjectRef,
 };
 use rstar::{RTree, RTreeObject, AABB};
 use uuid::Uuid;
@@ -42,9 +42,9 @@ impl ViewportPoint {
 }
 
 #[derive(Debug, Default)]
-pub(super) struct SpatialViewportQuery {
+pub(super) struct SpatialViewportQuery<'a> {
     detailed_ids: Vec<Uuid>,
-    points: Vec<ViewportPoint>,
+    points: Vec<&'a ViewportPoint>,
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +59,7 @@ pub(super) enum SpatialRenderGeometry {
 
 #[derive(Debug, Clone)]
 pub(super) struct SpatialRenderObject {
+    bounds: [f64; 4],
     layer_id: Option<Uuid>,
     class_id: String,
     geometry: SpatialRenderGeometry,
@@ -93,13 +94,19 @@ impl SpatialRenderObject {
     }
 }
 
-impl SpatialViewportQuery {
+impl SpatialViewportQuery<'_> {
     pub(super) fn detailed_ids(&self) -> &[Uuid] {
         &self.detailed_ids
     }
 
-    pub(super) fn points(&self) -> &[ViewportPoint] {
+    pub(super) fn points(&self) -> &[&ViewportPoint] {
         &self.points
+    }
+}
+
+impl PartialEq for IndexedObject {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
     }
 }
 
@@ -121,77 +128,61 @@ impl WorkspaceSpatialIndex {
     pub(super) fn build(document: &WorkspaceDocument) -> Result<Self, ViewerError> {
         let mut objects = Vec::with_capacity(document.object_count());
         let mut render_objects = HashMap::with_capacity(document.object_count());
-        for layer in document.vector_layers() {
-            for finding in layer.findings() {
-                let (bounds, point) = match finding.geometry() {
-                    VectorFindingGeometry::Point(point) => (
-                        [point.x, point.y, point.x, point.y],
-                        Some(ViewportPoint {
-                            id: finding.object_id(),
-                            layer_id: layer.id(),
-                            class_id: finding.class_id().to_owned(),
-                            point: *point,
-                        }),
-                    ),
-                    VectorFindingGeometry::Regions(components) => (
-                        bounds(components.iter().flat_map(|component| {
-                            component.iter().map(|point| [point.x, point.y])
-                        }))
-                        .ok_or_else(|| {
-                            ViewerError::InvalidInput("vector finding has no coordinates".into())
-                        })?,
-                        None,
-                    ),
-                };
-                objects.push(indexed(finding.object_id(), bounds, point));
-                render_objects.insert(
-                    finding.object_id(),
-                    SpatialRenderObject {
-                        layer_id: Some(layer.id()),
-                        class_id: finding.class_id().to_owned(),
-                        geometry: SpatialRenderGeometry::Vector(finding.geometry().clone()),
-                    },
-                );
-            }
-        }
-        for layer in document.segmentation_layers() {
-            for segment in layer.segments() {
-                let composite = document.composite_segment(segment.object_id())?;
-                if let Some(bounds) = composite.bounds() {
-                    objects.push(indexed(segment.object_id(), bounds, None));
-                    render_objects.insert(
-                        segment.object_id(),
-                        SpatialRenderObject {
-                            layer_id: Some(layer.id()),
-                            class_id: segment.class_id().to_owned(),
-                            geometry: SpatialRenderGeometry::Segment {
-                                composite,
-                                primitives: Arc::from(segment.primitives()),
-                            },
-                        },
-                    );
-                }
-            }
-        }
-        for measurement in document.measurements() {
-            objects.push(indexed(
-                measurement.object_id(),
-                measurement_bounds(measurement),
-                None,
-            ));
-            render_objects.insert(
-                measurement.object_id(),
-                SpatialRenderObject {
-                    layer_id: None,
-                    class_id: measurement.class_id().to_owned(),
-                    geometry: SpatialRenderGeometry::Measurement(measurement.endpoints()),
-                },
+        let records = document
+            .vector_layers()
+            .iter()
+            .flat_map(|layer| {
+                layer
+                    .findings()
+                    .iter()
+                    .map(move |finding| (Some(layer.id()), WorkspaceObjectRef::Vector(finding)))
+            })
+            .chain(document.segmentation_layers().iter().flat_map(|layer| {
+                layer
+                    .segments()
+                    .iter()
+                    .map(move |segment| (Some(layer.id()), WorkspaceObjectRef::Segment(segment)))
+            }))
+            .chain(
+                document
+                    .measurements()
+                    .iter()
+                    .map(|measurement| (None, WorkspaceObjectRef::Measurement(measurement))),
             );
+        for (layer, object) in records {
+            if let Some((indexed, render)) = prepare_object(document, layer, object)? {
+                objects.push(indexed);
+                render_objects.insert(object.object_id(), render);
+            }
         }
         Ok(Self {
             tree: RTree::bulk_load(objects),
             render_objects,
         })
+    }
+
+    // A handle edit cannot move an object between layers. Prepare everything
+    // before touching either index so a failed geometry operation is atomic.
+    pub(super) fn update_object(
+        &mut self,
+        document: &WorkspaceDocument,
+        id: Uuid,
+    ) -> Result<(), ViewerError> {
+        let old = self.render_objects.get(&id).ok_or_else(|| {
+            ViewerError::InvalidInput("dragged object is absent from the spatial index".into())
+        })?;
+        let object = document.object(id).ok_or_else(|| {
+            ViewerError::InvalidInput("dragged object is absent from the document".into())
+        })?;
+        let replacement = prepare_object(document, old.layer_id, object)?;
+        let old_index = indexed(id, old.bounds, None);
+        self.tree.remove(&old_index);
+        self.render_objects.remove(&id);
+        if let Some((indexed, render)) = replacement {
+            self.tree.insert(indexed);
+            self.render_objects.insert(id, render);
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -213,7 +204,7 @@ impl WorkspaceSpatialIndex {
         bounds: [f64; 4],
         detailed_limit: usize,
         selected: &HashSet<Uuid>,
-    ) -> SpatialViewportQuery {
+    ) -> SpatialViewportQuery<'_> {
         let envelope = AABB::from_corners([bounds[0], bounds[1]], [bounds[2], bounds[3]]);
         let mut result = SpatialViewportQuery::default();
         let mut unselected_detail_count = 0usize;
@@ -221,7 +212,7 @@ impl WorkspaceSpatialIndex {
             if selected.contains(&object.id) {
                 result.detailed_ids.push(object.id);
             } else if let Some(point) = &object.point {
-                result.points.push(point.clone());
+                result.points.push(point);
             } else if unselected_detail_count < detailed_limit {
                 result.detailed_ids.push(object.id);
                 unselected_detail_count += 1;
@@ -229,20 +220,13 @@ impl WorkspaceSpatialIndex {
         }
         result.detailed_ids.sort_unstable();
         result.detailed_ids.dedup();
-        result.points.sort_unstable_by_key(ViewportPoint::id);
+        result.points.sort_unstable_by_key(|point| point.id());
         result
     }
 
     #[must_use]
     pub(super) fn bounds(&self, id: Uuid) -> Option<[f64; 4]> {
-        self.tree
-            .iter()
-            .find(|object| object.id == id)
-            .map(|object| {
-                let lower = object.envelope.lower();
-                let upper = object.envelope.upper();
-                [lower[0], lower[1], upper[0], upper[1]]
-            })
+        self.render_objects.get(&id).map(|object| object.bounds)
     }
 
     #[must_use]
@@ -278,4 +262,71 @@ fn bounds(points: impl Iterator<Item = [f64; 2]>) -> Option<[f64; 4]> {
             }
         })
     })
+}
+
+fn prepare_object(
+    document: &WorkspaceDocument,
+    layer_id: Option<Uuid>,
+    object: WorkspaceObjectRef<'_>,
+) -> Result<Option<(IndexedObject, SpatialRenderObject)>, ViewerError> {
+    let id = object.object_id();
+    let class_id = object.class_id().to_owned();
+    let (bounds, point, geometry) = match object {
+        WorkspaceObjectRef::Vector(finding) => {
+            let (bounds, point) =
+                match finding.geometry() {
+                    VectorFindingGeometry::Point(point) => (
+                        [point.x, point.y, point.x, point.y],
+                        Some(ViewportPoint {
+                            id,
+                            layer_id: layer_id.expect("vector index records have a layer"),
+                            class_id: class_id.clone(),
+                            point: *point,
+                        }),
+                    ),
+                    VectorFindingGeometry::Regions(components) => (
+                        bounds(components.iter().flat_map(|component| {
+                            component.iter().map(|point| [point.x, point.y])
+                        }))
+                        .ok_or_else(|| {
+                            ViewerError::InvalidInput("vector finding has no coordinates".into())
+                        })?,
+                        None,
+                    ),
+                };
+            (
+                bounds,
+                point,
+                SpatialRenderGeometry::Vector(finding.geometry().clone()),
+            )
+        }
+        WorkspaceObjectRef::Segment(segment) => {
+            let composite = document.composite_segment(id)?;
+            let Some(bounds) = composite.bounds() else {
+                return Ok(None);
+            };
+            (
+                bounds,
+                None,
+                SpatialRenderGeometry::Segment {
+                    composite,
+                    primitives: Arc::from(segment.primitives()),
+                },
+            )
+        }
+        WorkspaceObjectRef::Measurement(measurement) => (
+            measurement_bounds(measurement),
+            None,
+            SpatialRenderGeometry::Measurement(measurement.endpoints()),
+        ),
+    };
+    Ok(Some((
+        indexed(id, bounds, point),
+        SpatialRenderObject {
+            bounds,
+            layer_id,
+            class_id,
+            geometry,
+        },
+    )))
 }

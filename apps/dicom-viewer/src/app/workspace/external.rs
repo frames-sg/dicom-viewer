@@ -15,6 +15,7 @@ impl WorkspaceRuntime {
             None,
             count,
         )?;
+        self.external_render_cache.insert(id, Default::default());
         self.external_payloads
             .insert(id, ExternalLayerPayload::Annotation(Arc::new(document)));
         Ok(id)
@@ -35,6 +36,7 @@ impl WorkspaceRuntime {
             source_digest,
             count,
         )?;
+        self.external_render_cache.insert(id, Default::default());
         self.external_payloads
             .insert(id, ExternalLayerPayload::ProfiledGeoJson(Arc::new(session)));
         Ok(id)
@@ -63,6 +65,7 @@ impl WorkspaceRuntime {
                 let diagnostics = projection.diagnostics().to_vec();
                 (Some(Arc::from(projection.into_groups())), diagnostics)
             };
+        self.external_render_cache.insert(id, Default::default());
         self.external_payloads.insert(
             id,
             ExternalLayerPayload::Segmentation {
@@ -87,6 +90,7 @@ impl WorkspaceRuntime {
             None,
             count,
         )?;
+        self.external_render_cache.insert(id, Default::default());
         self.external_payloads
             .insert(id, ExternalLayerPayload::Report(Arc::new(session)));
         Ok(id)
@@ -110,6 +114,7 @@ impl WorkspaceRuntime {
             count,
         )?;
         let texture = session.load_texture(context);
+        self.external_render_cache.insert(id, Default::default());
         self.external_payloads.insert(
             id,
             ExternalLayerPayload::Heatmap {

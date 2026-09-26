@@ -94,6 +94,146 @@ fn source_identity() -> ViewerSourceIdentity {
     ViewerSourceIdentity::new(42, 1, 2, 3, 4, 5, (20_000, 10_000))
 }
 
+#[test]
+fn workspace_snapshots_share_immutable_object_data_and_preserve_json_on_edit() {
+    let mut document =
+        WorkspaceDocument::new(source_identity(), AnnotationScheme::general_pathology_v1())
+            .unwrap();
+    let layer = document.vector_layers()[0].id();
+    let id = document
+        .add_vector_finding(
+            layer,
+            "cell",
+            VectorFindingGeometry::Point(Point2::new(10.0, 10.0)),
+        )
+        .unwrap();
+    let original_json = document.to_json().unwrap();
+    let original = document.clone();
+    assert!(std::ptr::eq(
+        document.finding(id).unwrap().tracking(),
+        original.finding(id).unwrap().tracking()
+    ));
+    document.set_object_name(id, Some("Named finding")).unwrap();
+    assert_eq!(original.to_json().unwrap(), original_json);
+    assert_eq!(document.finding(id).unwrap().name(), Some("Named finding"));
+    assert_eq!(
+        WorkspaceDocument::from_json(&document.to_json().unwrap()).unwrap(),
+        document
+    );
+}
+
+#[test]
+fn history_size_estimate_accounts_for_retained_segment_composites() {
+    let mut document =
+        WorkspaceDocument::new(source_identity(), AnnotationScheme::general_pathology_v1())
+            .unwrap();
+    let layer = document.ensure_manual_segmentation_layer();
+    let id = document
+        .add_segment(
+            layer,
+            "neoplasm",
+            SegmentationPrimitive::brush(
+                SegmentOperation::Add,
+                vec![Point2::new(100.0, 100.0), Point2::new(200.0, 100.0)],
+                20.0,
+            ),
+        )
+        .unwrap();
+    let input_estimate = document.estimated_retained_bytes();
+    document.validate().unwrap();
+    let composite = document.composite_segment(id).unwrap();
+    let coordinates: usize = composite
+        .components()
+        .iter()
+        .map(|c| c.exterior().len() + c.holes().iter().map(Vec::len).sum::<usize>())
+        .sum();
+    let retained = document.estimated_retained_bytes();
+    assert!(retained >= input_estimate + coordinates * std::mem::size_of::<Point2>());
+    document.set_object_name(id, Some("Renamed")).unwrap();
+    assert_eq!(document.estimated_retained_bytes(), retained);
+    document
+        .move_segment_primitive_point(id, 0, 1, Point2::new(101.0, 100.0))
+        .unwrap();
+    let rebuilt = WorkspaceDocument::from_json(&document.to_json().unwrap()).unwrap();
+    assert_eq!(
+        document.estimated_retained_bytes(),
+        rebuilt.estimated_retained_bytes()
+    );
+}
+
+#[test]
+fn segment_composition_is_shared_until_a_primitive_changes() {
+    let mut document =
+        WorkspaceDocument::new(source_identity(), AnnotationScheme::general_pathology_v1())
+            .unwrap();
+    let layer = document.ensure_manual_segmentation_layer();
+    let id = document
+        .add_segment(
+            layer,
+            "neoplasm",
+            SegmentationPrimitive::polygon(SegmentOperation::Add, square(10.0, 10.0, 20.0)),
+        )
+        .unwrap();
+    let before = document.composite_segment(id).unwrap();
+    let same = document.composite_segment(id).unwrap();
+    assert!(std::ptr::eq(before.components(), same.components()));
+    document.set_object_name(id, Some("Named segment")).unwrap();
+    let named = document.composite_segment(id).unwrap();
+    assert!(std::ptr::eq(before.components(), named.components()));
+    let snapshot = document.clone();
+    document
+        .apply_segment_primitive(
+            id,
+            SegmentationPrimitive::polygon(SegmentOperation::Erase, square(15.0, 15.0, 5.0)),
+        )
+        .unwrap();
+    let edited = document.composite_segment(id).unwrap();
+    assert_eq!(before.components()[0].holes().len(), 0);
+    assert_eq!(edited.components()[0].holes().len(), 1);
+    assert_eq!(snapshot.composite_segment(id).unwrap(), before);
+    let fresh = WorkspaceDocument::from_json(&document.to_json().unwrap()).unwrap();
+    assert_eq!(fresh.composite_segment(id).unwrap(), edited);
+}
+
+#[test]
+fn cached_validation_does_not_bless_untrusted_or_structurally_changed_content() {
+    let mut document =
+        WorkspaceDocument::new(source_identity(), AnnotationScheme::general_pathology_v1())
+            .unwrap();
+    let layer = document.vector_layers()[0].id();
+    let id = document
+        .add_vector_finding(
+            layer,
+            "cell",
+            VectorFindingGeometry::Point(Point2::new(10.0, 10.0)),
+        )
+        .unwrap();
+    document.validate().unwrap();
+    let mut json = serde_json::to_value(&document).unwrap();
+    let findings = json["vector_layers"][0]["findings"].as_array_mut().unwrap();
+    findings.push(findings[0].clone());
+    let mut invalid: WorkspaceDocument = serde_json::from_value(json).unwrap();
+    invalid.set_object_name(id, Some("Still invalid")).unwrap();
+    assert!(invalid.validate().is_err());
+    assert!(invalid.to_json().is_err());
+
+    let id2 = document
+        .add_vector_finding(
+            layer,
+            "cell",
+            VectorFindingGeometry::Point(Point2::new(30.0, 10.0)),
+        )
+        .unwrap();
+    document.validate().unwrap();
+    assert_eq!(document.object(id2).unwrap().object_id(), id2);
+    document.delete_object(id).unwrap();
+    document.validate().unwrap();
+    assert!(document.object(id).is_none());
+    assert_eq!(document.object(id2).unwrap().object_id(), id2);
+    assert!(document.set_object_name(id2, Some(" ")).is_err());
+    document.validate().unwrap();
+}
+
 fn square(x: f64, y: f64, size: f64) -> Vec<Point2> {
     vec![
         Point2::new(x, y),

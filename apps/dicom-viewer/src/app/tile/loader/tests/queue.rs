@@ -1,6 +1,74 @@
 use super::*;
 
 #[test]
+#[ignore = "manual release scheduler characterization; requires DICOM_VIEWER_WSI_FIXTURE"]
+fn compatible_queue_release_characterization() {
+    if cfg!(debug_assertions) {
+        panic!("run this characterization with --release");
+    }
+    let path =
+        std::env::var_os("DICOM_VIEWER_WSI_FIXTURE").expect("a local WSI fixture is required");
+    let study = Arc::new(
+        ViewerStudy::open_path_with_options(path, dicom_viewer_core::ViewerOpenOptions::cpu_only())
+            .unwrap(),
+    );
+    let level = &study.summary().levels[0];
+    let (columns, rows) = level.tile_layout.grid_size().unwrap();
+    let count = columns.saturating_mul(rows).min(8_192);
+    assert!(
+        count >= 16,
+        "scheduler fixture must have at least 16 real tiles"
+    );
+    let key_at = |index| TileKey {
+        generation: 1,
+        level: level.index,
+        coord: TileCoord::new(index % columns, index / columns),
+    };
+    let expected = std::iter::once(key_at(0))
+        .chain((count - 7..count).map(key_at))
+        .collect::<Vec<_>>();
+    for sample in 1..=15 {
+        let mut state = LoaderState::default();
+        for index in 0..count {
+            let key = key_at(index);
+            let priority = priority(QueueLane::Visible, u128::from(index), index);
+            let read_mode = if index == 0 || index >= count - 7 {
+                TileReadMode::Preferred
+            } else {
+                TileReadMode::CpuFallback
+            };
+            state.queued.insert(
+                key,
+                QueuedJob {
+                    priority,
+                    read_mode,
+                    enqueued_at: None,
+                },
+            );
+            state.jobs.push(Reverse(TileJob {
+                key,
+                priority,
+                read_mode,
+                enqueued_at: None,
+                study: Arc::clone(&study),
+            }));
+        }
+        let start = Instant::now();
+        let batch = std::hint::black_box(pop_next_batch(&mut state).unwrap());
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1_000.0;
+        assert_eq!(
+            batch.iter().map(|job| job.key).collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(state.queued.len(), count as usize - 8);
+        eprintln!(
+            "{}",
+            serde_json::json!({"workload":"compatible-queue", "sample":sample,"jobs":count,"batch":batch.len(),"elapsed_ms":elapsed_ms})
+        );
+    }
+}
+
+#[test]
 fn queue_reprioritizes_without_duplicating_current_work() {
     let loader = TileLoader::with_worker_count(0);
     let study = study();
@@ -63,6 +131,39 @@ fn batches_are_priority_ordered_and_limited_to_eight() {
     assert_eq!(batch.len(), 8);
     assert_eq!(batch[0].key, key(0));
     assert_eq!(batch[7].key, key(7));
+}
+
+#[test]
+fn compatible_batch_defers_other_modes_without_losing_byte_budget_or_priority() {
+    let study = study();
+    let mut state = LoaderState {
+        max_in_flight_decoded_bytes: 4 * 16 * 16 * 8,
+        ..LoaderState::default()
+    };
+    let requests = (0..16)
+        .map(|col| {
+            let mut job = request(&study, col, QueueLane::Visible, col);
+            if col > 0 && col < 9 {
+                job.read_mode = TileReadMode::CpuFallback;
+            }
+            job
+        })
+        .collect();
+    enqueue_requests(&mut state, requests, true);
+    let first = pop_next_batch(&mut state).unwrap();
+    assert_eq!(
+        first.iter().map(|job| job.key).collect::<Vec<_>>(),
+        [0, 9, 10, 11].map(key)
+    );
+    let next = pop_next_batch(&mut state).unwrap();
+    assert_eq!(
+        next.iter().map(|job| job.key).collect::<Vec<_>>(),
+        [1, 2, 3, 4].map(key)
+    );
+    assert!(next
+        .iter()
+        .all(|job| job.read_mode == TileReadMode::CpuFallback));
+    assert_eq!(state.queued.len(), 8);
 }
 
 #[test]

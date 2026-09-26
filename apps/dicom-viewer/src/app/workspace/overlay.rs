@@ -341,15 +341,15 @@ fn screen_points_for_render(
     view: CameraView,
     selected: bool,
 ) -> Vec<egui::Pos2> {
-    let screen = screen_points(viewport, points, view);
-    if selected || screen.len() <= 3 {
-        return screen;
+    if selected || points.len() <= 3 {
+        return screen_points(viewport, points, view);
     }
 
     let minimum_distance_squared = DISPLAY_DECIMATION_PIXELS * DISPLAY_DECIMATION_PIXELS;
-    let mut display = Vec::with_capacity(screen.len());
-    display.push(screen[0]);
-    for point in screen.iter().copied().skip(1) {
+    let mut display = Vec::with_capacity(points.len());
+    display.push(screen_point(viewport, points[0], view));
+    for point in points.iter().copied().skip(1) {
+        let point = screen_point(viewport, point, view);
         if point.distance_sq(*display.last().expect("display begins with one point"))
             >= minimum_distance_squared
         {
@@ -360,9 +360,9 @@ fn screen_points_for_render(
         display
     } else {
         vec![
-            screen[0],
-            screen[screen.len() / 3],
-            screen[2 * screen.len() / 3],
+            screen_point(viewport, points[0], view),
+            screen_point(viewport, points[points.len() / 3], view),
+            screen_point(viewport, points[2 * points.len() / 3], view),
         ]
     }
 }

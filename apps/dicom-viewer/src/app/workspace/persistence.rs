@@ -1,9 +1,9 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -57,6 +57,7 @@ struct SerializedRevision {
 pub(in crate::app) struct RestoredWorkspace {
     revision: u64,
     saved_unix_ms: u64,
+    #[cfg(test)]
     path: PathBuf,
     document: Arc<WorkspaceDocument>,
     draft: Option<DraftInteraction>,
@@ -92,12 +93,20 @@ impl RestoredWorkspace {
 #[derive(Debug, Clone)]
 pub(in crate::app) struct RevisionStore {
     root: PathBuf,
+    verified: Arc<Mutex<VecDeque<(PathBuf, ViewerSourceIdentity)>>>,
+    #[cfg(test)]
+    revision_parses: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl RevisionStore {
     #[must_use]
     pub(super) fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            verified: Default::default(),
+            #[cfg(test)]
+            revision_parses: Default::default(),
+        }
     }
 
     pub(in crate::app) fn application_default() -> Result<Self, ViewerError> {
@@ -178,6 +187,7 @@ impl RevisionStore {
             }
             Err(error) => return Err(io_error(&destination, error.error)),
         }
+        self.remember_verified(&destination, request.document.source_identity())?;
         self.prune_valid_revisions(request.document.source_identity())?;
         Ok(destination)
     }
@@ -186,13 +196,18 @@ impl RevisionStore {
         &self,
         source: &ViewerSourceIdentity,
     ) -> Result<Option<RestoredWorkspace>, ViewerError> {
-        Ok(self.valid_revisions(source)?.into_iter().next())
+        for (revision, path) in self.revision_candidates(source)? {
+            if let Ok(restored) = self.load_revision(&path, revision, source) {
+                return Ok(Some(restored));
+            }
+        }
+        Ok(None)
     }
 
-    pub(super) fn valid_revisions(
+    fn revision_candidates(
         &self,
         source: &ViewerSourceIdentity,
-    ) -> Result<Vec<RestoredWorkspace>, ViewerError> {
+    ) -> Result<Vec<(u64, PathBuf)>, ViewerError> {
         let directory = self.revision_directory(source);
         let entries = match fs::read_dir(&directory) {
             Ok(entries) => entries,
@@ -208,9 +223,18 @@ impl RevisionStore {
             .collect::<Vec<_>>();
         candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
 
+        Ok(candidates)
+    }
+
+    #[cfg(test)]
+    pub(super) fn valid_revisions(
+        &self,
+        source: &ViewerSourceIdentity,
+    ) -> Result<Vec<RestoredWorkspace>, ViewerError> {
+        let candidates = self.revision_candidates(source)?;
         let mut valid = Vec::new();
         for (filename_revision, path) in candidates {
-            let Ok(restored) = read_revision(&path, filename_revision, source) else {
+            let Ok(restored) = self.load_revision(&path, filename_revision, source) else {
                 continue;
             };
             valid.push(restored);
@@ -218,11 +242,35 @@ impl RevisionStore {
         Ok(valid)
     }
 
-    pub(super) fn next_revision(&self, source: &ViewerSourceIdentity) -> Result<u64, ViewerError> {
-        Ok(self
-            .valid_revisions(source)?
-            .first()
-            .map_or(1, |revision| revision.revision.saturating_add(1)))
+    #[cfg(test)]
+    pub(super) fn revision_parse_count(&self) -> usize {
+        self.revision_parses
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn load_revision(
+        &self,
+        path: &Path,
+        revision: u64,
+        source: &ViewerSourceIdentity,
+    ) -> Result<RestoredWorkspace, ViewerError> {
+        let bytes = read_revision_bytes(path)?;
+        self.parse_revision(path, revision, source, &bytes)
+    }
+
+    fn parse_revision(
+        &self,
+        path: &Path,
+        revision: u64,
+        source: &ViewerSourceIdentity,
+        bytes: &[u8],
+    ) -> Result<RestoredWorkspace, ViewerError> {
+        #[cfg(test)]
+        self.revision_parses
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let restored = parse_revision(path, revision, source, bytes)?;
+        self.remember_verified(path, source)?;
+        Ok(restored)
     }
 
     pub(in crate::app) fn archive_current(
@@ -344,13 +392,55 @@ impl RevisionStore {
         Ok(true)
     }
 
-    fn prune_valid_revisions(&self, source: &ViewerSourceIdentity) -> Result<(), ViewerError> {
-        for revision in self
-            .valid_revisions(source)?
-            .into_iter()
-            .skip(VALID_REVISIONS_TO_KEEP)
+    fn remember_verified(
+        &self,
+        path: &Path,
+        source: &ViewerSourceIdentity,
+    ) -> Result<(), ViewerError> {
+        let mut verified = self.verified.lock().map_err(|_| {
+            ViewerError::InvalidInput("workspace revision validation cache was poisoned".into())
+        })?;
+        if !verified
+            .iter()
+            .any(|(known, identity)| known == path && identity == source)
         {
-            fs::remove_file(&revision.path).map_err(|error| io_error(&revision.path, error))?;
+            // Store identities only, never full revision payloads. The filename
+            // contains the existing content digest; pruning verifies it anew.
+            if verified.len() == 32 {
+                verified.pop_front();
+            }
+            verified.push_back((path.to_path_buf(), source.clone()));
+        }
+        Ok(())
+    }
+
+    fn prune_valid_revisions(&self, source: &ViewerSourceIdentity) -> Result<(), ViewerError> {
+        let mut valid_count = 0;
+        for (revision, path) in self.revision_candidates(source)? {
+            let Ok(bytes) = read_revision_bytes(&path) else {
+                continue;
+            };
+            let known = self
+                .verified
+                .lock()
+                .map_err(|_| {
+                    ViewerError::InvalidInput(
+                        "workspace revision validation cache was poisoned".into(),
+                    )
+                })?
+                .iter()
+                .any(|(known, identity)| known == &path && identity == source);
+            if !known
+                && self
+                    .parse_revision(&path, revision, source, &bytes)
+                    .is_err()
+            {
+                continue;
+            }
+            valid_count += 1;
+            if valid_count > VALID_REVISIONS_TO_KEEP {
+                fs::remove_file(&path).map_err(|error| io_error(&path, error))?;
+            }
         }
         Ok(())
     }
@@ -378,23 +468,32 @@ pub(in crate::app) struct WorkspaceAutosave {
     debounce: Duration,
     next_revision: u64,
     pending: Option<(WorkspaceSaveRequest, Instant)>,
-    in_flight: Option<Receiver<SaveCompletion>>,
+    in_flight: Option<(WorkspaceSaveRequest, Receiver<SaveCompletion>)>,
     status: AutosaveStatus,
 }
 
 impl WorkspaceAutosave {
+    #[cfg(test)]
     pub(in crate::app) fn new(
         store: RevisionStore,
         source: &ViewerSourceIdentity,
     ) -> Result<Self, ViewerError> {
-        Ok(Self {
-            next_revision: store.next_revision(source)?,
+        let restored = store.restore_latest(source)?;
+        Ok(Self::from_restored(store, restored.as_ref()))
+    }
+
+    pub(in crate::app) fn from_restored(
+        store: RevisionStore,
+        restored: Option<&RestoredWorkspace>,
+    ) -> Self {
+        Self {
+            next_revision: restored.map_or(1, |revision| revision.revision.saturating_add(1)),
             store,
             debounce: DEFAULT_DEBOUNCE,
             pending: None,
             in_flight: None,
             status: AutosaveStatus::Clean,
-        })
+        }
     }
 
     pub(in crate::app) fn queue(&mut self, request: WorkspaceSaveRequest, now: Instant) {
@@ -416,19 +515,24 @@ impl WorkspaceAutosave {
     }
 
     pub(in crate::app) fn flush(&mut self) -> Result<(), ViewerError> {
-        if let Some(receiver) = self.in_flight.take() {
-            let completion = receiver.recv().map_err(|_| {
-                ViewerError::InvalidInput("workspace autosave worker exited".into())
-            })?;
-            self.apply_completion(completion)?;
+        if let Some((request, receiver)) = self.in_flight.take() {
+            let completion = receiver.recv().unwrap_or_else(|_| SaveCompletion {
+                revision: self.next_revision.saturating_sub(1),
+                saved_unix_ms: request.captured_unix_ms,
+                result: Err(ViewerError::InvalidInput(
+                    "workspace autosave worker exited".into(),
+                )),
+            });
+            self.apply_completion(request, completion)?;
         }
         if let Some((request, _)) = self.pending.take() {
             let revision = self.allocate_revision();
-            self.store.save_revision(&request, revision)?;
-            self.status = AutosaveStatus::Saved {
+            let completion = SaveCompletion {
                 revision,
                 saved_unix_ms: request.captured_unix_ms,
+                result: self.store.save_revision(&request, revision),
             };
+            self.apply_completion(request, completion)?;
         }
         Ok(())
     }
@@ -450,21 +554,22 @@ impl WorkspaceAutosave {
         let store = self.store.clone();
         let revision = self.allocate_revision();
         let saved_unix_ms = request.captured_unix_ms;
+        let worker_request = request.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
         thread::spawn(move || {
-            let result = store.save_revision(&request, revision);
+            let result = store.save_revision(&worker_request, revision);
             let _ = sender.send(SaveCompletion {
                 revision,
                 saved_unix_ms,
                 result,
             });
         });
-        self.in_flight = Some(receiver);
+        self.in_flight = Some((request, receiver));
         self.status = AutosaveStatus::Saving;
     }
 
     fn poll_completion(&mut self) {
-        let Some(receiver) = &self.in_flight else {
+        let Some((_, receiver)) = &self.in_flight else {
             return;
         };
         let completion = match receiver.try_recv() {
@@ -478,16 +583,24 @@ impl WorkspaceAutosave {
                 )),
             },
         };
-        self.in_flight = None;
-        if let Err(error) = self.apply_completion(completion) {
-            self.status = AutosaveStatus::Failed(error.to_string());
-        } else if self.pending.is_some() {
+        let (request, _) = self.in_flight.take().expect("in-flight save was checked");
+        if self.apply_completion(request, completion).is_ok() && self.pending.is_some() {
             self.status = AutosaveStatus::Pending;
         }
     }
 
-    fn apply_completion(&mut self, completion: SaveCompletion) -> Result<(), ViewerError> {
-        completion.result?;
+    fn apply_completion(
+        &mut self,
+        request: WorkspaceSaveRequest,
+        completion: SaveCompletion,
+    ) -> Result<(), ViewerError> {
+        if let Err(error) = completion.result {
+            if self.pending.is_none() {
+                self.pending = Some((request, Instant::now() + self.debounce));
+            }
+            self.status = AutosaveStatus::Failed(error.to_string());
+            return Err(error);
+        }
         self.status = AutosaveStatus::Saved {
             revision: completion.revision,
             saved_unix_ms: completion.saved_unix_ms,
@@ -502,11 +615,7 @@ impl WorkspaceAutosave {
     }
 }
 
-fn read_revision(
-    path: &Path,
-    filename_revision: u64,
-    expected_source: &ViewerSourceIdentity,
-) -> Result<RestoredWorkspace, ViewerError> {
+fn read_revision_bytes(path: &Path) -> Result<Vec<u8>, ViewerError> {
     let bytes = read_bounded(path)?;
     let expected_digest = path
         .file_stem()
@@ -520,7 +629,16 @@ fn read_revision(
             "workspace revision content digest does not match its filename".into(),
         ));
     }
-    let serialized: SerializedRevision = serde_json::from_slice(&bytes).map_err(|error| {
+    Ok(bytes)
+}
+
+fn parse_revision(
+    _path: &Path,
+    filename_revision: u64,
+    expected_source: &ViewerSourceIdentity,
+    bytes: &[u8],
+) -> Result<RestoredWorkspace, ViewerError> {
+    let serialized: SerializedRevision = serde_json::from_slice(bytes).map_err(|error| {
         ViewerError::InvalidInput(format!("workspace revision is not valid JSON: {error}"))
     })?;
     if serialized.schema_version != REVISION_SCHEMA_VERSION
@@ -536,7 +654,8 @@ fn read_revision(
     Ok(RestoredWorkspace {
         revision: serialized.revision,
         saved_unix_ms: serialized.saved_unix_ms,
-        path: path.to_path_buf(),
+        #[cfg(test)]
+        path: _path.to_path_buf(),
         document: serialized.document,
         draft: serialized.draft,
     })

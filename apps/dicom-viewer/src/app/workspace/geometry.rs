@@ -128,8 +128,21 @@ impl WorkspaceRuntime {
             }
         }
         candidate.validate()?;
+        let spatial_was_current = self.spatial_revision == self.document.revision();
+        if spatial_was_current {
+            if self.spatial_index.render_object(object_id).is_some() {
+                self.spatial_index.update_object(&candidate, object_id)?;
+            } else {
+                // An erased segment may have no indexed composite yet.
+                self.spatial_index = WorkspaceSpatialIndex::build(&candidate)?;
+            }
+        }
         self.document = Arc::new(candidate);
-        self.invalidate_spatial_index();
+        if spatial_was_current {
+            self.spatial_revision = self.document.revision();
+        } else {
+            self.invalidate_spatial_index();
+        }
         Ok(())
     }
 

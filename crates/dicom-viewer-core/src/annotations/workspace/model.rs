@@ -196,11 +196,11 @@ impl VectorFindingGeometry {
 pub struct VectorFinding {
     object_id: Uuid,
     ordinal: u64,
-    tracking: TrackingIdentity,
-    class_id: String,
+    tracking: Arc<TrackingIdentity>,
+    class_id: Arc<str>,
     finding_site: Option<ControlledFindingSite>,
-    name: Option<String>,
-    comment: Option<String>,
+    name: Option<Arc<str>>,
+    comment: Option<Arc<str>>,
     provenance: WorkspaceObjectProvenance,
     source_frame: SourceFrameContext,
     geometry: VectorFindingGeometry,
@@ -267,8 +267,8 @@ impl VectorFinding {
         Self {
             object_id: identity.object_id,
             ordinal: identity.ordinal,
-            tracking: identity.tracking,
-            class_id,
+            tracking: Arc::new(identity.tracking),
+            class_id: Arc::from(class_id),
             finding_site: None,
             name: None,
             comment: None,
@@ -279,7 +279,7 @@ impl VectorFinding {
     }
 
     pub(super) fn set_class_id(&mut self, class_id: String) {
-        self.class_id = class_id;
+        self.class_id = Arc::from(class_id);
     }
 
     pub(super) fn set_finding_site(&mut self, site: Option<ControlledFindingSite>) {
@@ -291,11 +291,11 @@ impl VectorFinding {
     }
 
     pub(super) fn set_name(&mut self, name: Option<String>) {
-        self.name = name;
+        self.name = name.map(Arc::from);
     }
 
     pub(super) fn set_comment(&mut self, comment: Option<String>) {
-        self.comment = comment;
+        self.comment = comment.map(Arc::from);
     }
 }
 
@@ -406,14 +406,16 @@ impl SegmentationPrimitive {
 pub struct SegmentationSegmentFinding {
     object_id: Uuid,
     ordinal: u64,
-    tracking: TrackingIdentity,
-    class_id: String,
+    tracking: Arc<TrackingIdentity>,
+    class_id: Arc<str>,
     finding_site: Option<ControlledFindingSite>,
-    name: Option<String>,
-    comment: Option<String>,
+    name: Option<Arc<str>>,
+    comment: Option<Arc<str>>,
     provenance: WorkspaceObjectProvenance,
     source_frame: SourceFrameContext,
     primitives: Vec<SegmentationPrimitive>,
+    #[serde(skip)]
+    geometry_cache: super::composition::SegmentGeometryCache,
 }
 
 impl SegmentationSegmentFinding {
@@ -477,26 +479,35 @@ impl SegmentationSegmentFinding {
         Self {
             object_id: identity.object_id,
             ordinal: identity.ordinal,
-            tracking: identity.tracking,
-            class_id,
+            tracking: Arc::new(identity.tracking),
+            class_id: Arc::from(class_id),
             finding_site: None,
             name: None,
             comment: None,
             provenance,
             source_frame,
             primitives: vec![initial],
+            geometry_cache: Default::default(),
         }
     }
 
     pub(super) fn set_class_id(&mut self, class_id: String) {
-        self.class_id = class_id;
+        self.class_id = Arc::from(class_id);
     }
 
     pub(super) fn set_finding_site(&mut self, site: Option<ControlledFindingSite>) {
         self.finding_site = site;
     }
 
+    pub(super) fn composite_geometry(
+        &self,
+        dimensions: (u64, u64),
+    ) -> Result<CompositeSegmentGeometry> {
+        self.geometry_cache.get(&self.primitives, dimensions)
+    }
+
     pub(super) fn push_primitive(&mut self, primitive: SegmentationPrimitive) {
+        self.geometry_cache = Default::default();
         self.primitives.push(primitive);
     }
 
@@ -509,15 +520,16 @@ impl SegmentationSegmentFinding {
             ViewerError::InvalidInput("segment primitive index is outside the segment".into())
         })?;
         *target = primitive;
+        self.geometry_cache = Default::default();
         Ok(())
     }
 
     pub(super) fn set_name(&mut self, name: Option<String>) {
-        self.name = name;
+        self.name = name.map(Arc::from);
     }
 
     pub(super) fn set_comment(&mut self, comment: Option<String>) {
-        self.comment = comment;
+        self.comment = comment.map(Arc::from);
     }
 }
 
@@ -526,11 +538,11 @@ impl SegmentationSegmentFinding {
 pub struct WorkspaceLinearMeasurement {
     object_id: Uuid,
     ordinal: u64,
-    tracking: TrackingIdentity,
-    class_id: String,
+    tracking: Arc<TrackingIdentity>,
+    class_id: Arc<str>,
     finding_site: Option<ControlledFindingSite>,
-    name: Option<String>,
-    comment: Option<String>,
+    name: Option<Arc<str>>,
+    comment: Option<Arc<str>>,
     provenance: WorkspaceObjectProvenance,
     source_frame: SourceFrameContext,
     endpoints: [Point2; 2],
@@ -549,8 +561,8 @@ impl WorkspaceLinearMeasurement {
         Self {
             object_id: identity.object_id,
             ordinal: identity.ordinal,
-            tracking: identity.tracking,
-            class_id,
+            tracking: Arc::new(identity.tracking),
+            class_id: Arc::from(class_id),
             finding_site: None,
             name: None,
             comment: None,
@@ -617,7 +629,7 @@ impl WorkspaceLinearMeasurement {
     }
 
     pub(super) fn set_class_id(&mut self, class_id: String) {
-        self.class_id = class_id;
+        self.class_id = Arc::from(class_id);
     }
 
     pub(super) fn set_finding_site(&mut self, site: Option<ControlledFindingSite>) {
@@ -634,11 +646,11 @@ impl WorkspaceLinearMeasurement {
     }
 
     pub(super) fn set_name(&mut self, name: Option<String>) {
-        self.name = name;
+        self.name = name.map(Arc::from);
     }
 
     pub(super) fn set_comment(&mut self, comment: Option<String>) {
-        self.comment = comment;
+        self.comment = comment.map(Arc::from);
     }
 }
 
@@ -845,7 +857,7 @@ impl WorkspacePresentation {
 pub struct VectorLayer {
     id: Uuid,
     name: String,
-    findings: Vec<VectorFinding>,
+    findings: Arc<Vec<VectorFinding>>,
 }
 
 impl VectorLayer {
@@ -853,7 +865,7 @@ impl VectorLayer {
         Self {
             id: Uuid::new_v4(),
             name: name.into(),
-            findings: Vec::new(),
+            findings: Arc::new(Vec::new()),
         }
     }
 
@@ -873,7 +885,7 @@ impl VectorLayer {
     }
 
     pub(super) fn findings_mut(&mut self) -> &mut Vec<VectorFinding> {
-        &mut self.findings
+        Arc::make_mut(&mut self.findings)
     }
 }
 
@@ -882,7 +894,7 @@ impl VectorLayer {
 pub struct SegmentationLayer {
     id: Uuid,
     name: String,
-    segments: Vec<SegmentationSegmentFinding>,
+    segments: Arc<Vec<SegmentationSegmentFinding>>,
 }
 
 impl SegmentationLayer {
@@ -890,7 +902,7 @@ impl SegmentationLayer {
         Self {
             id: Uuid::new_v4(),
             name: name.into(),
-            segments: Vec::new(),
+            segments: Arc::new(Vec::new()),
         }
     }
 
@@ -910,7 +922,7 @@ impl SegmentationLayer {
     }
 
     pub(super) fn segments_mut(&mut self) -> &mut Vec<SegmentationSegmentFinding> {
-        &mut self.segments
+        Arc::make_mut(&mut self.segments)
     }
 }
 
@@ -938,12 +950,14 @@ impl PolygonComponent {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CompositeSegmentGeometry {
-    components: Vec<PolygonComponent>,
+    components: Arc<[PolygonComponent]>,
 }
 
 impl CompositeSegmentGeometry {
     pub(super) fn new(components: Vec<PolygonComponent>) -> Self {
-        Self { components }
+        Self {
+            components: Arc::from(components),
+        }
     }
 
     #[must_use]

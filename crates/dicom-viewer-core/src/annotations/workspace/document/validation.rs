@@ -1,14 +1,34 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, OnceLock};
 
 use uuid::Uuid;
 
 use crate::{AnnotationClassGeometry, Result, TrackingIdentity, ViewerError};
 
-use super::super::composition::compose_segment;
 use super::super::model::{
     ExternalLayerReference, SegmentOperation, SegmentationLayer, SegmentationPrimitive,
     VectorFindingGeometry, VectorLayer,
 };
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct ValidationCache {
+    checked: OnceLock<()>,
+    pub(super) retained_bytes: OnceLock<usize>,
+    pub(super) object_locations: Arc<OnceLock<HashMap<Uuid, super::object::ObjectLocation>>>,
+}
+
+impl PartialEq for ValidationCache {
+    fn eq(&self, _other: &Self) -> bool {
+        // Validation proof and size estimates never affect document equality.
+        true
+    }
+}
+
+impl ValidationCache {
+    pub(super) fn is_validated(&self) -> bool {
+        self.checked.get().is_some()
+    }
+}
 use super::{
     validate_measurement, validate_source_identity, validate_vector_geometry, WorkspaceDocument,
     MAX_COORDINATE_POINTS, MAX_EDITABLE_OBJECTS, WORKSPACE_SCHEMA_VERSION,
@@ -16,6 +36,9 @@ use super::{
 
 impl WorkspaceDocument {
     pub fn validate(&self) -> Result<()> {
+        if self.validation.checked.get().is_some() {
+            return Ok(());
+        }
         if self.schema_version != WORKSPACE_SCHEMA_VERSION {
             return Err(ViewerError::Unsupported(format!(
                 "workspace schema version {} is not supported",
@@ -103,7 +126,7 @@ impl WorkspaceDocument {
                     "a segmentation segment must start with an Add primitive".into(),
                 ));
             }
-            compose_segment(segment.primitives(), self.source_identity.dimensions())?;
+            segment.composite_geometry(self.source_identity.dimensions())?;
             validate_identity(
                 segment.object_id(),
                 segment.ordinal(),
@@ -140,6 +163,7 @@ impl WorkspaceDocument {
         }
         self.validate_sites_for_scheme(&self.scheme)?;
         self.presentation.validate(&layer_ids, &object_ids)?;
+        let _ = self.validation.checked.set(());
         Ok(())
     }
 }

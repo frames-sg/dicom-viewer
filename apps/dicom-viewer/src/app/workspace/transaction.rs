@@ -61,6 +61,7 @@ impl WorkspaceRuntime {
             spatial_index,
             spatial_revision,
             external_payloads: HashMap::new(),
+            external_render_cache: HashMap::new(),
             handle_drag: None,
         })
     }
@@ -88,9 +89,8 @@ impl WorkspaceRuntime {
             let after = Arc::new(candidate);
             self.history
                 .record(label, Arc::clone(&before), Arc::clone(&after));
-            self.document = after;
+            self.publish_document(after);
             self.draft_undo.clear();
-            self.invalidate_spatial_index();
         }
         Ok(result)
     }
@@ -99,10 +99,9 @@ impl WorkspaceRuntime {
         let Some(document) = self.history.undo() else {
             return false;
         };
-        self.document = document;
+        self.publish_document(document);
         self.selection
             .retain(|id| self.document.object(*id).is_some());
-        self.invalidate_spatial_index();
         true
     }
 
@@ -110,9 +109,19 @@ impl WorkspaceRuntime {
         let Some(document) = self.history.redo() else {
             return false;
         };
-        self.document = document;
-        self.invalidate_spatial_index();
+        self.publish_document(document);
         true
+    }
+
+    pub(super) fn publish_document(&mut self, document: Arc<WorkspaceDocument>) {
+        let spatial_was_current = self.spatial_revision == self.document.revision();
+        let changes_geometry = !self.document.shares_render_geometry_with(&document);
+        self.document = document;
+        if changes_geometry || !spatial_was_current {
+            self.invalidate_spatial_index();
+        } else {
+            self.spatial_revision = self.document.revision();
+        }
     }
 
     #[must_use]

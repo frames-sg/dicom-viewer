@@ -36,6 +36,10 @@ fn expect_cpu_render_tile(tile: RenderTile, message: &str) -> RgbaTile {
         RenderTile::Cpu(tile) => tile,
         #[cfg(target_os = "macos")]
         RenderTile::Metal(_) => panic!("{message}"),
+        #[cfg(target_os = "macos")]
+        RenderTile::CpuWithColorLut { .. } => {
+            panic!("{message}: color conversion is still pending")
+        }
     }
 }
 

@@ -294,33 +294,59 @@ impl WorkspaceDocument {
     }
 
     fn locate_object(&self, object_id: Uuid) -> Option<ObjectLocation> {
-        for (layer_index, layer) in self.vector_layers.iter().enumerate() {
-            if let Some(object) = layer
+        // Bulk construction and unvalidated input use allocation-free lookup.
+        // Cache only immutable validated object layouts shared by snapshots.
+        if !self.validation.is_validated() {
+            return self.locate_object_uncached(object_id);
+        }
+        let locations = self.validation.object_locations.get_or_init(|| {
+            let mut locations = std::collections::HashMap::with_capacity(self.object_count());
+            for (layer, items) in self.vector_layers.iter().enumerate() {
+                for (object, finding) in items.findings().iter().enumerate() {
+                    locations
+                        .entry(finding.object_id())
+                        .or_insert(ObjectLocation::Vector { layer, object });
+                }
+            }
+            for (layer, items) in self.segmentation_layers.iter().enumerate() {
+                for (object, segment) in items.segments().iter().enumerate() {
+                    locations
+                        .entry(segment.object_id())
+                        .or_insert(ObjectLocation::Segment { layer, object });
+                }
+            }
+            for (object, measurement) in self.measurements.iter().enumerate() {
+                locations
+                    .entry(measurement.object_id())
+                    .or_insert(ObjectLocation::Measurement { object });
+            }
+            locations
+        });
+        locations.get(&object_id).copied()
+    }
+
+    fn locate_object_uncached(&self, object_id: Uuid) -> Option<ObjectLocation> {
+        for (layer, items) in self.vector_layers.iter().enumerate() {
+            if let Some(object) = items
                 .findings()
                 .iter()
-                .position(|object| object.object_id() == object_id)
+                .position(|item| item.object_id() == object_id)
             {
-                return Some(ObjectLocation::Vector {
-                    layer: layer_index,
-                    object,
-                });
+                return Some(ObjectLocation::Vector { layer, object });
             }
         }
-        for (layer_index, layer) in self.segmentation_layers.iter().enumerate() {
-            if let Some(object) = layer
+        for (layer, items) in self.segmentation_layers.iter().enumerate() {
+            if let Some(object) = items
                 .segments()
                 .iter()
-                .position(|object| object.object_id() == object_id)
+                .position(|item| item.object_id() == object_id)
             {
-                return Some(ObjectLocation::Segment {
-                    layer: layer_index,
-                    object,
-                });
+                return Some(ObjectLocation::Segment { layer, object });
             }
         }
         self.measurements
             .iter()
-            .position(|object| object.object_id() == object_id)
+            .position(|item| item.object_id() == object_id)
             .map(|object| ObjectLocation::Measurement { object })
     }
 }

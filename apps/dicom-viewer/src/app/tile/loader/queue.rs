@@ -23,7 +23,16 @@ pub(super) fn enqueue_requests(
                 TileReadMode::Preferred
             };
             let priority = if authoritative_priority {
-                request.priority
+                if request.priority.lane == current.priority.lane
+                    && request.priority.distance2 == current.priority.distance2
+                {
+                    TilePriority {
+                        sequence: current.priority.sequence,
+                        ..request.priority
+                    }
+                } else {
+                    request.priority
+                }
             } else {
                 current.priority.min(request.priority)
             };
@@ -186,16 +195,32 @@ pub(super) fn pop_next_batch(state: &mut LoaderState) -> Option<Vec<TileJob>> {
     let first = pop_next_valid_job_for_lane(state, lane, available_bytes)?;
     let mut reserved_bytes = decoded_byte_reservation(&first);
     let mut jobs = vec![first];
+    let mut deferred = Vec::new();
     while jobs.len() < state.max_batch_size {
         let remaining_bytes = available_bytes.saturating_sub(reserved_bytes);
-        let Some(job) = pop_next_compatible_job(state, &jobs[0], remaining_bytes) else {
+        let Some(Reverse(job)) = state.jobs.pop() else {
             break;
         };
+        if !is_current_job(state, &job) {
+            continue;
+        }
+        if !can_batch(&jobs[0], &job) {
+            deferred.push(Reverse(job));
+            continue;
+        }
+        let bytes = decoded_byte_reservation(&job);
+        if bytes > remaining_bytes {
+            deferred.push(Reverse(job));
+            continue;
+        }
+        state.queued.remove(&job.key);
         reserved_bytes = reserved_bytes
-            .checked_add(decoded_byte_reservation(&job))
+            .checked_add(bytes)
             .expect("admitted tile decode reservations must fit in usize");
         jobs.push(job);
     }
+    // Restore incompatible jobs once, rather than once per accepted tile.
+    state.jobs.extend(deferred);
     Some(jobs)
 }
 
@@ -258,27 +283,6 @@ fn pop_next_valid_job_for_lane(
             continue;
         }
         if job.priority.lane == lane && decoded_byte_reservation(&job) <= available_bytes {
-            state.queued.remove(&job.key);
-            state.jobs.extend(deferred.into_iter().map(Reverse));
-            return Some(job);
-        }
-        deferred.push(job);
-    }
-    state.jobs.extend(deferred.into_iter().map(Reverse));
-    None
-}
-
-fn pop_next_compatible_job(
-    state: &mut LoaderState,
-    first: &TileJob,
-    available_bytes: usize,
-) -> Option<TileJob> {
-    let mut deferred = Vec::new();
-    while let Some(Reverse(job)) = state.jobs.pop() {
-        if !is_current_job(state, &job) {
-            continue;
-        }
-        if can_batch(first, &job) && decoded_byte_reservation(&job) <= available_bytes {
             state.queued.remove(&job.key);
             state.jobs.extend(deferred.into_iter().map(Reverse));
             return Some(job);
