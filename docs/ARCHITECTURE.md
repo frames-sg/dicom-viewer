@@ -324,12 +324,19 @@ for this reason.
 
 ## Release integration
 
-The viewer workspace resolves `wsi-rs` 0.6.0 at revision `b940ea94` and J2K
-0.10.0 at revision `57b6af89` from their upstream Git repositories. CI and
-clean checkouts must use the locked revisions without sibling source overlays.
-wsi-rs owns codec selection; the viewer must not create a parallel codec or
-device-session stack. Metal ownership crosses crate boundaries only as retained
-`objc2` protocol objects; the viewer has no `metal-rs` compatibility layer.
+The viewer workspace targets `wsi-rs` 0.7.0 and published J2K 0.11.2.
+wsi-rs 0.7.0 is not yet on crates.io, so current development uses the temporary
+wsi-rs override documented in the [build instructions](../README.md#build).
+Distribution requires published first-party dependencies in the locked graph; see the
+[release checklist](RELEASE.md#reproducible-source-gate).
+The viewer calls the typed CPU and device tile APIs. Metal reads use sessions
+created from the renderer's device; unsupported paths and device tile-read
+failures retry through the strict CPU reader. Cancellation, admission limits,
+and backend-contract errors propagate.
+CPU reads and device-failure retries use a shared Rayon pool with the configured
+`DICOM_VIEWER_JP2K_THREADS` budget and disable automatic device selection.
+wsi-rs owns codec execution. Metal ownership crosses crate boundaries only as
+retained `objc2` protocol objects; the viewer has no `metal-rs` compatibility layer.
 
 Large conformance slides remain local. Repository tests use synthetic fixtures
 and opt-in paths for local SVS/DICOM acceptance.

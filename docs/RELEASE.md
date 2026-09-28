@@ -20,15 +20,17 @@ runtime validation must pass when those backends are included in a release.
 
 ## Reproducible source gate
 
-The locked graph must resolve `wsi-rs` 0.6.0 at revision `b940ea94`, J2K 0.10.0
-at revision `57b6af89`, and `wsi-dicom-annotations` 0.1.2 at revision `71851b4a`
-from their upstream Git repositories. The annotation revision includes the shared
-`metadata::open_metadata_object` API; the manifest pins its full 40-character SHA.
+The locked graph must resolve `wsi-rs` 0.7.0, J2K 0.11.2, and
+`wsi-dicom-annotations` 0.1.3 from crates.io. The annotations release includes
+the shared `metadata::open_metadata_object` API. J2K and annotations are
+published; wsi-rs 0.7.0 is still unreleased, so this gate is not yet satisfied
+by the current dependency set. The README's temporary wsi-rs development
+override does not satisfy the distribution gate.
 
-CI and packaging must build without sibling checkouts or local source overrides.
+CI and packaging must build without sibling checkouts or local codec overrides.
 Run `cargo metadata --locked --format-version 1` from a clean checkout and confirm
-that it leaves `Cargo.lock` unchanged. Moving annotations to crates.io requires a
-matching owner publication and a reviewed registry lockfile refresh.
+that it leaves `Cargo.lock` unchanged. The reviewed security patches listed in
+`SUPPLY_CHAIN.md` remain part of the workspace.
 
 ## Interactive performance gate
 

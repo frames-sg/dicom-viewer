@@ -14,15 +14,21 @@ checklist](docs/RELEASE.md) for distribution gates.
 
 ## Build
 
-The viewer resolves `wsi-rs` 0.6.0 at revision `b940ea94` and J2K 0.10.0 at
-revision `57b6af89` from their upstream Git repositories. `Cargo.lock` pins the
-complete revisions, so no sibling codec checkout is required.
+The current source targets `wsi-rs` 0.7.0, J2K 0.11.2, and
+`wsi-dicom-annotations` 0.1.3. J2K and annotations are published on crates.io;
+wsi-rs 0.7.0 is still unreleased. For development, use the sibling wsi-rs
+checkout with a command-local override:
 
 ```sh
-cargo run -p dicom-viewer
+cargo run -p dicom-viewer --config 'patch.crates-io.wsi-rs.path="../wsi-rs"'
 ```
 
-Build the standalone Windows GUI executable on an x86-64 Windows host with:
+Use the same override for other development Cargo commands until wsi-rs 0.7.0
+is published. J2K and JXR resolve from crates.io. Distribution builds must first
+pass the [registry dependency gate](docs/RELEASE.md#reproducible-source-gate).
+
+After that gate passes, build the standalone Windows GUI executable on an
+x86-64 Windows host with:
 
 ```powershell
 cargo build -p dicom-viewer --bin dicom-viewer --release --locked
@@ -36,8 +42,8 @@ builds automatically enable `wsi-rs` Metal decoding and use the renderer's
 exact Metal device; resident RGB tiles are converted to RGBA by a wgpu compute
 pass without host readback. CPU-decoded tiles use the same wgpu texture path.
 On other platforms, the `cuda` feature lets `auto` reuse wsi-rs CUDA sessions
-for compressed JPEG and JPEG 2000 decode. CUDA tiles cross the viewer boundary
-only through checked, pitch-aware host download and then use the existing CPU
+for JPEG 2000 and HTJ2K decode. JPEG decoding stays on the CPU. CUDA tiles cross
+the viewer boundary only through checked, pitch-aware host download and then use the existing CPU
 RGBA, ICC, cache, and wgpu upload path. wgpu remains the only renderer; there
 is no CUDA-to-wgpu interop. A CUDA download failure receives exactly one
 ordered CPU retry.
@@ -135,12 +141,10 @@ notes](docs/WORKSPACE_STORAGE.md).
 
 ### Annotation dependency source
 
-Annotations 0.1.2 is pinned to immutable Git revision
-`71851b4a0c286fa9b57326e426962bf1a63a781e` in `frames-sg/wsi-dicom-annotations`.
-That revision owns the shared metadata reader and headless CLI. CI checks out only
-the viewer; Cargo resolves the owner without a sibling directory or local overlay.
-The dependency remains versioned and locked. A later registry migration requires
-publication of the matching API and a reviewed lockfile refresh.
+The viewer pins the published `wsi-dicom-annotations = "=0.1.3"` package from
+crates.io. It includes the shared metadata reader and requires no annotations
+Git pin or sibling library checkout. The headless CLI is built from the
+annotations repository as described below.
 
 ### Headless annotation interoperability probe
 
