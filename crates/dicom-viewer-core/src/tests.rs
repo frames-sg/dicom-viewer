@@ -78,12 +78,8 @@ fn opened_study_applies_the_jp2k_cpu_decode_budget_to_wsi_rs() {
         .saturating_sub(1)
         .max(1);
     assert_eq!(
-        study
-            .slide
-            .decode_execution_options()
-            .jp2k_cpu_threads()
-            .map(std::num::NonZeroUsize::get),
-        Some(expected)
+        study.cpu_decode_pool.install(rayon::current_num_threads),
+        expected
     );
 }
 
@@ -535,7 +531,14 @@ fn opens_wsi_rs_raw_jp2k_without_dicom_instances() {
     assert_eq!(summary.format_label, "Raw JPEG 2000 WSI");
     assert_eq!(summary.file_count, 1);
     assert_eq!(summary.dicom_instance_count, 0);
-    assert_eq!(summary.levels.len(), 1);
+    assert_eq!(
+        summary
+            .levels
+            .iter()
+            .map(|level| (level.width, level.height))
+            .collect::<Vec<_>>(),
+        [(32, 24), (16, 12)]
+    );
     assert_eq!(study.selected_view.scene.get(), 0);
     assert_eq!(study.selected_view.series.get(), 0);
     assert_eq!(study.selected_view.plane, wsi_rs::PlaneIdx::default());
@@ -545,6 +548,18 @@ fn opens_wsi_rs_raw_jp2k_without_dicom_instances() {
         .unwrap();
     assert_eq!((tile.width, tile.height), (32, 24));
     assert_eq!(tile.rgba.len(), 32 * 24 * 4);
+
+    let reduced = study
+        .read_tile_rgba(LevelIndex::from_u32(1), TileCoord::new(0, 0))
+        .unwrap();
+    assert_eq!((reduced.width, reduced.height), (16, 12));
+    assert_eq!(reduced.rgba.len(), 16 * 12 * 4);
+    assert!(reduced
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .all(|pixel| pixel[3] == 255));
 }
 
 #[test]
@@ -599,8 +614,8 @@ fn macos_metal_options_return_resident_tiles_for_synthetic_dicom_htj2k() {
     )
     .unwrap();
     assert!(
-        !study.render_tile_output.adaptive_decode_route_enabled(),
-        "the viewer's explicit same-device DICOM Metal path must not spend the first batch probing CPU throughput"
+        matches!(study.render_tile_output, RenderTileBackend::Metal(_)),
+        "DICOM rendering must use the renderer-owned Metal session"
     );
     let requests = (0..8)
         .map(|col| (LevelIndex::from_u32(0), TileCoord::new(col, 0)))
@@ -611,16 +626,15 @@ fn macos_metal_options_return_resident_tiles_for_synthetic_dicom_htj2k() {
         .collect::<Vec<_>>();
     let required = study
         .slide
-        .read_tiles(
+        .read_tiles_metal(
             &raw_requests,
-            wsi_rs::TileOutputPreference::require_device_auto_with_metal_and_compressed_decode(
-                wsi_rs::output::metal::MetalBackendSessions::new(device),
-            ),
+            &wsi_rs::output::metal::MetalBackendSessions::new(device),
         )
         .unwrap();
-    assert!(required
-        .iter()
-        .all(|tile| matches!(tile, wsi_rs::TilePixels::Device(_))));
+    assert_eq!(required.len(), raw_requests.len());
+    for tile in &required {
+        tile.validated_resident_image().unwrap();
+    }
 
     let tiles = study.read_tiles_for_render(&requests).unwrap();
 
@@ -672,7 +686,48 @@ fn cuda_viewer_download_matches_strict_cpu_for_synthetic_dicom_htj2k() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn macos_metal_options_keep_adaptive_routing_for_non_dicom_sources() {
+fn macos_rendering_falls_back_to_cpu_for_tiled_rgb_tiff() {
+    let Ok(device) = j2k_metal_support::system_default_device() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tiled-rgb.tiff");
+    // Synthetic 16x16 RGB8 tile: channel sample i is (i * 13) modulo 256.
+    std::fs::write(&path, include_bytes!("../tests/fixtures/tiled-rgb.tiff")).unwrap();
+    let study = ViewerStudy::open_path_with_options(
+        &path,
+        ViewerOpenOptions::auto().with_metal_device(device),
+    )
+    .unwrap();
+    assert_eq!(
+        study.summary().tile_decode_backend,
+        TileDecodeBackend::Metal
+    );
+    let request = (LevelIndex::from_u32(0), TileCoord::new(0, 0));
+    let tiles = study
+        .read_tiles_for_render_controlled(&[request, request], &ReadControl::default())
+        .unwrap();
+    assert_eq!(tiles.len(), 2);
+    for tile in tiles {
+        let tile = expect_cpu_render_tile(tile, "unsupported TIFF device read must use CPU pixels");
+        assert_eq!((tile.width, tile.height), (16, 16));
+        let expected: Vec<u8> = (0..256)
+            .flat_map(|pixel| {
+                [
+                    ((pixel * 3 * 13) % 256) as u8,
+                    (((pixel * 3 + 1) * 13) % 256) as u8,
+                    (((pixel * 3 + 2) * 13) % 256) as u8,
+                    255,
+                ]
+            })
+            .collect();
+        assert_eq!(tile.rgba, expected);
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_metal_options_preserve_cpu_reads_for_non_dicom_sources() {
     let Ok(device) = j2k_metal_support::system_default_device() else {
         return;
     };
@@ -686,9 +741,18 @@ fn macos_metal_options_keep_adaptive_routing_for_non_dicom_sources() {
     )
     .unwrap();
 
-    assert!(
-        study.render_tile_output.adaptive_decode_route_enabled(),
-        "the DICOM-specific first-batch optimization must not disable adaptive routing for other formats"
+    let cpu = ViewerStudy::open_path_with_options(&path, ViewerOpenOptions::cpu_only()).unwrap();
+    let expected = cpu
+        .read_tile_rgba(LevelIndex::from_u32(0), TileCoord::new(0, 0))
+        .unwrap();
+    let actual = study
+        .read_tile_rgba(LevelIndex::from_u32(0), TileCoord::new(0, 0))
+        .unwrap();
+    assert_eq!(actual.rgba, expected.rgba);
+    assert_eq!(
+        study.slide.decode_execution_options().acceleration(),
+        DecodeAcceleration::CpuOnly,
+        "CPU retries must not reselect the device that failed"
     );
 }
 

@@ -209,7 +209,9 @@ fn exact_color_lut_gpu_readback_covers_every_rgb8_input() {
         for from_cpu in [false, true] {
             let prepared = if from_cpu {
                 let rgba = rgb
-                    .chunks_exact(3)
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
                     .flat_map(|p| [p[0], p[1], p[2], 255])
                     .collect();
                 uploader

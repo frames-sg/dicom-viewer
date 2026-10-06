@@ -41,7 +41,7 @@ jobs:
             libxcb-xfixes0-dev
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@a75363d06101555fc97c6c7e1e65670b99104d98 # 1.96.1
+        uses: dtolnay/rust-toolchain@70dec6087f2cb6bab9fbac4da23160afbe848e91 # 1.99.0
         with:
           components: rustfmt, clippy
 
@@ -74,6 +74,7 @@ jobs:
         working-directory: dicom-viewer
         env:
           RUSTFLAGS: -D warnings
+          RUSTUP_AUTO_INSTALL: "0"
         run: cargo check --workspace --all-targets --locked --features cuda
 
       - name: Test default macOS Metal tile output
@@ -101,7 +102,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@a75363d06101555fc97c6c7e1e65670b99104d98 # 1.96.1
+        uses: dtolnay/rust-toolchain@70dec6087f2cb6bab9fbac4da23160afbe848e91 # 1.99.0
 
       - name: Install dependency tools
         run: |

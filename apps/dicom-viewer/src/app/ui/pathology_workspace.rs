@@ -135,7 +135,7 @@ fn show_draft_guard(
     }
     egui::Frame::NONE
         .fill(theme::AMBER_GLOW)
-        .stroke(Stroke::new(1.0, theme::AMBER))
+        .stroke(Stroke::new(1.0_f32, theme::AMBER))
         .inner_margin(Margin::same(8))
         .show(ui, |ui| {
             ui.label(RichText::new("Unfinished polygon").strong());

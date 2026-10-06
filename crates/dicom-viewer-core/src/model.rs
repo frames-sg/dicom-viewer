@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use wsi_rs::{PlaneIdx, SceneId, SeriesId, Slide, TileOutputPreference};
+use wsi_rs::{PlaneIdx, SceneId, SeriesId, Slide};
 
 pub type Result<T> = std::result::Result<T, ViewerError>;
 pub const DEFAULT_DISPLAY_TILE_SIZE: u32 = 512;
@@ -133,8 +133,8 @@ pub struct ViewerStudy {
     pub(crate) summary: StudySummary,
     pub(crate) annotation_context: Option<crate::DicomAnnotationContext>,
     pub(crate) sidecars: Vec<crate::SidecarMetadata>,
-    pub(crate) render_tile_output: TileOutputPreference,
-    pub(crate) cpu_tile_output: TileOutputPreference,
+    pub(crate) render_tile_output: crate::tile_output::RenderTileBackend,
+    pub(crate) cpu_decode_pool: std::sync::Arc<rayon::ThreadPool>,
     pub(crate) selected_view: SelectedView,
     pub(crate) color_management: crate::color::ColorManagement,
 }

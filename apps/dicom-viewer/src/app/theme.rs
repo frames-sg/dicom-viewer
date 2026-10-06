@@ -43,7 +43,7 @@ pub(super) fn install_visuals(ctx: &egui::Context) {
     v.dark_mode = true;
     v.panel_fill = CHROME;
     v.window_fill = CARD;
-    v.window_stroke = Stroke::new(1.0, HAIRLINE);
+    v.window_stroke = Stroke::new(1.0_f32, HAIRLINE);
     v.window_corner_radius = CornerRadius::same(8);
     v.faint_bg_color = CARD_RAISED;
     v.extreme_bg_color = CANVAS_EDGE;
@@ -51,36 +51,36 @@ pub(super) fn install_visuals(ctx: &egui::Context) {
     v.hyperlink_color = CYAN;
 
     v.selection.bg_fill = AMBER_GLOW;
-    v.selection.stroke = Stroke::new(1.0, AMBER);
+    v.selection.stroke = Stroke::new(1.0_f32, AMBER);
 
     let w = &mut v.widgets;
     w.noninteractive.bg_fill = CHROME;
     w.noninteractive.weak_bg_fill = CHROME;
-    w.noninteractive.bg_stroke = Stroke::new(1.0, HAIRLINE_SOFT);
-    w.noninteractive.fg_stroke = Stroke::new(1.0, TEXT_MUTED);
+    w.noninteractive.bg_stroke = Stroke::new(1.0_f32, HAIRLINE_SOFT);
+    w.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT_MUTED);
     w.noninteractive.corner_radius = CornerRadius::same(6);
 
     w.inactive.bg_fill = CARD_RAISED;
     w.inactive.weak_bg_fill = CHROME_RAISED;
-    w.inactive.bg_stroke = Stroke::new(1.0, HAIRLINE);
-    w.inactive.fg_stroke = Stroke::new(1.0, TEXT);
+    w.inactive.bg_stroke = Stroke::new(1.0_f32, HAIRLINE);
+    w.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT);
     w.inactive.corner_radius = CornerRadius::same(6);
 
     w.hovered.bg_fill = AMBER_GLOW;
     w.hovered.weak_bg_fill = AMBER_GLOW;
-    w.hovered.bg_stroke = Stroke::new(1.0, AMBER);
-    w.hovered.fg_stroke = Stroke::new(1.0, AMBER_BRIGHT);
+    w.hovered.bg_stroke = Stroke::new(1.0_f32, AMBER);
+    w.hovered.fg_stroke = Stroke::new(1.0_f32, AMBER_BRIGHT);
     w.hovered.corner_radius = CornerRadius::same(6);
 
     w.active.bg_fill = AMBER;
     w.active.weak_bg_fill = AMBER;
-    w.active.bg_stroke = Stroke::new(1.0, AMBER_BRIGHT);
-    w.active.fg_stroke = Stroke::new(1.0, CANVAS_EDGE);
+    w.active.bg_stroke = Stroke::new(1.0_f32, AMBER_BRIGHT);
+    w.active.fg_stroke = Stroke::new(1.0_f32, CANVAS_EDGE);
     w.active.corner_radius = CornerRadius::same(6);
 
     w.open.bg_fill = CARD_RAISED;
-    w.open.bg_stroke = Stroke::new(1.0, HAIRLINE);
-    w.open.fg_stroke = Stroke::new(1.0, TEXT);
+    w.open.bg_stroke = Stroke::new(1.0_f32, HAIRLINE);
+    w.open.fg_stroke = Stroke::new(1.0_f32, TEXT);
 
     ctx.set_global_style(style);
 }

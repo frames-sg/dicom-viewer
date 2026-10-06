@@ -154,7 +154,7 @@ fn draw_workspace_overlay_with_budgets(
                     for hole in component.holes() {
                         shapes.push(Shape::closed_line(
                             screen_points_for_render(viewport, hole, view, selected),
-                            Stroke::new(1.5, color.gamma_multiply(0.8)),
+                            Stroke::new(1.5_f32, color.gamma_multiply(0.8)),
                         ));
                     }
                 }
@@ -185,10 +185,10 @@ fn draw_workspace_overlay_with_budgets(
                 if selected {
                     shapes.push(Shape::line_segment(
                         points,
-                        Stroke::new(4.0, Color32::WHITE.gamma_multiply(0.75)),
+                        Stroke::new(4.0_f32, Color32::WHITE.gamma_multiply(0.75)),
                     ));
                 }
-                shapes.push(Shape::line_segment(points, Stroke::new(2.0, color)));
+                shapes.push(Shape::line_segment(points, Stroke::new(2.0_f32, color)));
                 for point in points {
                     draw_handle(&mut shapes, point, color, selected);
                 }
@@ -214,7 +214,7 @@ fn draw_workspace_overlay_with_budgets(
         if points.len() >= 2 {
             shapes.push(Shape::line(
                 points.clone(),
-                Stroke::new(2.0, theme::AMBER_BRIGHT),
+                Stroke::new(2.0_f32, theme::AMBER_BRIGHT),
             ));
         }
         for point in points {
@@ -265,7 +265,7 @@ fn draw_polygon(
             } else if filled {
                 1.8
             } else {
-                1.4
+                1.4_f32
             },
             color,
         ),
@@ -273,9 +273,12 @@ fn draw_polygon(
     if selected {
         shapes.push(Shape::closed_line(
             screen.clone(),
-            Stroke::new(3.8, Color32::WHITE.gamma_multiply(0.65)),
+            Stroke::new(3.8_f32, Color32::WHITE.gamma_multiply(0.65)),
         ));
-        shapes.push(Shape::closed_line(screen.clone(), Stroke::new(2.0, color)));
+        shapes.push(Shape::closed_line(
+            screen.clone(),
+            Stroke::new(2.0_f32, color),
+        ));
         if !filled {
             for point in screen {
                 draw_handle(shapes, point, color, true);

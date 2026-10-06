@@ -63,7 +63,7 @@ fn fps_from_dt(dt: f32) -> Option<f32> {
 
 pub(in crate::app) fn paint_canvas_background(painter: &egui::Painter, rect: Rect) {
     painter.rect_filled(rect, CornerRadius::ZERO, theme::CANVAS);
-    let stroke = Stroke::new(1.0, theme::HAIRLINE_SOFT);
+    let stroke = Stroke::new(1.0_f32, theme::HAIRLINE_SOFT);
     let len = 14.0;
     let margin = 10.0;
     let corners = [
@@ -164,7 +164,7 @@ pub(in crate::app) fn draw_canvas_overlays(
         panel,
         CornerRadius::same(6),
         Color32::from_rgba_unmultiplied(15, 17, 20, 226),
-        Stroke::new(1.0, theme::HAIRLINE),
+        Stroke::new(1.0_f32, theme::HAIRLINE),
         StrokeKind::Inside,
     );
     let mut x = panel.left() + pad.x;
@@ -211,7 +211,7 @@ fn draw_debug_stats(painter: &egui::Painter, rect: Rect, text: &str) {
         panel,
         CornerRadius::same(5),
         Color32::from_rgba_unmultiplied(15, 17, 20, 226),
-        Stroke::new(1.0, theme::HAIRLINE),
+        Stroke::new(1.0_f32, theme::HAIRLINE),
         StrokeKind::Inside,
     );
     painter.galley(panel.left_top() + pad, galley, theme::TEXT_MUTED);
@@ -241,7 +241,7 @@ fn draw_tile_failure_badge(painter: &egui::Painter, rect: Rect, failure: &TileFa
         panel,
         CornerRadius::same(6),
         Color32::from_rgba_unmultiplied(38, 28, 15, 236),
-        Stroke::new(1.0, theme::WARN),
+        Stroke::new(1.0_f32, theme::WARN),
         StrokeKind::Inside,
     );
     painter.galley(panel.left_top() + pad, galley, theme::WARN);
@@ -295,7 +295,7 @@ fn draw_scale_bar(painter: &egui::Painter, rect: Rect, summary: &StudySummary, z
     let y = rect.bottom() - 22.0;
     let x0 = rect.left() + 16.0;
     let x1 = x0 + bar_px.clamp(8.0, rect.width() * 0.5);
-    let stroke = Stroke::new(2.0, theme::TEXT_MUTED);
+    let stroke = Stroke::new(2.0_f32, theme::TEXT_MUTED);
     painter.line_segment([pos2(x0, y), pos2(x1, y)], stroke);
     painter.line_segment([pos2(x0, y - 4.0), pos2(x0, y + 4.0)], stroke);
     painter.line_segment([pos2(x1, y - 4.0), pos2(x1, y + 4.0)], stroke);

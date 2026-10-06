@@ -319,7 +319,7 @@ impl SlideCanvas {
         painter.rect_stroke(
             slide_rect,
             CornerRadius::ZERO,
-            Stroke::new(1.0, theme::HAIRLINE),
+            Stroke::new(1.0_f32, theme::HAIRLINE),
             StrokeKind::Inside,
         );
         if self.tiles.loading_count() > 0 {

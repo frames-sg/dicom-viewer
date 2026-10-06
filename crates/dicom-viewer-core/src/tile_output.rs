@@ -1,8 +1,5 @@
-use wsi_rs::{TileOutputPreference, TilePixels};
-
 use crate::{
-    RenderTile, Result, RgbaTile, TileDecodeBackend, ViewerCacheBudgets, ViewerError,
-    ViewerOpenOptions,
+    Result, RgbaTile, TileDecodeBackend, ViewerCacheBudgets, ViewerError, ViewerOpenOptions,
 };
 
 const TILE_BACKEND_ENV: &str = "DICOM_VIEWER_TILE_BACKEND";
@@ -21,7 +18,12 @@ pub(crate) fn rgba_tile_from_cpu_tile(tile: wsi_rs::CpuTile) -> Result<RgbaTile>
             if let Some(byte_len) = pixels.and_then(|n| n.checked_mul(4)) {
                 if pixels.and_then(|n| n.checked_mul(3)) == Some(rgb.len()) {
                     let mut rgba = vec![255; byte_len];
-                    for (source, destination) in rgb.chunks_exact(3).zip(rgba.chunks_exact_mut(4)) {
+                    for (source, destination) in rgb
+                        .as_chunks::<3>()
+                        .0
+                        .iter()
+                        .zip(rgba.as_chunks_mut::<4>().0)
+                    {
                         destination[..3].copy_from_slice(source);
                     }
                     return Ok(RgbaTile {
@@ -39,20 +41,6 @@ pub(crate) fn rgba_tile_from_cpu_tile(tile: wsi_rs::CpuTile) -> Result<RgbaTile>
         height: image.height(),
         rgba: image.into_raw(),
     })
-}
-
-pub(crate) fn rgba_tile_from_pixels(tile: TilePixels) -> Result<RgbaTile> {
-    match tile {
-        TilePixels::Cpu(tile) => rgba_tile_from_cpu_tile(tile),
-        TilePixels::Device(_) => Err(ViewerError::Unsupported(
-            "wsi-rs violated the viewer tile-output contract by returning device-resident pixels"
-                .into(),
-        )),
-        #[allow(unreachable_patterns)]
-        _ => Err(ViewerError::Unsupported(
-            "wsi-rs returned an unknown tile pixel output variant".into(),
-        )),
-    }
 }
 
 pub(crate) fn default_viewer_open_options() -> Result<ViewerOpenOptions> {
@@ -86,72 +74,33 @@ fn viewer_open_options(requested: &str) -> Result<ViewerOpenOptions> {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) enum RenderTileBackend {
+    Cpu,
+    #[cfg(target_os = "macos")]
+    Metal(wsi_rs::output::metal::MetalBackendSessions),
+    #[cfg(all(feature = "cuda", not(target_os = "macos")))]
+    Cuda(wsi_rs::output::cuda::CudaBackendSessions),
+}
+
 pub(crate) fn tile_output_config(
     options: &ViewerOpenOptions,
-) -> (
-    TileDecodeBackend,
-    TileOutputPreference,
-    TileOutputPreference,
-) {
+) -> (TileDecodeBackend, RenderTileBackend) {
     #[cfg(not(any(target_os = "macos", feature = "cuda")))]
     let _ = options;
-    // Compatibility reads and ordered device-failure retries must never
-    // select the same device backend that just failed its download boundary.
-    let cpu = TileOutputPreference::cpu_only();
     #[cfg(target_os = "macos")]
     if !options.requests_cpu_only() {
         if let Some(device) = options.metal_device() {
             let sessions = wsi_rs::output::metal::MetalBackendSessions::new(device.clone());
-            let render =
-                TileOutputPreference::prefer_device_auto_with_metal_and_compressed_decode(sessions);
-            return (TileDecodeBackend::Metal, render, cpu);
+            return (TileDecodeBackend::Metal, RenderTileBackend::Metal(sessions));
         }
     }
     #[cfg(all(feature = "cuda", not(target_os = "macos")))]
     if !options.requests_cpu_only() {
         let sessions = wsi_rs::output::cuda::CudaBackendSessions::new();
-        let render =
-            TileOutputPreference::prefer_device_auto_with_cuda_and_compressed_decode(sessions);
-        return (TileDecodeBackend::Cuda, render, cpu);
+        return (TileDecodeBackend::Cuda, RenderTileBackend::Cuda(sessions));
     }
-    (TileDecodeBackend::Cpu, cpu.clone(), cpu)
-}
-
-pub(crate) fn render_tile_from_pixels(tile: TilePixels) -> Result<RenderTile> {
-    match tile {
-        TilePixels::Cpu(tile) => rgba_tile_from_cpu_tile(tile).map(RenderTile::Cpu),
-        TilePixels::Device(device) => render_tile_from_device(device),
-        #[allow(unreachable_patterns)]
-        _ => Err(ViewerError::Unsupported(
-            "wsi-rs returned an unknown tile pixel output variant".into(),
-        )),
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn render_tile_from_device(device: wsi_rs::DeviceTile) -> Result<RenderTile> {
-    match device {
-        wsi_rs::DeviceTile::Metal(tile) => crate::MetalRenderTile::new(tile).map(RenderTile::Metal),
-        #[allow(unreachable_patterns)]
-        _ => Err(ViewerError::Unsupported(
-            "wsi-rs returned a device tile unsupported by the current wgpu renderer".into(),
-        )),
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn render_tile_from_device(device: wsi_rs::DeviceTile) -> Result<RenderTile> {
-    match device {
-        #[cfg(feature = "cuda")]
-        wsi_rs::DeviceTile::Cuda(tile) => {
-            rgba_tile_from_cpu_tile(tile.download_cpu()?).map(RenderTile::Cpu)
-        }
-        #[allow(unreachable_patterns)]
-        _ => Err(ViewerError::Unsupported(
-            "wsi-rs returned device-resident pixels without a configured viewer download path"
-                .into(),
-        )),
-    }
+    (TileDecodeBackend::Cpu, RenderTileBackend::Cpu)
 }
 
 #[cfg(test)]
@@ -204,11 +153,10 @@ mod tests {
     #[test]
     fn auto_requests_host_resident_output() {
         let options = viewer_open_options("auto").unwrap();
-        let (backend, preference, cpu) = tile_output_config(&options);
+        let (backend, preference) = tile_output_config(&options);
 
         assert_eq!(backend, TileDecodeBackend::Cpu);
-        assert!(!preference.prefers_device());
-        assert!(!cpu.prefers_device());
+        assert!(matches!(preference, RenderTileBackend::Cpu));
     }
 
     #[test]
@@ -239,13 +187,10 @@ mod tests {
     fn cuda_feature_auto_prefers_reusable_compressed_decode_sessions() {
         let options = ViewerOpenOptions::auto();
 
-        let (backend, render, cpu) = tile_output_config(&options);
+        let (backend, render) = tile_output_config(&options);
 
         assert_eq!(backend, TileDecodeBackend::Cuda);
-        assert!(render.prefers_device());
-        assert!(render.compressed_device_decode_enabled());
-        assert!(render.adaptive_decode_route_enabled());
-        assert!(!cpu.prefers_device());
+        assert!(matches!(render, RenderTileBackend::Cuda(_)));
     }
 
     #[cfg(target_os = "macos")]
@@ -256,12 +201,9 @@ mod tests {
         };
         let options = ViewerOpenOptions::auto().with_metal_device(device);
 
-        let (backend, render, cpu) = tile_output_config(&options);
+        let (backend, render) = tile_output_config(&options);
 
         assert_eq!(backend, TileDecodeBackend::Metal);
-        assert!(render.prefers_device());
-        assert!(render.compressed_device_decode_enabled());
-        assert!(render.adaptive_decode_route_enabled());
-        assert!(!cpu.prefers_device());
+        assert!(matches!(render, RenderTileBackend::Metal(_)));
     }
 }

@@ -14,7 +14,7 @@ The production raster boundary adds only these direct crates:
   decoding it; WebP is not enabled.
 - `npyz = 0.9.1` (MIT): no optional features are enabled. The crate publishes
   no `rust-version`, so compatibility is established by the locked workspace
-  build on Rust 1.96 rather than an upstream MSRV declaration.
+  build on Rust 1.99.0 rather than an upstream MSRV declaration.
 - `zarrs = 0.23.14` (MIT OR Apache-2.0, declared Rust 1.91): defaults are
   disabled; only `filesystem`, `blosc`, `crc32c`, `gzip`, `sharding`, and
   `zstd` are enabled. The application exposes only a local filesystem array
@@ -22,7 +22,7 @@ The production raster boundary adds only these direct crates:
   uncommon-codec surfaces.
 
 All three versions exist in the locked registry graph, compile below the
-workspace Rust 1.96 floor (or are verified directly there where no MSRV is
+workspace Rust 1.99.0 floor (or are verified directly there where no MSRV is
 declared), and are covered by the release advisory/license/source gates. The
 TIFF and NPY crates own their mature file-format decoding; `zarrs` owns the
 substantially more complex Zarr v2/v3 metadata, chunk-grid, sharding, and codec

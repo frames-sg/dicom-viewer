@@ -131,7 +131,7 @@ fn section_header(ui: &mut egui::Ui, text: &str) {
     ui.painter().hline(
         rect.x_range(),
         rect.top() + 3.0,
-        Stroke::new(1.0, theme::HAIRLINE_SOFT),
+        Stroke::new(1.0_f32, theme::HAIRLINE_SOFT),
     );
 }
 

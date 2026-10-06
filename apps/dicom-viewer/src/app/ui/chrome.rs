@@ -187,7 +187,7 @@ pub(in crate::app) fn rule(ui: &mut egui::Ui) {
     ui.painter().vline(
         rect.center().x,
         rect.y_range(),
-        Stroke::new(1.0, theme::HAIRLINE),
+        Stroke::new(1.0_f32, theme::HAIRLINE),
     );
     ui.add_space(9.0);
 }
@@ -195,7 +195,7 @@ pub(in crate::app) fn rule(ui: &mut egui::Ui) {
 pub(in crate::app) fn privacy_badge(ui: &mut egui::Ui) {
     Frame::NONE
         .fill(theme::CARD)
-        .stroke(Stroke::new(1.0, theme::HAIRLINE))
+        .stroke(Stroke::new(1.0_f32, theme::HAIRLINE))
         .inner_margin(Margin::symmetric(9, 4))
         .corner_radius(CornerRadius::same(11))
         .show(ui, |ui| {

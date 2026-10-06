@@ -35,7 +35,9 @@ fn metal_upload_release_characterization() {
                 .map(|i| (i % 251) as u8)
                 .collect();
             let expected: Vec<u8> = rgb
-                .chunks_exact(3)
+                .as_chunks::<3>()
+                .0
+                .iter()
                 .flat_map(|p| [p[0], p[1], p[2], 255])
                 .collect();
             let images: Vec<_> = (0..batch)
@@ -117,7 +119,9 @@ fn metal_pass_gpu_timestamp_characterization() {
             .map(|i| (i % 251) as u8)
             .collect();
         let expected: Vec<u8> = rgb
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .flat_map(|p| [p[0], p[1], p[2], 255])
             .collect();
         let images: Vec<_> = (0..8)

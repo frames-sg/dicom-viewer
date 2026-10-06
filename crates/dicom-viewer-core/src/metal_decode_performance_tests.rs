@@ -12,10 +12,7 @@ fn local_native_metal_decode_characterization() {
     let path = std::env::var_os("DICOM_VIEWER_WSI_FIXTURE").expect("trusted local fixture");
     let study = ViewerStudy::open_path_with_options(path, ViewerOpenOptions::cpu_only()).unwrap();
     let device = j2k_metal_support::system_default_device().unwrap();
-    let output = TileOutputPreference::require_device_auto_with_metal_and_compressed_decode(
-        wsi_rs::output::metal::MetalBackendSessions::new(device),
-    )
-    .without_adaptive_decode_route();
+    let sessions = wsi_rs::output::metal::MetalBackendSessions::new(device);
     let samples = std::env::var("DICOM_VIEWER_DECODE_SAMPLES")
         .map(|value| value.parse::<usize>().expect("positive sample count"))
         .unwrap_or(3);
@@ -64,13 +61,10 @@ fn local_native_metal_decode_characterization() {
         }
         for sample in 0..samples {
             let started = Instant::now();
-            let tiles = study.slide.read_tiles(&requests, output.clone()).unwrap();
+            let tiles = study.slide.read_tiles_metal(&requests, &sessions).unwrap();
             let elapsed = started.elapsed();
             assert_eq!(tiles.len(), requests.len());
             for tile in &tiles {
-                let TilePixels::Device(wsi_rs::DeviceTile::Metal(tile)) = tile else {
-                    panic!("required native Metal output returned CPU pixels");
-                };
                 assert_eq!((tile.width, tile.height), (tile_width, tile_height));
                 tile.validated_resident_image().unwrap();
             }

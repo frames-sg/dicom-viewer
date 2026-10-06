@@ -65,7 +65,7 @@ pub(in crate::app) fn show_tool_rail(
 fn tool_icon_shapes(tool: ActiveTool, rect: egui::Rect, color: Color32) -> Vec<egui::Shape> {
     let center = rect.center();
     let radius = rect.width().min(rect.height()) * 0.42;
-    let stroke = Stroke::new(1.8, color);
+    let stroke = Stroke::new(1.8_f32, color);
     let point = |x: f32, y: f32| center + egui::vec2(x * radius, y * radius);
 
     match tool {

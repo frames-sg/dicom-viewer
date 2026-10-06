@@ -155,7 +155,7 @@ fn draw_pathology_preview(
         }
         let rgb = dicom_cielab_to_srgb(feature.recommended_display_cielab());
         let color = Color32::from_rgb(rgb[0], rgb[1], rgb[2]).gamma_multiply(opacity);
-        let stroke = Stroke::new(2.0, color);
+        let stroke = Stroke::new(2.0_f32, color);
         match feature.geometry() {
             PathologyPreviewGeometry::Points(points) => {
                 for point in points {
@@ -180,7 +180,7 @@ fn draw_pathology_preview(
                     for hole in polygon.holes() {
                         painter.add(Shape::closed_line(
                             screen_points(viewport, hole, view),
-                            Stroke::new(2.0, color.gamma_multiply(0.75)),
+                            Stroke::new(2.0_f32, color.gamma_multiply(0.75)),
                         ));
                     }
                 }
@@ -206,7 +206,7 @@ fn draw_report(
         draw_report_mask_run(painter, viewport, run, opacity, view, visible);
     }
     let color = theme::AMBER_BRIGHT.gamma_multiply(opacity);
-    let stroke = Stroke::new(2.25, color);
+    let stroke = Stroke::new(2.25_f32, color);
     for index in prepared.regions.visible(visible) {
         let region = &session.regions()[index];
         if !bounds_intersect(region.bounds(), visible) {
@@ -342,7 +342,7 @@ fn draw_groups(
         let visible_indices = prepared.index.visible(visible);
         let rgb = dicom_cielab_to_srgb(group.recommended_display_cielab());
         let color = Color32::from_rgb(rgb[0], rgb[1], rgb[2]).gamma_multiply(opacity);
-        let stroke = Stroke::new(1.35, color);
+        let stroke = Stroke::new(1.35_f32, color);
         match group.geometry() {
             AnnotationGeometry::Points(points) => {
                 for index in visible_indices {

@@ -14,18 +14,15 @@ checklist](docs/RELEASE.md) for distribution gates.
 
 ## Build
 
-The current source targets `wsi-rs` 0.7.0, J2K 0.11.2, and
-`wsi-dicom-annotations` 0.1.3. J2K and annotations are published on crates.io;
-wsi-rs 0.7.0 is still unreleased. For development, use the sibling wsi-rs
-checkout with a command-local override:
+The current source targets `wsi-rs` 0.8.0, J2K 0.12.0, and
+`wsi-dicom-annotations` 0.1.4 from crates.io, using Rust 1.99.0.
 
 ```sh
-cargo run -p dicom-viewer --config 'patch.crates-io.wsi-rs.path="../wsi-rs"'
+cargo run -p dicom-viewer --locked
 ```
 
-Use the same override for other development Cargo commands until wsi-rs 0.7.0
-is published. J2K and JXR resolve from crates.io. Distribution builds must first
-pass the [registry dependency gate](docs/RELEASE.md#reproducible-source-gate).
+Distribution builds must pass the
+[registry dependency gate](docs/RELEASE.md#reproducible-source-gate).
 
 After that gate passes, build the standalone Windows GUI executable on an
 x86-64 Windows host with:
@@ -41,8 +38,9 @@ wgpu is the only presentation backend on every platform. On macOS, ordinary
 builds automatically enable `wsi-rs` Metal decoding and use the renderer's
 exact Metal device; resident RGB tiles are converted to RGBA by a wgpu compute
 pass without host readback. CPU-decoded tiles use the same wgpu texture path.
-On other platforms, the `cuda` feature lets `auto` reuse wsi-rs CUDA sessions
-for JPEG 2000 and HTJ2K decode. JPEG decoding stays on the CPU. CUDA tiles cross
+On Linux with CUDA Oxide kernels, the `cuda` feature lets `auto` reuse wsi-rs
+CUDA sessions for JPEG 2000 and HTJ2K decode. Windows builds use CPU decoding.
+JPEG decoding stays on the CPU. CUDA tiles cross
 the viewer boundary only through checked, pitch-aware host download and then use the existing CPU
 RGBA, ICC, cache, and wgpu upload path. wgpu remains the only renderer; there
 is no CUDA-to-wgpu interop. A CUDA download failure receives exactly one
@@ -141,7 +139,7 @@ notes](docs/WORKSPACE_STORAGE.md).
 
 ### Annotation dependency source
 
-The viewer pins the published `wsi-dicom-annotations = "=0.1.3"` package from
+The viewer pins the published `wsi-dicom-annotations = "=0.1.4"` package from
 crates.io. It includes the shared metadata reader and requires no annotations
 Git pin or sibling library checkout. The headless CLI is built from the
 annotations repository as described below.

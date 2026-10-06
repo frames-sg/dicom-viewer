@@ -2,10 +2,11 @@
 
 use std::num::NonZeroUsize;
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
 
 use wsi_rs::{
-    CacheConfig, DecodeExecutionOptions, LevelIdx, Slide, SlideOpenOptions, TileOutputPreference,
-    TilePixels, TileRequest, TileViewRequest,
+    CacheConfig, DecodeAcceleration, DecodeExecutionOptions, LevelIdx, Slide, SlideOpenOptions,
+    TileRequest, TileViewRequest,
 };
 pub use wsi_rs::{
     DicomIndexDiagnostic, DicomIndexMapping, DicomIndexOutcome, ReadCancellationToken, ReadControl,
@@ -68,8 +69,7 @@ pub use model::{
 };
 pub use statistics::nearest_rank_percentile;
 use tile_output::{
-    default_viewer_open_options, render_tile_from_pixels, rgba_tile_from_cpu_tile,
-    rgba_tile_from_pixels, tile_output_config,
+    default_viewer_open_options, rgba_tile_from_cpu_tile, tile_output_config, RenderTileBackend,
 };
 pub use wsi_dicom_annotations::{Error as AnnotationError, Result as AnnotationResult};
 
@@ -160,11 +160,8 @@ impl ViewerStudy {
     ) -> Result<Self> {
         let path = path.as_ref();
         let input = inspect_input(path)?;
-        let (mut tile_decode_backend, mut render_tile_output, cpu_tile_output) =
-            tile_output_config(&options);
-        if !input.instances.is_empty() {
-            render_tile_output = render_tile_output.without_adaptive_decode_route();
-        }
+        let (mut tile_decode_backend, mut render_tile_output) = tile_output_config(&options);
+        let cpu_decode_pool = viewer_cpu_decode_pool()?;
         let cache_budgets = options.cache_budgets();
         let slide_options = SlideOpenOptions::deterministic()
             .with_cache_config(
@@ -172,7 +169,9 @@ impl ViewerStudy {
                     .with_shared_tile_bytes(cache_budgets.shared_tile_bytes)
                     .with_display_tile_bytes(cache_budgets.display_tile_bytes),
             )
-            .with_decode_execution_options(viewer_decode_execution_options());
+            .with_decode_execution_options(
+                DecodeExecutionOptions::default().with_acceleration(DecodeAcceleration::CpuOnly),
+            );
         let slide = Slide::open_with_options(path, slide_options)?;
         let (mut summary, selected_view) =
             summarize_slide(path, &slide, input, tile_decode_backend)?;
@@ -181,7 +180,7 @@ impl ViewerStudy {
             color::ColorManagement::build(slide.dataset(), selected_view, tile_decode_backend);
         if color.force_cpu {
             tile_decode_backend = TileDecodeBackend::Cpu;
-            render_tile_output = cpu_tile_output.clone();
+            render_tile_output = RenderTileBackend::Cpu;
             summary.tile_decode_backend = tile_decode_backend;
         }
         summary.color_management = color.summary;
@@ -192,7 +191,7 @@ impl ViewerStudy {
             annotation_context,
             sidecars,
             render_tile_output,
-            cpu_tile_output,
+            cpu_decode_pool,
             selected_view,
             color_management: color.color,
         })
@@ -403,9 +402,9 @@ impl ViewerStudy {
         requests: &[TileRequest],
         policy: BatchReadPolicy<'_>,
     ) -> Result<Vec<RgbaTile>> {
-        self.read_regular_tile_pixels(requests, &self.cpu_tile_output, policy)?
+        self.read_regular_cpu_tiles(requests, policy)?
             .into_iter()
-            .map(|tile| self.color_managed_rgba_from_pixels(tile))
+            .map(|tile| self.color_managed_rgba_from_cpu_tile(tile))
             .collect()
     }
 
@@ -414,25 +413,78 @@ impl ViewerStudy {
         requests: &[TileRequest],
         policy: BatchReadPolicy<'_>,
     ) -> Result<Vec<RenderTile>> {
-        self.read_regular_tile_pixels(requests, &self.render_tile_output, policy)?
-            .into_iter()
-            .map(|tile| self.color_managed_render_from_pixels(tile))
-            .collect()
+        if let BatchReadPolicy::Controlled(control) = policy {
+            ensure_not_cancelled(control)?;
+        }
+        let device_tiles: std::result::Result<Option<Vec<RenderTile>>, wsi_rs::WsiError> =
+            match &self.render_tile_output {
+                RenderTileBackend::Cpu => Ok(None),
+                #[cfg(target_os = "macos")]
+                RenderTileBackend::Metal(sessions) => {
+                    match self.slide.read_tiles_metal(requests, sessions) {
+                        Ok(tiles) => Ok(Some(
+                            tiles
+                                .into_iter()
+                                .map(|tile| MetalRenderTile::new(tile).map(RenderTile::Metal))
+                                .collect::<Result<Vec<_>>>()?,
+                        )),
+                        Err(error) => Err(error),
+                    }
+                }
+                #[cfg(all(feature = "cuda", not(target_os = "macos")))]
+                RenderTileBackend::Cuda(sessions) => {
+                    match self.slide.read_tiles_cuda(requests, sessions) {
+                        Ok(tiles) => Ok(Some(
+                            tiles
+                                .into_iter()
+                                .map(|tile| {
+                                    rgba_tile_from_cpu_tile(tile.download_cpu()?)
+                                        .map(RenderTile::Cpu)
+                                })
+                                .collect::<Result<Vec<_>>>()?,
+                        )),
+                        Err(error) => Err(error),
+                    }
+                }
+            };
+        if let BatchReadPolicy::Controlled(control) = policy {
+            ensure_not_cancelled(control)?;
+        }
+        match device_tiles {
+            Ok(Some(tiles)) => {
+                if tiles.len() != requests.len() {
+                    return Err(ViewerError::Unsupported(format!(
+                        "tile backend returned {} tiles for {} requests",
+                        tiles.len(),
+                        requests.len()
+                    )));
+                }
+                Ok(tiles
+                    .into_iter()
+                    .map(|tile| self.color_management.prepare_render_tile(tile))
+                    .collect())
+            }
+            // TIFF wraps unsupported device codecs in TileRead. Retry through
+            // the strict CPU reader; malformed source data still fails there.
+            Ok(None)
+            | Err(wsi_rs::WsiError::Unsupported { .. } | wsi_rs::WsiError::TileRead { .. }) => self
+                .read_regular_tiles_rgba(requests, policy)
+                .map(|tiles| tiles.into_iter().map(RenderTile::Cpu).collect()),
+            Err(error) => Err(error.into()),
+        }
     }
 
-    fn read_regular_tile_pixels(
+    fn read_regular_cpu_tiles(
         &self,
         requests: &[TileRequest],
-        output: &TileOutputPreference,
         policy: BatchReadPolicy<'_>,
-    ) -> Result<Vec<TilePixels>> {
-        let tiles = match policy {
-            BatchReadPolicy::Uncontrolled => self.slide.read_tiles(requests, output.clone())?,
+    ) -> Result<Vec<wsi_rs::CpuTile>> {
+        let tiles = self.cpu_decode_pool.install(|| match policy {
+            BatchReadPolicy::Uncontrolled => self.slide.read_tiles(requests),
             BatchReadPolicy::Controlled(control) => {
-                self.slide
-                    .read_tiles_controlled(requests, output.clone(), control)?
+                self.slide.read_tiles_controlled(requests, control)
             }
-        };
+        })?;
         if tiles.len() != requests.len() {
             return Err(ViewerError::Unsupported(format!(
                 "tile backend returned {} tiles for {} requests",
@@ -462,20 +514,18 @@ impl ViewerStudy {
             tile_width,
             tile_height,
         )?;
-        let tile = self.slide.read_display_tile(&request)?;
+        let tile = self
+            .cpu_decode_pool
+            .install(|| self.slide.read_display_tile(&request))?;
         let mut tile = rgba_tile_from_cpu_tile(tile)?;
         self.color_management.apply_rgba_tile(&mut tile);
         Ok(tile)
     }
 
-    fn color_managed_rgba_from_pixels(&self, tile: wsi_rs::TilePixels) -> Result<RgbaTile> {
-        let mut tile = rgba_tile_from_pixels(tile)?;
+    fn color_managed_rgba_from_cpu_tile(&self, tile: wsi_rs::CpuTile) -> Result<RgbaTile> {
+        let mut tile = rgba_tile_from_cpu_tile(tile)?;
         self.color_management.apply_rgba_tile(&mut tile);
         Ok(tile)
-    }
-
-    fn color_managed_render_from_pixels(&self, tile: wsi_rs::TilePixels) -> Result<RenderTile> {
-        render_tile_from_pixels(tile).map(|tile| self.color_management.prepare_render_tile(tile))
     }
 
     fn level(&self, level_index: LevelIndex) -> Result<&LevelInfo> {
@@ -497,13 +547,21 @@ fn ensure_not_cancelled(control: &wsi_rs::ReadControl) -> Result<()> {
     }
 }
 
-fn viewer_decode_execution_options() -> DecodeExecutionOptions {
-    let available = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
-    let configured = std::env::var("DICOM_VIEWER_JP2K_THREADS").ok();
-    DecodeExecutionOptions::default().with_jp2k_cpu_threads(jp2k_cpu_decode_thread_budget(
-        available,
-        configured.as_deref(),
-    ))
+fn viewer_cpu_decode_pool() -> Result<Arc<rayon::ThreadPool>> {
+    static POOL: OnceLock<std::result::Result<Arc<rayon::ThreadPool>, String>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let available = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+        let configured = std::env::var("DICOM_VIEWER_JP2K_THREADS").ok();
+        let threads = jp2k_cpu_decode_thread_budget(available, configured.as_deref());
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads.get())
+            .thread_name(|index| format!("dicom-viewer-decode-{index}"))
+            .build()
+            .map(Arc::new)
+            .map_err(|error| error.to_string())
+    })
+    .clone()
+    .map_err(|error| ViewerError::Unsupported(format!("cannot create viewer decode pool: {error}")))
 }
 
 fn jp2k_cpu_decode_thread_budget(available: usize, configured: Option<&str>) -> NonZeroUsize {

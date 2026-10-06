@@ -628,7 +628,7 @@ impl WgpuTileUploader {
             0,
         ];
         let mut bytes = [0_u8; 32];
-        for (chunk, value) in bytes.chunks_exact_mut(4).zip(params) {
+        for (chunk, value) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(params) {
             chunk.copy_from_slice(&value.to_le_bytes());
         }
         // Initialize immutable parameters with the buffer, avoiding a separate
@@ -1421,7 +1421,9 @@ mod tests {
             .unwrap()]);
         let uploaded = uploader.register(prepared.texture);
         let expected = rgb
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .flat_map(|pixel| [pixel[0], pixel[1], pixel[2], 255])
             .collect::<Vec<_>>();
 
@@ -1486,7 +1488,9 @@ mod tests {
         );
         let plain = uploader.register(plain.texture);
         let expected: Vec<_> = rgb
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .flat_map(|p| [p[0], p[1], p[2], 255])
             .collect();
         assert_eq!(

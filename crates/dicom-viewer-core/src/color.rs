@@ -715,7 +715,9 @@ mod tests {
                 .map(|i| (i % 251) as u8)
                 .collect();
             let expected: Vec<u8> = rgb
-                .chunks_exact(3)
+                .as_chunks::<3>()
+                .0
+                .iter()
                 .flat_map(|p| [p[0], p[1], p[2], 255])
                 .collect();
             for (profile_name, profile) in [
@@ -853,7 +855,7 @@ mod tests {
             .as_ref()
             .unwrap()
             .transform_rgba(&mut expected);
-        for (input, expected) in inputs.iter().zip(expected.chunks_exact(4)) {
+        for (input, expected) in inputs.iter().zip(expected.as_chunks::<4>().0) {
             let [r, g, b, _] = input.map(usize::from);
             let offset = ((b * 256 + g) * 256 + r) * 4;
             assert_eq!(&lut.rgba()[offset..offset + 4], expected);
